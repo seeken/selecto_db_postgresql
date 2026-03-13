@@ -57,7 +57,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def execute_raw(connection, query, params) do
     cond do
       is_atom(connection) and not is_nil(connection) ->
-        case apply(Ecto.Adapters.SQL, :query, [connection, normalize_query(query), params]) do
+        case Kernel.apply(Ecto.Adapters.SQL, :query, [connection, normalize_query(query), params]) do
           {:ok, result} -> {:ok, normalize_result(result)}
           {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
         end
