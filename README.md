@@ -10,9 +10,9 @@ for using Selecto against PostgreSQL via `postgrex`.
 ```elixir
 def deps do
   [
-    {:selecto, "~> 0.3.16"},
+    {:selecto, "~> 0.4.0"},
     {:selecto_db_adapter, "~> 0.1"},
-    {:selecto_db_postgresql, "~> 0.1"}
+    {:selecto_db_postgresql, "~> 0.4.0"}
   ]
 end
 ```
