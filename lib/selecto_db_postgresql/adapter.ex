@@ -94,6 +94,37 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
+  @impl true
+  def with_connection(pool_ref, fun) when is_function(fun, 1) do
+    case Selecto.ConnectionPool.get_pool_pid(pool_ref) do
+      {:ok, pool_pid} ->
+        try do
+          result = fun.(pool_pid)
+          {:ok, result}
+        rescue
+          e in DBConnection.ConnectionError ->
+            {:error, Selecto.Error.connection_error(Exception.message(e), %{exception: e})}
+
+          e ->
+            {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
+  def transaction(pool_ref, fun, opts \\ []) when is_function(fun, 1) do
+    case Selecto.ConnectionPool.get_pool_pid(pool_ref) do
+      {:ok, pool_pid} ->
+        Postgrex.transaction(pool_pid, fun, opts)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)
 
