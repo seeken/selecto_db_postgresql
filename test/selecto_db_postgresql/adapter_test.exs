@@ -34,4 +34,9 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
     assert {:error, {:invalid_stream_pool, %{stream_context: :pool}}} =
              SelectoDBPostgreSQL.Adapter.stream({:pool, %{}}, "select 1", [], [])
   end
+
+  test "postgres adapter validates execute_pool references" do
+    assert {:error, "Invalid pool reference"} =
+             SelectoDBPostgreSQL.Adapter.execute_pool(:bad_ref, "select 1", [], [])
+  end
 end

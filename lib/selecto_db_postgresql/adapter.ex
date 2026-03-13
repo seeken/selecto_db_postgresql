@@ -40,6 +40,20 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def execute(connection, _query, _params, _opts), do: {:error, {:invalid_connection, connection}}
 
   @impl true
+  def execute_pool(pool_ref, query, params, opts) do
+    use_prepared = Keyword.get(opts, :prepared, true)
+    cache_key = if use_prepared, do: Selecto.ConnectionPool.generate_cache_key(query), else: nil
+
+    case Selecto.ConnectionPool.get_pool_pid(pool_ref) do
+      {:ok, pool_pid} ->
+        execute_with_pool_pid(pool_pid, query, params, cache_key, opts)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
   def placeholder(index), do: ["$", Integer.to_string(index)]
 
   @impl true
@@ -200,6 +214,39 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)
+
+  defp execute_with_pool_pid(pool_pid, query, params, cache_key, opts) do
+    timeout = Keyword.get(opts, :timeout, 15_000)
+
+    try do
+      if cache_key do
+        execute_with_prepared_cache(pool_pid, query, params, cache_key, timeout)
+      else
+        Postgrex.query(pool_pid, query, params, timeout: timeout)
+      end
+    rescue
+      e in DBConnection.ConnectionError ->
+        {:error, Selecto.Error.connection_error(Exception.message(e), %{exception: e})}
+
+      e in Postgrex.Error ->
+        {:error, Selecto.Error.query_error(Exception.message(e), query, params, %{exception: e})}
+
+      e ->
+        {:error, Selecto.Error.query_error(Exception.message(e), query, params, %{exception: e})}
+    end
+  end
+
+  defp execute_with_prepared_cache(pool_pid, query, params, cache_key, timeout) do
+    case Selecto.ConnectionPool.prepared_statement_cached?(pool_pid, cache_key) do
+      false ->
+        result = Postgrex.query(pool_pid, query, params, timeout: timeout)
+        Selecto.ConnectionPool.mark_prepared_statement(pool_pid, cache_key)
+        result
+
+      true ->
+        Postgrex.query(pool_pid, query, params, timeout: timeout)
+    end
+  end
 
   defp start_postgrex_connection(postgrex_opts) do
     case Postgrex.start_link(postgrex_opts) do
