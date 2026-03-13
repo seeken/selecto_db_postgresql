@@ -125,8 +125,89 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
+  @impl true
+  def execute_repo_fallback(repo, query, params) do
+    config = apply(repo, :config, [])
+
+    postgrex_opts = [
+      username: config[:username],
+      password: config[:password],
+      hostname: config[:hostname] || "localhost",
+      database: config[:database],
+      port: config[:port] || 5432,
+      supervisor: false
+    ]
+
+    case Postgrex.start_link(postgrex_opts) do
+      {:ok, conn} ->
+        result = execute(conn, query, params, [])
+        GenServer.stop(conn)
+        result
+
+      {:error, reason} ->
+        {:error,
+         Selecto.Error.connection_error("Failed to connect to database", %{reason: reason})}
+    end
+  end
+
+  @impl true
+  def start_pool(connection_config, pool_config, pool_name) do
+    case Selecto.ConnectionPool.get_manager_pid_by_name(pool_name) do
+      {:ok, manager_pid} ->
+        Selecto.ConnectionPool.build_pool_ref_from_manager(manager_pid)
+
+      :error ->
+        dbconnection_opts = [
+          name: pool_name,
+          pool: DBConnection.ConnectionPool,
+          pool_size: pool_config[:pool_size],
+          pool_overflow: pool_config[:max_overflow],
+          timeout: pool_config[:connection_timeout],
+          queue_target: pool_config[:checkout_timeout],
+          queue_interval: 1000
+        ]
+
+        postgrex_opts = Keyword.merge(connection_config, dbconnection_opts)
+
+        case start_postgrex_connection(postgrex_opts) do
+          {:ok, pool_pid, started_new_pool?} ->
+            manager_opts = [
+              adapter: __MODULE__,
+              pool_pid: pool_pid,
+              pool_name: pool_name,
+              pool_config: pool_config,
+              connection_config: connection_config
+            ]
+
+            case Selecto.ConnectionPool.start_manager(manager_opts) do
+              {:ok, manager_pid, :started} ->
+                Selecto.ConnectionPool.build_pool_ref_from_manager(manager_pid)
+
+              {:ok, manager_pid, :existing} ->
+                if started_new_pool?, do: GenServer.stop(pool_pid)
+                Selecto.ConnectionPool.build_pool_ref_from_manager(manager_pid)
+
+              {:error, reason} ->
+                if started_new_pool?, do: GenServer.stop(pool_pid)
+                {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)
+
+  defp start_postgrex_connection(postgrex_opts) do
+    case Postgrex.start_link(postgrex_opts) do
+      {:ok, pool_pid} -> {:ok, pool_pid, true}
+      {:error, {:already_started, pool_pid}} -> {:ok, pool_pid, false}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp normalize_result(%{rows: rows, columns: columns}) do
     %{
