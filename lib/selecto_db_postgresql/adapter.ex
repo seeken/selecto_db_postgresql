@@ -54,6 +54,38 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   @impl true
+  def execute_raw(connection, query, params) do
+    cond do
+      is_atom(connection) and not is_nil(connection) ->
+        case apply(Ecto.Adapters.SQL, :query, [connection, normalize_query(query), params]) do
+          {:ok, result} -> {:ok, normalize_result(result)}
+          {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
+        end
+
+      match?({:pool, _}, connection) ->
+        case execute(connection, query, params, prepared: false) do
+          {:ok, result} -> {:ok, result}
+          {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
+        end
+
+      is_pid(connection) or is_atom(connection) ->
+        case Postgrex.query(connection, normalize_query(query), params) do
+          {:ok, result} -> {:ok, normalize_result(result)}
+          {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
+        end
+
+      true ->
+        {:error,
+         Selecto.Error.connection_error("Invalid connection type", %{
+           connection: inspect(connection)
+         })}
+    end
+  rescue
+    e ->
+      {:error, Selecto.Error.from_reason(e)}
+  end
+
+  @impl true
   def placeholder(index), do: ["$", Integer.to_string(index)]
 
   @impl true
@@ -105,6 +137,51 @@ defmodule SelectoDBPostgreSQL.Adapter do
       false -> {:error, :invalid_server_version_num}
       {:error, _reason} = error -> error
       _ -> {:error, :invalid_server_version_num}
+    end
+  end
+
+  @impl true
+  def validate_connection(connection) do
+    cond do
+      is_atom(connection) and not is_nil(connection) ->
+        :ok
+
+      match?({:pool, _}, connection) ->
+        validate_pool_connection(connection)
+
+      is_pid(connection) ->
+        if Process.alive?(connection),
+          do: :ok,
+          else: {:error, "Postgrex connection process is not alive"}
+
+      true ->
+        {:error, "Invalid connection configuration"}
+    end
+  end
+
+  @impl true
+  def connection_info(connection) do
+    cond do
+      is_atom(connection) and not is_nil(connection) ->
+        %{type: :ecto_repo, repo: connection, status: :connected}
+
+      match?({:pool, _}, connection) ->
+        %{
+          type: :connection_pool,
+          pool_ref: elem(connection, 1),
+          status: :connected,
+          pool_stats: pool_stats(connection)
+        }
+
+      is_pid(connection) ->
+        %{
+          type: :postgrex,
+          pid: connection,
+          status: if(Process.alive?(connection), do: :connected, else: :disconnected)
+        }
+
+      true ->
+        %{type: :unknown, value: connection, status: :invalid}
     end
   end
 
@@ -214,6 +291,25 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)
+
+  defp validate_pool_connection({:pool, pool_ref}) do
+    try do
+      case Selecto.ConnectionPool.pool_stats(pool_ref) do
+        %{error: _} -> {:error, "Connection pool is not available"}
+        stats when is_map(stats) -> :ok
+      end
+    catch
+      :exit, _ -> {:error, "Connection pool is not available"}
+    end
+  end
+
+  defp pool_stats({:pool, pool_ref}) do
+    try do
+      Selecto.ConnectionPool.pool_stats(pool_ref)
+    catch
+      :exit, _ -> %{error: "Pool manager not available"}
+    end
+  end
 
   defp execute_with_pool_pid(pool_pid, query, params, cache_key, opts) do
     timeout = Keyword.get(opts, :timeout, 15_000)
