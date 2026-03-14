@@ -30,6 +30,10 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
     assert SelectoDBPostgreSQL.Adapter.supports?(:stream)
   end
 
+  test "postgres adapter reports rollup support" do
+    assert SelectoDBPostgreSQL.Adapter.supports?(:rollup)
+  end
+
   test "postgres adapter validates stream pool references" do
     assert {:error, {:invalid_stream_pool, %{stream_context: :pool}}} =
              SelectoDBPostgreSQL.Adapter.stream({:pool, %{}}, "select 1", [], [])

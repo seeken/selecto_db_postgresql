@@ -102,6 +102,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       :cte,
       :jsonb,
       :array_ops,
+      :rollup,
       :returning,
       :window_functions,
       :lateral_join,
