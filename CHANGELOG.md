@@ -1,6 +1,11 @@
 CHANGES
 =======
 
+V NEXT
+------
+
+- No unreleased changes yet.
+
 V 0.4.0
 --------
 
