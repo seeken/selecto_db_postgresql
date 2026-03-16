@@ -4,7 +4,10 @@ CHANGES
 V NEXT
 ------
 
-- No unreleased changes yet.
+- Dropped the standalone `selecto_db_adapter` dependency now that
+  `Selecto.DB.Adapter` ships with `selecto`.
+- Updated installation guidance to depend directly on `selecto` plus
+  `selecto_db_postgresql`.
 
 V 0.4.0
 --------
