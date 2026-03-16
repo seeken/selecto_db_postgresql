@@ -11,7 +11,6 @@ for using Selecto against PostgreSQL via `postgrex`.
 def deps do
   [
     {:selecto, "~> 0.4.0"},
-    {:selecto_db_adapter, "~> 0.1"},
     {:selecto_db_postgresql, "~> 0.4.0"}
   ]
 end
@@ -42,5 +41,4 @@ For local multi-repo development against vendored ecosystem packages, set:
 SELECTO_ECOSYSTEM_USE_LOCAL=true
 ```
 
-When enabled, this package resolves local paths for `selecto` and
-`selecto_db_adapter`.
+When enabled, this package resolves a local path for `selecto`.
