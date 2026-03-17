@@ -384,7 +384,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp normalize_query(query), do: IO.iodata_to_binary(query)
 
   defp introspection_query(connection, query, params) do
-    execute(connection, query, params, prepared: false)
+    case connection do
+      %{query_fun: query_fun} when is_function(query_fun, 3) ->
+        query_fun.(query, params, prepared: false)
+
+      _ ->
+        execute(connection, query, params, prepared: false)
+    end
   end
 
   defp get_columns(connection, table_name, schema) do

@@ -40,6 +40,60 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
     assert SelectoDBPostgreSQL.Adapter.supports?(:rollup)
   end
 
+  test "postgres adapter reports schema introspection support" do
+    assert SelectoDBPostgreSQL.Adapter.supports?(:schema_introspection)
+  end
+
+  test "postgres adapter lists tables through schema introspection" do
+    connection = %{
+      query_fun: fn query, params, _opts ->
+        assert query =~ "FROM information_schema.tables"
+        assert params == ["public"]
+
+        {:ok, %{rows: [["products"], ["users"]], columns: ["table_name"]}}
+      end
+    }
+
+    assert {:ok, ["products", "users"]} =
+             SelectoDBPostgreSQL.Adapter.list_tables(connection, schema: "public")
+  end
+
+  test "postgres adapter introspects table metadata and belongs_to associations" do
+    connection = %{query_fun: &introspection_query_stub/3}
+
+    assert {:ok, metadata} =
+             SelectoDBPostgreSQL.Adapter.introspect_table(connection, "products",
+               schema: "public"
+             )
+
+    assert metadata.table_name == "products"
+    assert metadata.schema == "public"
+    assert metadata.primary_key == :id
+    assert metadata.fields == [:id, :name, :price, :category_id]
+    assert metadata.field_types[:name] == :string
+    assert metadata.field_types[:price] == :decimal
+    assert metadata.field_types[:id] == :integer
+    assert metadata.columns[:price].precision == 10
+    assert metadata.columns[:name].nullable == false
+
+    assert metadata.associations == %{
+             category: %{
+               association_type: :belongs_to,
+               constraint_name: "products_category_id_fkey",
+               field: :category,
+               is_through: false,
+               join_type: :inner,
+               owner_key: :category_id,
+               queryable: :categories,
+               related_key: :id,
+               related_module_name: "Category",
+               related_schema: "Category",
+               related_table: "categories",
+               type: :belongs_to
+             }
+           }
+  end
+
   test "postgres rollup uses compatibility wrapper by default" do
     selecto =
       sales_domain()
@@ -109,5 +163,36 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
       joins: %{},
       name: "Sales"
     }
+  end
+
+  defp introspection_query_stub(query, params, _opts) do
+    cond do
+      String.contains?(query, "FROM information_schema.columns") ->
+        assert params == ["public", "products"]
+
+        {:ok,
+         %{
+           rows: [
+             ["id", "integer", "int4", "NO", nil, nil, 32, 0, 1],
+             ["name", "character varying", "varchar", "NO", nil, 255, nil, nil, 2],
+             ["price", "numeric", "numeric", "YES", nil, nil, 10, 2, 3],
+             ["category_id", "integer", "int4", "YES", nil, nil, 32, 0, 4]
+           ],
+           columns: []
+         }}
+
+      String.contains?(query, "AND i.indisprimary") ->
+        assert params == ["public", "products"]
+        {:ok, %{rows: [["id"]], columns: ["attname"]}}
+
+      String.contains?(query, "AND tc.table_name = $2") ->
+        assert params == ["public", "products"]
+
+        {:ok,
+         %{rows: [["products_category_id_fkey", "category_id", "public", "categories", "id"]]}}
+
+      true ->
+        flunk("unexpected introspection query: #{query} with #{inspect(params)}")
+    end
   end
 end
