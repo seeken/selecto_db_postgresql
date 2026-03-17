@@ -1,7 +1,7 @@
 CHANGES
 =======
 
-V 0.4.0 (Unreleased)
+V 0.4.0
 --------
 
 - Introduced the standalone PostgreSQL adapter package for the external
