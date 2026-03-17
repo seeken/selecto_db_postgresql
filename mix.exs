@@ -14,6 +14,7 @@ defmodule SelectoDBPostgreSQL.MixProject do
       name: "SelectoDBPostgreSQL",
       description: "PostgreSQL adapter package for Selecto",
       source_url: @source_url,
+      docs: docs(),
       package: package()
     ]
   end
@@ -58,11 +59,20 @@ defmodule SelectoDBPostgreSQL.MixProject do
 
   defp package do
     [
+      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE .formatter.exs),
       licenses: ["MIT"],
       links: %{
+        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md",
         "GitHub" => @source_url,
         "Selecto" => "https://github.com/seeken/selecto"
       }
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md", "CHANGELOG.md", "LICENSE"]
     ]
   end
 end
