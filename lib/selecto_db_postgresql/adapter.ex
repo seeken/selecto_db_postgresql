@@ -109,8 +109,85 @@ defmodule SelectoDBPostgreSQL.Adapter do
       :window_functions,
       :lateral_join,
       :prefix,
-      :stream
+      :stream,
+      :schema_introspection
     ]
+  end
+
+  @impl true
+  def list_tables(connection, opts \\ []) do
+    schema = Keyword.get(opts, :schema, "public")
+
+    query = """
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = $1
+      AND table_type = 'BASE TABLE'
+    ORDER BY table_name
+    """
+
+    case introspection_query(connection, query, [schema]) do
+      {:ok, %{rows: rows}} -> {:ok, Enum.map(rows, fn [table_name] -> table_name end)}
+      {:error, reason} -> {:error, {:query_failed, reason}}
+    end
+  end
+
+  @impl true
+  def introspect_table(connection, table_name, opts \\ []) do
+    schema = Keyword.get(opts, :schema, "public")
+    include_associations = Keyword.get(opts, :include_associations, true)
+    expand = Keyword.get(opts, :expand, false)
+
+    with {:ok, columns} <- get_columns(connection, table_name, schema),
+         {:ok, primary_key} <- get_primary_key(connection, table_name, schema),
+         {:ok, foreign_keys} <- get_foreign_keys(connection, table_name, schema) do
+      fields = Enum.map(columns, & &1.column_name)
+
+      field_types =
+        Enum.into(columns, %{}, fn column ->
+          {column.column_name, map_pg_type(connection, column.data_type, column.udt_name)}
+        end)
+
+      associations =
+        cond do
+          not include_associations ->
+            %{}
+
+          expand ->
+            case build_expanded_associations(connection, table_name, schema, primary_key) do
+              {:ok, expanded_associations} -> expanded_associations
+              {:error, _reason} -> build_associations(foreign_keys)
+            end
+
+          true ->
+            build_associations(foreign_keys)
+        end
+
+      column_metadata =
+        Enum.into(columns, %{}, fn column ->
+          {column.column_name,
+           %{
+             type: Map.get(field_types, column.column_name),
+             nullable: column.is_nullable == "YES",
+             default: column.column_default,
+             max_length: column.character_maximum_length,
+             precision: column.numeric_precision,
+             scale: column.numeric_scale
+           }}
+        end)
+
+      {:ok,
+       %{
+         table_name: table_name,
+         schema: schema,
+         fields: fields,
+         field_types: field_types,
+         primary_key: primary_key,
+         associations: associations,
+         columns: column_metadata,
+         source: :postgresql
+       }}
+    end
   end
 
   @impl true
@@ -305,6 +382,489 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)
+
+  defp introspection_query(connection, query, params) do
+    execute(connection, query, params, prepared: false)
+  end
+
+  defp get_columns(connection, table_name, schema) do
+    query = """
+    SELECT
+      column_name,
+      data_type,
+      udt_name,
+      is_nullable,
+      column_default,
+      character_maximum_length,
+      numeric_precision,
+      numeric_scale,
+      ordinal_position
+    FROM information_schema.columns
+    WHERE table_schema = $1 AND table_name = $2
+    ORDER BY ordinal_position
+    """
+
+    case introspection_query(connection, query, [schema, table_name]) do
+      {:ok, %{rows: rows}} ->
+        {:ok,
+         Enum.map(rows, fn [
+                             column_name,
+                             data_type,
+                             udt_name,
+                             is_nullable,
+                             column_default,
+                             max_length,
+                             precision,
+                             scale,
+                             _ordinal_position
+                           ] ->
+           %{
+             column_name: String.to_atom(column_name),
+             data_type: data_type,
+             udt_name: udt_name,
+             is_nullable: is_nullable,
+             column_default: column_default,
+             character_maximum_length: max_length,
+             numeric_precision: precision,
+             numeric_scale: scale
+           }
+         end)}
+
+      {:error, reason} ->
+        {:error, {:columns_query_failed, reason}}
+    end
+  end
+
+  defp get_primary_key(connection, table_name, schema) do
+    query = """
+    SELECT a.attname
+    FROM pg_index i
+    JOIN pg_attribute a ON a.attrelid = i.indrelid
+      AND a.attnum = ANY(i.indkey)
+    WHERE i.indrelid = ($1 || '.' || $2)::regclass
+      AND i.indisprimary
+    ORDER BY a.attnum
+    """
+
+    case introspection_query(connection, query, [schema, table_name]) do
+      {:ok, %{rows: []}} -> {:ok, nil}
+      {:ok, %{rows: [[single_key]]}} -> {:ok, String.to_atom(single_key)}
+      {:ok, %{rows: rows}} -> {:ok, Enum.map(rows, fn [key] -> String.to_atom(key) end)}
+      {:error, reason} -> {:error, {:primary_key_query_failed, reason}}
+    end
+  end
+
+  defp get_foreign_keys(connection, table_name, schema) do
+    query = """
+    SELECT
+      tc.constraint_name,
+      kcu.column_name,
+      ccu.table_schema AS foreign_table_schema,
+      ccu.table_name AS foreign_table_name,
+      ccu.column_name AS foreign_column_name
+    FROM information_schema.table_constraints AS tc
+    JOIN information_schema.key_column_usage AS kcu
+      ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+    JOIN information_schema.constraint_column_usage AS ccu
+      ON ccu.constraint_name = tc.constraint_name
+      AND ccu.table_schema = tc.table_schema
+    WHERE tc.constraint_type = 'FOREIGN KEY'
+      AND tc.table_schema = $1
+      AND tc.table_name = $2
+    ORDER BY tc.constraint_name, kcu.ordinal_position
+    """
+
+    case introspection_query(connection, query, [schema, table_name]) do
+      {:ok, %{rows: rows}} ->
+        {:ok,
+         Enum.map(rows, fn [
+                             constraint_name,
+                             column_name,
+                             foreign_schema,
+                             foreign_table,
+                             foreign_col
+                           ] ->
+           %{
+             constraint_name: constraint_name,
+             column_name: String.to_atom(column_name),
+             foreign_table_schema: foreign_schema,
+             foreign_table_name: foreign_table,
+             foreign_column_name: String.to_atom(foreign_col)
+           }
+         end)}
+
+      {:error, reason} ->
+        {:error, {:foreign_keys_query_failed, reason}}
+    end
+  end
+
+  defp get_reverse_foreign_keys(connection, table_name, schema) do
+    query = """
+    SELECT
+      tc.table_name AS referencing_table,
+      kcu.column_name AS referencing_column,
+      ccu.column_name AS referenced_column,
+      tc.constraint_name
+    FROM information_schema.table_constraints AS tc
+    JOIN information_schema.key_column_usage AS kcu
+      ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+    JOIN information_schema.constraint_column_usage AS ccu
+      ON ccu.constraint_name = tc.constraint_name
+      AND ccu.table_schema = tc.table_schema
+    WHERE tc.constraint_type = 'FOREIGN KEY'
+      AND ccu.table_schema = $1
+      AND ccu.table_name = $2
+    ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position
+    """
+
+    case introspection_query(connection, query, [schema, table_name]) do
+      {:ok, %{rows: rows}} ->
+        {:ok,
+         Enum.map(rows, fn [
+                             referencing_table,
+                             referencing_column,
+                             referenced_column,
+                             constraint_name
+                           ] ->
+           %{
+             referencing_table: referencing_table,
+             referencing_column: String.to_atom(referencing_column),
+             referenced_column: String.to_atom(referenced_column),
+             constraint_name: constraint_name
+           }
+         end)}
+
+      {:error, reason} ->
+        {:error, {:reverse_foreign_keys_query_failed, reason}}
+    end
+  end
+
+  defp build_associations(foreign_keys) do
+    Enum.into(foreign_keys, %{}, fn foreign_key ->
+      association_name =
+        foreign_key.column_name
+        |> Atom.to_string()
+        |> String.replace_suffix("_id", "")
+        |> String.to_atom()
+
+      related_module_name = table_name_to_module(foreign_key.foreign_table_name)
+
+      {association_name,
+       %{
+         type: :belongs_to,
+         association_type: :belongs_to,
+         related_schema: related_module_name,
+         related_module_name: related_module_name,
+         related_table: foreign_key.foreign_table_name,
+         queryable: String.to_atom(foreign_key.foreign_table_name),
+         field: association_name,
+         owner_key: foreign_key.column_name,
+         related_key: foreign_key.foreign_column_name,
+         join_type: :inner,
+         is_through: false,
+         constraint_name: foreign_key.constraint_name
+       }}
+    end)
+  end
+
+  defp build_expanded_associations(connection, table_name, schema, primary_key) do
+    with {:ok, foreign_keys} <- get_foreign_keys(connection, table_name, schema),
+         {:ok, reverse_foreign_keys} <- get_reverse_foreign_keys(connection, table_name, schema),
+         {:ok, junction_tables} <- detect_junction_tables(connection, schema) do
+      belongs_to = build_associations(foreign_keys)
+
+      primary_key_field = normalize_primary_key(primary_key)
+
+      has_many =
+        Enum.into(reverse_foreign_keys, %{}, fn reverse_foreign_key ->
+          association_name = String.to_atom(reverse_foreign_key.referencing_table)
+          related_module_name = table_name_to_module(reverse_foreign_key.referencing_table)
+
+          {association_name,
+           %{
+             type: :has_many,
+             association_type: :has_many,
+             related_schema: related_module_name,
+             related_module_name: related_module_name,
+             related_table: reverse_foreign_key.referencing_table,
+             queryable: String.to_atom(reverse_foreign_key.referencing_table),
+             field: association_name,
+             owner_key: primary_key_field,
+             related_key: reverse_foreign_key.referencing_column,
+             join_type: :left,
+             is_through: false,
+             constraint_name: reverse_foreign_key.constraint_name
+           }}
+        end)
+
+      many_to_many =
+        junction_tables
+        |> Enum.filter(fn junction -> table_name in junction.tables end)
+        |> Enum.flat_map(fn junction ->
+          {this_foreign_keys, other_foreign_keys} =
+            Enum.split_with(junction.foreign_keys, fn foreign_key ->
+              foreign_key.foreign_table_name == table_name
+            end)
+
+          Enum.map(other_foreign_keys, fn other_foreign_key ->
+            association_name = String.to_atom(other_foreign_key.foreign_table_name)
+            related_module_name = table_name_to_module(other_foreign_key.foreign_table_name)
+
+            owner_foreign_key =
+              case this_foreign_keys do
+                [foreign_key | _] -> foreign_key.column_name
+                _ -> primary_key_field
+              end
+
+            {association_name,
+             %{
+               type: :many_to_many,
+               association_type: :many_to_many,
+               related_schema: related_module_name,
+               related_module_name: related_module_name,
+               related_table: other_foreign_key.foreign_table_name,
+               queryable: String.to_atom(other_foreign_key.foreign_table_name),
+               field: association_name,
+               owner_key: primary_key_field,
+               related_key: other_foreign_key.foreign_column_name,
+               join_type: :left,
+               is_through: false,
+               join_through: junction.table,
+               join_keys: [
+                 {owner_foreign_key, primary_key_field},
+                 {other_foreign_key.column_name, other_foreign_key.foreign_column_name}
+               ]
+             }}
+          end)
+        end)
+        |> Enum.into(%{})
+
+      {:ok, belongs_to |> Map.merge(has_many) |> Map.merge(many_to_many)}
+    end
+  end
+
+  defp detect_junction_tables(connection, schema) do
+    with {:ok, tables} <- list_tables(connection, schema: schema) do
+      junction_tables =
+        Enum.flat_map(tables, fn table ->
+          case analyze_junction_table(connection, table, schema) do
+            {:ok, junction_table} -> [junction_table]
+            _ -> []
+          end
+        end)
+
+      {:ok, junction_tables}
+    end
+  end
+
+  defp analyze_junction_table(connection, table, schema) do
+    with {:ok, columns} <- get_columns(connection, table, schema),
+         {:ok, foreign_keys} <- get_foreign_keys(connection, table, schema),
+         {:ok, primary_key} <- get_primary_key(connection, table, schema),
+         true <- junction_table?(columns, foreign_keys) do
+      primary_key_fields = normalize_primary_keys(primary_key)
+      foreign_key_fields = Enum.map(foreign_keys, & &1.column_name)
+      all_fields = Enum.map(columns, & &1.column_name)
+
+      {:ok,
+       %{
+         table: table,
+         foreign_keys: foreign_keys,
+         primary_key: primary_key,
+         extra_columns: all_fields -- Enum.uniq(primary_key_fields ++ foreign_key_fields),
+         tables: Enum.map(foreign_keys, & &1.foreign_table_name)
+       }}
+    else
+      false -> {:error, :not_junction_table}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp junction_table?(columns, foreign_keys) do
+    foreign_key_fields = MapSet.new(Enum.map(foreign_keys, & &1.column_name))
+
+    data_fields =
+      columns
+      |> Enum.map(& &1.column_name)
+      |> Enum.reject(fn field ->
+        field_name = Atom.to_string(field)
+
+        field_name in ["id", "inserted_at", "updated_at", "created_at"] or
+          String.ends_with?(field_name, "_at")
+      end)
+
+    length(foreign_keys) == 2 and Enum.all?(data_fields, &MapSet.member?(foreign_key_fields, &1))
+  end
+
+  defp normalize_primary_key([primary_key | _]), do: primary_key
+  defp normalize_primary_key(primary_key) when is_atom(primary_key), do: primary_key
+  defp normalize_primary_key(_), do: :id
+
+  defp normalize_primary_keys(primary_key) when is_list(primary_key), do: primary_key
+  defp normalize_primary_keys(primary_key) when is_atom(primary_key), do: [primary_key]
+  defp normalize_primary_keys(_), do: []
+
+  defp map_pg_type(connection, data_type, udt_name) do
+    case {data_type, udt_name} do
+      {"smallint", _} ->
+        :integer
+
+      {"integer", _} ->
+        :integer
+
+      {"bigint", _} ->
+        :integer
+
+      {"smallserial", _} ->
+        :integer
+
+      {"serial", _} ->
+        :integer
+
+      {"bigserial", _} ->
+        :integer
+
+      {"numeric", _} ->
+        :decimal
+
+      {"decimal", _} ->
+        :decimal
+
+      {"real", _} ->
+        :float
+
+      {"double precision", _} ->
+        :float
+
+      {"character varying", _} ->
+        :string
+
+      {"character", _} ->
+        :string
+
+      {"text", _} ->
+        :string
+
+      {"citext", _} ->
+        :string
+
+      {"boolean", _} ->
+        :boolean
+
+      {"date", _} ->
+        :date
+
+      {"time without time zone", _} ->
+        :time
+
+      {"time with time zone", _} ->
+        :time
+
+      {"timestamp without time zone", _} ->
+        :naive_datetime
+
+      {"timestamp with time zone", _} ->
+        :utc_datetime
+
+      {"json", _} ->
+        :jsonb
+
+      {"jsonb", _} ->
+        :jsonb
+
+      {"uuid", _} ->
+        :binary_id
+
+      {"ARRAY", udt} ->
+        {:array, map_pg_type(connection, base_data_type_for_array(udt), normalize_array_udt(udt))}
+
+      {"USER-DEFINED", udt} ->
+        map_user_defined_type(connection, udt)
+
+      _ ->
+        map_udt_fallback(connection, data_type, udt_name)
+    end
+  end
+
+  defp map_udt_fallback(connection, _data_type, udt_name) when is_binary(udt_name) do
+    case map_user_defined_type(connection, udt_name) do
+      :string -> :string
+      other -> other
+    end
+  end
+
+  defp map_udt_fallback(_connection, _data_type, _udt_name), do: :string
+
+  defp map_user_defined_type(connection, udt_name) do
+    case get_enum_values(connection, udt_name) do
+      {:ok, [_ | _]} -> :string
+      _ -> :string
+    end
+  end
+
+  defp get_enum_values(connection, enum_type_name) do
+    query = """
+    SELECT e.enumlabel
+    FROM pg_type t
+    JOIN pg_enum e ON t.oid = e.enumtypid
+    WHERE t.typname = $1
+    ORDER BY e.enumsortorder
+    """
+
+    case introspection_query(connection, query, [enum_type_name]) do
+      {:ok, %{rows: rows}} -> {:ok, Enum.map(rows, fn [label] -> label end)}
+      {:error, reason} -> {:error, {:enum_values_query_failed, reason}}
+    end
+  end
+
+  defp base_data_type_for_array(<<base::binary>>) do
+    case normalize_array_udt(base) do
+      "int2" -> "smallint"
+      "int4" -> "integer"
+      "int8" -> "bigint"
+      "varchar" -> "character varying"
+      "text" -> "text"
+      "bool" -> "boolean"
+      "uuid" -> "uuid"
+      "jsonb" -> "jsonb"
+      "json" -> "json"
+      "numeric" -> "numeric"
+      "date" -> "date"
+      "timestamp" -> "timestamp without time zone"
+      "timestamptz" -> "timestamp with time zone"
+      _ -> "USER-DEFINED"
+    end
+  end
+
+  defp normalize_array_udt("_" <> base), do: base
+  defp normalize_array_udt(base), do: base
+
+  defp table_name_to_module(table_name) when is_binary(table_name) do
+    table_name
+    |> singularize()
+    |> Macro.camelize()
+  end
+
+  defp singularize(word) do
+    cond do
+      String.ends_with?(word, "ies") ->
+        String.replace_suffix(word, "ies", "y")
+
+      String.ends_with?(word, "sses") ->
+        String.replace_suffix(word, "sses", "ss")
+
+      String.ends_with?(word, "ses") ->
+        String.replace_suffix(word, "ses", "s")
+
+      String.ends_with?(word, "s") and not String.ends_with?(word, "ss") ->
+        String.replace_suffix(word, "s", "")
+
+      true ->
+        word
+    end
+  end
 
   defp validate_pool_connection({:pool, pool_ref}) do
     try do
