@@ -39,7 +39,7 @@ defmodule SelectoDBPostgreSQL.MixProject do
     if use_local_ecosystem?() do
       {:selecto, path: "../selecto"}
     else
-      {:selecto, ">= 0.4.0 and < 0.5.0"}
+      {:selecto, "0.4.0"}
     end
   end
 
