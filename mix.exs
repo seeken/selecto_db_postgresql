@@ -55,7 +55,7 @@ defmodule SelectoDBPostgreSQL.MixProject do
     if use_local_ecosystem?() do
       {:selecto_components, path: "../selecto_components", only: :test}
     else
-      {:selecto_components, github: "seeken/selecto_components", branch: "main", only: :test}
+      {:selecto_components, ">= 0.4.0 and < 0.5.0", only: :test}
     end
   end
 

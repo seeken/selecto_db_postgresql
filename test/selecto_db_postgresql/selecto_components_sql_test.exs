@@ -176,9 +176,10 @@ defmodule SelectoDBPostgreSQL.SelectoComponentsSQLTest do
       }
     }
 
-    [{_col, {:field, {:raw_sql, sql}, "title"}}] =
+    [{_col, {:field, {:raw_sql, sql}, alias_name}}] =
       AggregateProcess.group_by(params, columns, selecto())
 
+    assert alias_name == "Title"
     assert sql =~ "REGEXP_REPLACE"
     assert sql =~ "UPPER(LEFT("
     assert sql =~ ", 2))"
