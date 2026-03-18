@@ -56,7 +56,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @impl true
   def execute_raw(connection, query, params) do
     cond do
-      is_atom(connection) and not is_nil(connection) ->
+      repo_module?(connection) ->
         case Kernel.apply(Ecto.Adapters.SQL, :query, [connection, normalize_query(query), params]) do
           {:ok, result} -> {:ok, normalize_result(result)}
           {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
@@ -68,7 +68,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
           {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
         end
 
-      is_pid(connection) or is_atom(connection) ->
+      is_pid(connection) or (is_atom(connection) and not is_nil(connection)) ->
         case Postgrex.query(connection, normalize_query(query), params) do
           {:ok, result} -> {:ok, normalize_result(result)}
           {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
@@ -234,6 +234,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @impl true
   def validate_connection(connection) do
     cond do
+      repo_module?(connection) ->
+        :ok
+
       is_atom(connection) and not is_nil(connection) ->
         :ok
 
@@ -253,8 +256,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @impl true
   def connection_info(connection) do
     cond do
-      is_atom(connection) and not is_nil(connection) ->
+      repo_module?(connection) ->
         %{type: :ecto_repo, repo: connection, status: :connected}
+
+      is_atom(connection) and not is_nil(connection) ->
+        %{type: :postgrex, pid: connection, status: :connected}
 
       match?({:pool, _}, connection) ->
         %{
@@ -311,14 +317,37 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def execute_repo_fallback(repo, query, params) do
     config = apply(repo, :config, [])
 
-    postgrex_opts = [
-      username: config[:username],
-      password: config[:password],
-      hostname: config[:hostname] || "localhost",
-      database: config[:database],
-      port: config[:port] || 5432,
-      supervisor: false
-    ]
+    postgrex_opts =
+      config
+      |> Keyword.take([
+        :username,
+        :password,
+        :hostname,
+        :database,
+        :port,
+        :socket,
+        :socket_dir,
+        :parameters,
+        :ssl,
+        :ssl_opts,
+        :types,
+        :timeout,
+        :connect_timeout,
+        :prepare,
+        :queue_target,
+        :queue_interval,
+        :backoff_type,
+        :backoff_min,
+        :backoff_max,
+        :idle_interval,
+        :sslmode,
+        :cacertfile,
+        :certfile,
+        :keyfile
+      ])
+      |> Keyword.put_new(:hostname, "localhost")
+      |> Keyword.put_new(:port, 5432)
+      |> Keyword.put(:supervisor, false)
 
     case Postgrex.start_link(postgrex_opts) do
       {:ok, conn} ->
@@ -916,7 +945,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
     case Selecto.ConnectionPool.prepared_statement_cached?(pool_pid, cache_key) do
       false ->
         result = Postgrex.query(pool_pid, query, params, timeout: timeout)
-        Selecto.ConnectionPool.mark_prepared_statement(pool_pid, cache_key)
+
+        if match?({:ok, _}, result) do
+          Selecto.ConnectionPool.mark_prepared_statement(pool_pid, cache_key)
+        end
+
         result
 
       true ->
@@ -938,6 +971,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
       columns: Enum.map(columns || [], &to_string/1)
     }
   end
+
+  defp repo_module?(connection) when is_atom(connection) do
+    Code.ensure_loaded?(connection) and function_exported?(connection, :config, 0) and
+      function_exported?(connection, :__adapter__, 0)
+  end
+
+  defp repo_module?(_), do: false
 
   defp resolve_stream_pool_connection(pool_ref) when is_pid(pool_ref) or is_atom(pool_ref) do
     {:ok, pool_ref}

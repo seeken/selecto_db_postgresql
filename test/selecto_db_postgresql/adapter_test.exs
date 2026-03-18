@@ -145,6 +145,13 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
              SelectoDBPostgreSQL.Adapter.connection_info(123)
   end
 
+  test "named atom connections are treated as postgrex connections, not repos" do
+    assert :ok = SelectoDBPostgreSQL.Adapter.validate_connection(:named_postgrex_conn)
+
+    assert %{type: :postgrex, pid: :named_postgrex_conn, status: :connected} =
+             SelectoDBPostgreSQL.Adapter.connection_info(:named_postgrex_conn)
+  end
+
   defp sales_domain do
     %{
       source: %{

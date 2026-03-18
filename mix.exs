@@ -30,6 +30,7 @@ defmodule SelectoDBPostgreSQL.MixProject do
       selecto_dep(),
       selecto_components_dep(),
       {:postgrex, ">= 0.0.0"},
+      {:ecto_sql, "~> 3.12"},
       {:ex_doc, "~> 0.29", only: :dev, runtime: false}
     ]
   end
@@ -45,7 +46,8 @@ defmodule SelectoDBPostgreSQL.MixProject do
   defp use_local_ecosystem? do
     case System.get_env("SELECTO_ECOSYSTEM_USE_LOCAL") do
       value when value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] -> true
-      _ -> false
+      value when value in ["0", "false", "FALSE", "no", "NO", "off", "OFF"] -> false
+      _ -> File.dir?(Path.expand("../selecto", __DIR__))
     end
   end
 
