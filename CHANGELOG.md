@@ -1,6 +1,12 @@
 CHANGES
 =======
 
+V 0.4.1
+--------
+
+- Relaxed the `selecto` dependency to allow releases from `0.4.0` up to `0.5.x`.
+- Bump package version to `0.4.1`.
+
 V 0.4.0
 --------
 
