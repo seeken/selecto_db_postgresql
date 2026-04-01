@@ -1,6 +1,12 @@
 CHANGES
 =======
 
+Unreleased
+----------
+
+- Added `list_relations/2` support so PostgreSQL adapter introspection can
+  return tables, views, and materialized views for DB-backed generator flows.
+
 V 0.4.1
 --------
 

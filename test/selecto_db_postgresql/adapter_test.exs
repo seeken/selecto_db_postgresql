@@ -60,6 +60,35 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
              SelectoDBPostgreSQL.Adapter.list_tables(connection, schema: "public")
   end
 
+  test "postgres adapter lists relations including views when requested" do
+    connection = %{
+      query_fun: fn query, params, _opts ->
+        assert query =~ "pg_matviews"
+        assert params == ["public"]
+
+        {:ok,
+         %{
+           rows: [
+             ["products", "table"],
+             ["active_customers", "view"],
+             ["daily_rollup", "materialized_view"]
+           ]
+         }}
+      end
+    }
+
+    assert {:ok,
+            [
+              %{name: "products", source_kind: :table},
+              %{name: "active_customers", source_kind: :view},
+              %{name: "daily_rollup", source_kind: :materialized_view}
+            ]} =
+             SelectoDBPostgreSQL.Adapter.list_relations(connection,
+               schema: "public",
+               include_views: true
+             )
+  end
+
   test "postgres adapter introspects table metadata and belongs_to associations" do
     connection = %{query_fun: &introspection_query_stub/3}
 
