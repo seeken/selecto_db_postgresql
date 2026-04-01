@@ -9,12 +9,14 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
 
   test "adapter exposes the selecto adapter contract" do
     assert Code.ensure_loaded?(SelectoDBPostgreSQL.Adapter)
+    assert Code.ensure_loaded?(SelectoDBPostgreSQL.UpdatoAdapter)
     assert function_exported?(SelectoDBPostgreSQL.Adapter, :name, 0)
     assert function_exported?(SelectoDBPostgreSQL.Adapter, :connect, 1)
     assert function_exported?(SelectoDBPostgreSQL.Adapter, :execute, 4)
     assert function_exported?(SelectoDBPostgreSQL.Adapter, :placeholder, 1)
     assert function_exported?(SelectoDBPostgreSQL.Adapter, :quote_identifier, 1)
     assert function_exported?(SelectoDBPostgreSQL.Adapter, :supports?, 1)
+    assert function_exported?(SelectoDBPostgreSQL.UpdatoAdapter, :merge_upsert_opts, 4)
   end
 
   test "postgres adapter reports expected placeholder and quoting strategy" do

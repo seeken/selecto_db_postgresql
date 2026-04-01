@@ -28,6 +28,7 @@ defmodule SelectoDBPostgreSQL.MixProject do
   defp deps do
     [
       selecto_dep(),
+      selecto_updato_dep(),
       selecto_components_dep(),
       {:postgrex, ">= 0.0.0"},
       {:ecto_sql, "~> 3.12"},
@@ -40,6 +41,14 @@ defmodule SelectoDBPostgreSQL.MixProject do
       {:selecto, path: "../selecto"}
     else
       {:selecto, ">= 0.4.0 and < 0.6.0"}
+    end
+  end
+
+  defp selecto_updato_dep do
+    if use_local_ecosystem?() do
+      {:selecto_updato, path: "../selecto_updato"}
+    else
+      {:selecto_updato, ">= 0.1.0 and < 0.3.0"}
     end
   end
 
