@@ -111,8 +111,23 @@ defmodule SelectoDBPostgreSQL.Adapter do
       :lateral_join,
       :prefix,
       :stream,
-      :schema_introspection
+      :schema_introspection,
+      :materialized_view_refresh,
+      :materialized_view_refresh_concurrently
     ]
+  end
+
+  @impl true
+  def refresh_materialized_view(connection, database_name, opts \\ []) do
+    query =
+      Selecto.ViewPublisher.refresh_sql(database_name,
+        concurrently: Keyword.get(opts, :concurrently, false)
+      )
+
+    case introspection_query(connection, query, []) do
+      {:ok, result} -> {:ok, result}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @impl true

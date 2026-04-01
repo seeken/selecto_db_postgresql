@@ -46,6 +46,11 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
     assert SelectoDBPostgreSQL.Adapter.supports?(:schema_introspection)
   end
 
+  test "postgres adapter reports materialized view refresh support" do
+    assert SelectoDBPostgreSQL.Adapter.supports?(:materialized_view_refresh)
+    assert SelectoDBPostgreSQL.Adapter.supports?(:materialized_view_refresh_concurrently)
+  end
+
   test "postgres adapter lists tables through schema introspection" do
     connection = %{
       query_fun: fn query, params, _opts ->
@@ -86,6 +91,25 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
              SelectoDBPostgreSQL.Adapter.list_relations(connection,
                schema: "public",
                include_views: true
+             )
+  end
+
+  test "postgres adapter refreshes materialized views" do
+    connection = %{
+      query_fun: fn query, params, opts ->
+        assert query == "REFRESH MATERIALIZED VIEW CONCURRENTLY reporting.daily_rollup;"
+        assert params == []
+        assert opts == [prepared: false]
+
+        {:ok, %{rows: [], columns: []}}
+      end
+    }
+
+    assert {:ok, _} =
+             SelectoDBPostgreSQL.Adapter.refresh_materialized_view(
+               connection,
+               "reporting.daily_rollup",
+               concurrently: true
              )
   end
 
