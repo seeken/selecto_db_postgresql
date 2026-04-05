@@ -4,6 +4,9 @@ CHANGES
 Unreleased
 ----------
 
+- Dropped the library dependency on `selecto_updato`; PostgreSQL write-adapter
+  ownership now stays inside `selecto_updato`'s generic write path instead of a
+  package-local `UpdatoAdapter` module.
 - Added `list_relations/2` support so PostgreSQL adapter introspection can
   return tables, views, and materialized views for DB-backed generator flows.
 - Added `refresh_materialized_view/3` support, including concurrent refresh SQL
