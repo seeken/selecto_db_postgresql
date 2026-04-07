@@ -1,7 +1,7 @@
 CHANGES
 =======
 
-Unreleased
+V 0.4.2
 ----------
 
 - Dropped the library dependency on `selecto_updato`; PostgreSQL write-adapter
@@ -11,6 +11,7 @@ Unreleased
   return tables, views, and materialized views for DB-backed generator flows.
 - Added `refresh_materialized_view/3` support, including concurrent refresh SQL
   for materialized-view publication workflows.
+- Bump package version to `0.4.2`.
 
 V 0.4.1
 --------
