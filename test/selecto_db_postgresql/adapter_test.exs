@@ -44,6 +44,11 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
     assert SelectoDBPostgreSQL.Adapter.supports?(:schema_introspection)
   end
 
+  test "postgres adapter reports materialized view refresh support" do
+    assert SelectoDBPostgreSQL.Adapter.supports?(:materialized_view_refresh)
+    assert SelectoDBPostgreSQL.Adapter.supports?(:materialized_view_refresh_concurrently)
+  end
+
   test "postgres adapter lists tables through schema introspection" do
     connection = %{
       query_fun: fn query, params, _opts ->
@@ -56,6 +61,54 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
 
     assert {:ok, ["products", "users"]} =
              SelectoDBPostgreSQL.Adapter.list_tables(connection, schema: "public")
+  end
+
+  test "postgres adapter lists relations including views when requested" do
+    connection = %{
+      query_fun: fn query, params, _opts ->
+        assert query =~ "pg_matviews"
+        assert params == ["public"]
+
+        {:ok,
+         %{
+           rows: [
+             ["products", "table"],
+             ["active_customers", "view"],
+             ["daily_rollup", "materialized_view"]
+           ]
+         }}
+      end
+    }
+
+    assert {:ok,
+            [
+              %{name: "products", source_kind: :table},
+              %{name: "active_customers", source_kind: :view},
+              %{name: "daily_rollup", source_kind: :materialized_view}
+            ]} =
+             SelectoDBPostgreSQL.Adapter.list_relations(connection,
+               schema: "public",
+               include_views: true
+             )
+  end
+
+  test "postgres adapter refreshes materialized views" do
+    connection = %{
+      query_fun: fn query, params, opts ->
+        assert query == "REFRESH MATERIALIZED VIEW CONCURRENTLY reporting.daily_rollup;"
+        assert params == []
+        assert opts == [prepared: false]
+
+        {:ok, %{rows: [], columns: []}}
+      end
+    }
+
+    assert {:ok, _} =
+             SelectoDBPostgreSQL.Adapter.refresh_materialized_view(
+               connection,
+               "reporting.daily_rollup",
+               concurrently: true
+             )
   end
 
   test "postgres adapter introspects table metadata and belongs_to associations" do
