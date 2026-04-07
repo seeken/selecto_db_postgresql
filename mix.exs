@@ -28,7 +28,6 @@ defmodule SelectoDBPostgreSQL.MixProject do
   defp deps do
     [
       selecto_dep(),
-      selecto_components_dep(),
       {:postgrex, ">= 0.0.0"},
       {:ecto_sql, "~> 3.12"},
       {:ex_doc, "~> 0.29", only: :dev, runtime: false}
@@ -48,14 +47,6 @@ defmodule SelectoDBPostgreSQL.MixProject do
       value when value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] -> true
       value when value in ["0", "false", "FALSE", "no", "NO", "off", "OFF"] -> false
       _ -> File.dir?(Path.expand("../selecto", __DIR__))
-    end
-  end
-
-  defp selecto_components_dep do
-    if use_local_ecosystem?() do
-      {:selecto_components, path: "../selecto_components", only: :test}
-    else
-      {:selecto_components, ">= 0.4.0 and < 0.5.0", only: :test}
     end
   end
 
