@@ -35,7 +35,7 @@ selecto =
 
 ## Local Workspace Development
 
-For local multi-repo development against vendored ecosystem packages, set:
+For local multi-repo workspace development, set:
 
 ```bash
 SELECTO_ECOSYSTEM_USE_LOCAL=true
