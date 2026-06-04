@@ -892,7 +892,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp map_udt_fallback(connection, _data_type, udt_name) when is_binary(udt_name) do
     case map_user_defined_type(connection, udt_name) do
       :string -> :string
-      other -> other
     end
   end
 
