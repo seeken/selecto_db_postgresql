@@ -1,6 +1,13 @@
 CHANGES
 =======
 
+V 0.4.4
+----------
+
+- Updated packaged `selecto` compatibility and README dependency guidance for
+  the coordinated Selecto ecosystem point release.
+- Bump package version to `0.4.4`.
+
 V 0.4.3
 ----------
 
