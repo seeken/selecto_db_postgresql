@@ -6,3 +6,4 @@ erl_crash.dump
 /doc/
 
 .expert/
+.DS_Store

@@ -1,6 +1,14 @@
 CHANGES
 =======
 
+V 0.4.5
+----------
+
+- Start the `:postgrex` application before opening direct adapter connections
+  so `SelectoDBPostgreSQL.Adapter.connect/1` works reliably in script and
+  generator contexts that have not already started dependency applications.
+- Bump package version to `0.4.5`.
+
 V 0.4.4
 ----------
 
