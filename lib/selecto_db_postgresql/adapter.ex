@@ -5,6 +5,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @behaviour Selecto.DB.Adapter
 
+  alias SelectoDBPostgreSQL.Identifier
+
   @impl true
   def name, do: :postgresql
 
@@ -520,7 +522,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
                              _ordinal_position
                            ] ->
            %{
-             column_name: String.to_atom(column_name),
+             column_name: Identifier.to_atom!(column_name),
              data_type: data_type,
              udt_name: udt_name,
              is_nullable: is_nullable,
@@ -549,8 +551,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
     case introspection_query(connection, query, [schema, table_name]) do
       {:ok, %{rows: []}} -> {:ok, nil}
-      {:ok, %{rows: [[single_key]]}} -> {:ok, String.to_atom(single_key)}
-      {:ok, %{rows: rows}} -> {:ok, Enum.map(rows, fn [key] -> String.to_atom(key) end)}
+      {:ok, %{rows: [[single_key]]}} -> {:ok, Identifier.to_atom!(single_key)}
+      {:ok, %{rows: rows}} -> {:ok, Enum.map(rows, fn [key] -> Identifier.to_atom!(key) end)}
       {:error, reason} -> {:error, {:primary_key_query_failed, reason}}
     end
   end
@@ -588,10 +590,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
                            ] ->
            %{
              constraint_name: constraint_name,
-             column_name: String.to_atom(column_name),
+             column_name: Identifier.to_atom!(column_name),
              foreign_table_schema: foreign_schema,
              foreign_table_name: foreign_table,
-             foreign_column_name: String.to_atom(foreign_col)
+             foreign_column_name: Identifier.to_atom!(foreign_col)
            }
          end)}
 
@@ -631,8 +633,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
                            ] ->
            %{
              referencing_table: referencing_table,
-             referencing_column: String.to_atom(referencing_column),
-             referenced_column: String.to_atom(referenced_column),
+             referencing_column: Identifier.to_atom!(referencing_column),
+             referenced_column: Identifier.to_atom!(referenced_column),
              constraint_name: constraint_name
            }
          end)}
@@ -648,7 +650,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         foreign_key.column_name
         |> Atom.to_string()
         |> String.replace_suffix("_id", "")
-        |> String.to_atom()
+        |> Identifier.to_atom!()
 
       related_module_name = table_name_to_module(foreign_key.foreign_table_name)
 
@@ -659,7 +661,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
          related_schema: related_module_name,
          related_module_name: related_module_name,
          related_table: foreign_key.foreign_table_name,
-         queryable: String.to_atom(foreign_key.foreign_table_name),
+         queryable: Identifier.to_atom!(foreign_key.foreign_table_name),
          field: association_name,
          owner_key: foreign_key.column_name,
          related_key: foreign_key.foreign_column_name,
@@ -680,7 +682,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
       has_many =
         Enum.into(reverse_foreign_keys, %{}, fn reverse_foreign_key ->
-          association_name = String.to_atom(reverse_foreign_key.referencing_table)
+          association_name = Identifier.to_atom!(reverse_foreign_key.referencing_table)
           related_module_name = table_name_to_module(reverse_foreign_key.referencing_table)
 
           {association_name,
@@ -690,7 +692,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
              related_schema: related_module_name,
              related_module_name: related_module_name,
              related_table: reverse_foreign_key.referencing_table,
-             queryable: String.to_atom(reverse_foreign_key.referencing_table),
+             queryable: Identifier.to_atom!(reverse_foreign_key.referencing_table),
              field: association_name,
              owner_key: primary_key_field,
              related_key: reverse_foreign_key.referencing_column,
@@ -710,7 +712,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
             end)
 
           Enum.map(other_foreign_keys, fn other_foreign_key ->
-            association_name = String.to_atom(other_foreign_key.foreign_table_name)
+            association_name = Identifier.to_atom!(other_foreign_key.foreign_table_name)
             related_module_name = table_name_to_module(other_foreign_key.foreign_table_name)
 
             owner_foreign_key =
@@ -726,7 +728,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
                related_schema: related_module_name,
                related_module_name: related_module_name,
                related_table: other_foreign_key.foreign_table_name,
-               queryable: String.to_atom(other_foreign_key.foreign_table_name),
+               queryable: Identifier.to_atom!(other_foreign_key.foreign_table_name),
                field: association_name,
                owner_key: primary_key_field,
                related_key: other_foreign_key.foreign_column_name,

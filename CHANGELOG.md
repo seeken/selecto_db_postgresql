@@ -1,6 +1,15 @@
 CHANGES
 =======
 
+V 0.4.6
+----------
+
+- Bounded atom conversion for PostgreSQL schema, table, column, primary-key,
+  and association identifiers while preserving the adapter's published
+  atom-keyed introspection contract.
+- Updated the coordinated Selecto dependency baseline to `0.4.9`.
+- Bump package version to `0.4.6`.
+
 V 0.4.5
 ----------
 
