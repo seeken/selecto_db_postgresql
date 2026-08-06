@@ -29,7 +29,6 @@ defmodule SelectoDBPostgreSQL.MixProject do
     [
       selecto_dep(),
       {:postgrex, ">= 0.0.0"},
-      {:ecto_sql, "~> 3.12"},
       {:ex_doc, "~> 0.29", only: :dev, runtime: false}
     ]
   end

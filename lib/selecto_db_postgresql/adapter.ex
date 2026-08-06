@@ -4,8 +4,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
   """
 
   @behaviour Selecto.DB.Adapter
+  @behaviour Selecto.DB.WriteAdapter
 
   alias SelectoDBPostgreSQL.Identifier
+  alias SelectoDBPostgreSQL.WriteCompiler
+  alias Selecto.Write.{Batch, Command, Error, Result}
 
   @impl true
   def name, do: :postgresql
@@ -41,6 +44,60 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   def execute(connection, _query, _params, _opts), do: {:error, {:invalid_connection, connection}}
 
+  @impl Selecto.DB.WriteAdapter
+  def write_capabilities(_connection) do
+    %{
+      insert: true,
+      update: true,
+      delete: true,
+      returning: true,
+      atomic_batch: true,
+      transactions: true,
+      dialect: :postgresql
+    }
+  end
+
+  @impl Selecto.DB.WriteAdapter
+  def preview_write(_connection, command, opts \\ []) do
+    WriteCompiler.preview(command, opts)
+  end
+
+  @impl Selecto.DB.WriteAdapter
+  def execute_write(connection, command, opts \\ [])
+
+  def execute_write(connection, %Command{} = command, opts) do
+    with {:ok, statement} <- WriteCompiler.compile(command, opts),
+         {:ok, query_result} <- execute(connection, statement.text, statement.params, opts),
+         {:ok, affected_rows} <- enforce_cardinality(command, query_result) do
+      {:ok,
+       %Result{
+         operation: command.operation,
+         affected_rows: affected_rows,
+         rows: result_rows(query_result),
+         metadata: %{dialect: :postgresql}
+       }}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> {:error, write_error(:execution_failed, reason)}
+    end
+  end
+
+  def execute_write(connection, %Batch{} = batch, opts) do
+    with_postgres_transaction(connection, opts, fn transactional_connection ->
+      batch.commands
+      |> Enum.reduce_while({:ok, []}, fn command, {:ok, results} ->
+        case execute_write(transactional_connection, command, opts) do
+          {:ok, result} -> {:cont, {:ok, [result | results]}}
+          {:error, %Error{} = error} -> {:halt, {:error, error}}
+        end
+      end)
+      |> case do
+        {:ok, results} -> {:ok, Enum.reverse(results)}
+        {:error, error} -> {:error, error}
+      end
+    end)
+  end
+
   @impl true
   def execute_pool(pool_ref, query, params, opts) do
     use_prepared = Keyword.get(opts, :prepared, true)
@@ -58,12 +115,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @impl true
   def execute_raw(connection, query, params) do
     cond do
-      repo_module?(connection) ->
-        case Kernel.apply(Ecto.Adapters.SQL, :query, [connection, normalize_query(query), params]) do
-          {:ok, result} -> {:ok, normalize_result(result)}
-          {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
-        end
-
       match?({:pool, _}, connection) ->
         case execute(connection, query, params, prepared: false) do
           {:ok, result} -> {:ok, result}
@@ -297,9 +348,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @impl true
   def validate_connection(connection) do
     cond do
-      repo_module?(connection) ->
-        :ok
-
       is_atom(connection) and not is_nil(connection) ->
         :ok
 
@@ -319,9 +367,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @impl true
   def connection_info(connection) do
     cond do
-      repo_module?(connection) ->
-        %{type: :ecto_repo, repo: connection, status: :connected}
-
       is_atom(connection) and not is_nil(connection) ->
         %{type: :postgrex, pid: connection, status: :connected}
 
@@ -380,54 +425,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp normalize_relation_source_kind("view"), do: :view
   defp normalize_relation_source_kind("materialized_view"), do: :materialized_view
   defp normalize_relation_source_kind(other), do: other
-
-  @impl true
-  def execute_repo_fallback(repo, query, params) do
-    config = apply(repo, :config, [])
-
-    postgrex_opts =
-      config
-      |> Keyword.take([
-        :username,
-        :password,
-        :hostname,
-        :database,
-        :port,
-        :socket,
-        :socket_dir,
-        :parameters,
-        :ssl,
-        :ssl_opts,
-        :types,
-        :timeout,
-        :connect_timeout,
-        :prepare,
-        :queue_target,
-        :queue_interval,
-        :backoff_type,
-        :backoff_min,
-        :backoff_max,
-        :idle_interval,
-        :sslmode,
-        :cacertfile,
-        :certfile,
-        :keyfile
-      ])
-      |> Keyword.put_new(:hostname, "localhost")
-      |> Keyword.put_new(:port, 5432)
-      |> Keyword.put(:supervisor, false)
-
-    case Postgrex.start_link(postgrex_opts) do
-      {:ok, conn} ->
-        result = execute(conn, query, params, [])
-        GenServer.stop(conn)
-        result
-
-      {:error, reason} ->
-        {:error,
-         Selecto.Error.connection_error("Failed to connect to database", %{reason: reason})}
-    end
-  end
 
   @impl true
   def start_pool(connection_config, pool_config, pool_name) do
@@ -1032,19 +1029,72 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp normalize_result(%{rows: rows, columns: columns}) do
+  defp normalize_result(%{rows: rows, columns: columns} = result) do
     %{
       rows: rows || [],
-      columns: Enum.map(columns || [], &to_string/1)
+      columns: Enum.map(columns || [], &to_string/1),
+      num_rows: Map.get(result, :num_rows, length(rows || []))
     }
   end
 
-  defp repo_module?(connection) when is_atom(connection) do
-    Code.ensure_loaded?(connection) and function_exported?(connection, :config, 0) and
-      function_exported?(connection, :__adapter__, 0)
+  defp enforce_cardinality(%Command{expected_cardinality: expected}, result) do
+    affected_rows = Map.get(result, :num_rows, length(Map.get(result, :rows, [])))
+
+    if cardinality_matches?(affected_rows, expected) do
+      {:ok, affected_rows}
+    else
+      {:error,
+       Error.new(:cardinality_mismatch, "write affected an unexpected number of rows",
+         details: %{expected: expected, actual: affected_rows}
+       )}
+    end
   end
 
-  defp repo_module?(_), do: false
+  defp cardinality_matches?(count, {:exactly, expected}), do: count == expected
+  defp cardinality_matches?(count, {:at_most, expected}), do: count <= expected
+  defp cardinality_matches?(count, {:at_least, expected}), do: count >= expected
+
+  defp cardinality_matches?(count, {:between, minimum, maximum}),
+    do: count >= minimum and count <= maximum
+
+  defp cardinality_matches?(_count, :many), do: true
+
+  defp result_rows(%{rows: rows, columns: columns}) do
+    Enum.map(rows || [], fn row -> Enum.zip(columns || [], row) |> Map.new() end)
+  end
+
+  defp with_postgres_transaction({:pool, pool_ref}, opts, fun) do
+    case Selecto.ConnectionPool.get_pool_pid(pool_ref) do
+      {:ok, pool_pid} -> with_postgres_transaction(pool_pid, opts, fun)
+      {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+    end
+  end
+
+  defp with_postgres_transaction(connection, opts, fun)
+       when is_pid(connection) or is_atom(connection) do
+    case Postgrex.transaction(
+           connection,
+           fn transaction_connection ->
+             case fun.(transaction_connection) do
+               {:ok, results} -> results
+               {:error, error} -> Postgrex.rollback(transaction_connection, error)
+             end
+           end,
+           opts
+         ) do
+      {:ok, results} -> {:ok, results}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+    end
+  end
+
+  defp with_postgres_transaction(connection, _opts, _fun) do
+    {:error, write_error(:transaction_failed, {:invalid_connection, connection})}
+  end
+
+  defp write_error(type, reason) do
+    Error.new(type, "PostgreSQL write failed", details: %{reason: reason})
+  end
 
   defp resolve_stream_pool_connection(pool_ref) when is_pid(pool_ref) or is_atom(pool_ref) do
     {:ok, pool_ref}
