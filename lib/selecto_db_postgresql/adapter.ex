@@ -35,7 +35,18 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  def execute(connection, query, params, opts) when is_pid(connection) or is_atom(connection) do
+  def execute(connection, query, params, opts) when is_atom(connection) do
+    execute_module_connection(connection, query, params, opts)
+  end
+
+  def execute(connection, query, params, opts) when is_pid(connection) do
+    case Postgrex.query(connection, normalize_query(query), params, opts) do
+      {:ok, result} -> {:ok, normalize_result(result)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def execute(%DBConnection{} = connection, query, params, opts) do
     case Postgrex.query(connection, normalize_query(query), params, opts) do
       {:ok, result} -> {:ok, normalize_result(result)}
       {:error, reason} -> {:error, reason}
@@ -66,6 +77,28 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def execute_write(connection, command, opts \\ [])
 
   def execute_write(connection, %Command{} = command, opts) do
+    with_postgres_transaction(connection, opts, fn transactional_connection ->
+      execute_write_command(transactional_connection, command, opts)
+    end)
+  end
+
+  def execute_write(connection, %Batch{} = batch, opts) do
+    with_postgres_transaction(connection, opts, fn transactional_connection ->
+      batch.commands
+      |> Enum.reduce_while({:ok, []}, fn command, {:ok, results} ->
+        case execute_write_command(transactional_connection, command, opts) do
+          {:ok, result} -> {:cont, {:ok, [result | results]}}
+          {:error, %Error{} = error} -> {:halt, {:error, error}}
+        end
+      end)
+      |> case do
+        {:ok, results} -> {:ok, Enum.reverse(results)}
+        {:error, error} -> {:error, error}
+      end
+    end)
+  end
+
+  defp execute_write_command(connection, %Command{} = command, opts) do
     with {:ok, statement} <- WriteCompiler.compile(command, opts),
          {:ok, query_result} <- execute(connection, statement.text, statement.params, opts),
          {:ok, affected_rows} <- enforce_cardinality(command, query_result) do
@@ -80,22 +113,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
       {:error, %Error{} = error} -> {:error, error}
       {:error, reason} -> {:error, write_error(:execution_failed, reason)}
     end
-  end
-
-  def execute_write(connection, %Batch{} = batch, opts) do
-    with_postgres_transaction(connection, opts, fn transactional_connection ->
-      batch.commands
-      |> Enum.reduce_while({:ok, []}, fn command, {:ok, results} ->
-        case execute_write(transactional_connection, command, opts) do
-          {:ok, result} -> {:cont, {:ok, [result | results]}}
-          {:error, %Error{} = error} -> {:halt, {:error, error}}
-        end
-      end)
-      |> case do
-        {:ok, results} -> {:ok, Enum.reverse(results)}
-        {:error, error} -> {:error, error}
-      end
-    end)
   end
 
   @impl true
@@ -120,6 +137,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
           {:ok, result} -> {:ok, result}
           {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
         end
+
+      is_atom(connection) and ecto_repo?(connection) ->
+        execute_ecto_query(connection, query, params)
 
       is_pid(connection) or (is_atom(connection) and not is_nil(connection)) ->
         case Postgrex.query(connection, normalize_query(query), params) do
@@ -476,6 +496,34 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)
+
+  # An Ecto repository is a supervision tree, not a DBConnection process. Route it
+  # through Ecto when the host application has Ecto available; keep it optional so
+  # native Postgrex users do not need Ecto in their dependency graph.
+  defp execute_module_connection(connection, query, params, opts) do
+    if ecto_repo?(connection) do
+      execute_ecto_query(connection, query, params)
+    else
+      case Postgrex.query(connection, normalize_query(query), params, opts) do
+        {:ok, result} -> {:ok, normalize_result(result)}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp execute_ecto_query(repo, query, params) do
+    case apply(Ecto.Adapters.SQL, :query, [repo, normalize_query(query), params]) do
+      {:ok, result} -> {:ok, normalize_result(result)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp ecto_repo?(module) when is_atom(module) do
+    Code.ensure_loaded?(module) and function_exported?(module, :__adapter__, 0) and
+      Code.ensure_loaded?(Ecto.Adapters.SQL) and function_exported?(Ecto.Adapters.SQL, :query, 3)
+  end
+
+  defp ecto_repo?(_), do: false
 
   defp introspection_query(connection, query, params) do
     case connection do

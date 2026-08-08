@@ -224,6 +224,33 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     end
   end
 
+  defp compile_predicate({:in, {:field, field}, values}, opts, offset)
+       when is_list(values) and values != [] do
+    values
+    |> Enum.reduce_while({:ok, [], [], offset}, fn value, {:ok, texts, params, next_offset} ->
+      case compile_value(value, opts, next_offset) do
+        {:ok, compiled} ->
+          {:cont,
+           {:ok, [compiled.text | texts], params ++ compiled.params,
+            next_offset + length(compiled.params)}}
+
+        {:error, _} = error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, texts, params, _next_offset} ->
+        {:ok,
+         %{
+           text: "#{quote_identifier(field)} IN (#{texts |> Enum.reverse() |> Enum.join(", ")})",
+           params: params
+         }}
+
+      error ->
+        error
+    end
+  end
+
   defp compile_predicate({operator, {:field, field}, value}, opts, offset)
        when operator in [:eq, :neq, :gt, :gte, :lt, :lte] do
     with {:ok, compiled_value} <- compile_value(value, opts, offset) do
@@ -276,6 +303,9 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
         error
     end
   end
+
+  defp compile_value({:literal, {:system, :now}}, _opts, _offset),
+    do: {:ok, %{text: "CURRENT_TIMESTAMP", params: []}}
 
   defp compile_value({:literal, value}, _opts, offset), do: parameter(value, offset)
 

@@ -23,6 +23,51 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
     assert sql == "UPDATE \"items\" SET \"name\" = $1 WHERE \"tenant_id\" = $2"
   end
 
+  test "compiles a non-empty IN predicate with one parameter per target id" do
+    {:ok, command} =
+      Command.new(%{
+        operation: :update,
+        relation: :items,
+        assignments: [%{field: :state, value: {:literal, "archived"}}],
+        predicate:
+          {:and,
+           [
+             {:in, {:field, :id}, [{:literal, 41}, {:literal, 42}, {:literal, 43}]},
+             {:eq, {:field, :state}, {:literal, "done"}}
+           ]},
+        expected_cardinality: {:exactly, 3}
+      })
+
+    assert {:ok, %{statements: [%{text: sql, params: params}]}} =
+             Adapter.preview_write(:unused, command)
+
+    assert sql ==
+             "UPDATE \"items\" SET \"state\" = $1 WHERE (\"id\" IN ($2, $3, $4) AND \"state\" = $5)"
+
+    assert params == ["archived", 41, 42, 43, "done"]
+  end
+
+  test "compiles the portable system-now token as an adapter-owned timestamp expression" do
+    {:ok, command} =
+      Command.new(%{
+        operation: :update,
+        relation: :items,
+        assignments: [
+          %{field: :state, value: {:literal, "archived"}},
+          %{field: :archived_at, value: {:literal, {:system, :now}}}
+        ],
+        predicate: {:eq, {:field, :id}, {:literal, 41}}
+      })
+
+    assert {:ok, %{statements: [%{text: sql, params: params}]}} =
+             Adapter.preview_write(:unused, command)
+
+    assert sql ==
+             "UPDATE \"items\" SET \"state\" = $1, \"archived_at\" = CURRENT_TIMESTAMP WHERE \"id\" = $2"
+
+    assert params == ["archived", 41]
+  end
+
   test "fails closed for missing tenant context and raw SQL" do
     assert {:error, %Error{type: :missing_context}} =
              Adapter.preview_write(:unused, command!(:update))

@@ -1,7 +1,7 @@
 defmodule SelectoDBPostgreSQL.MixProject do
   use Mix.Project
 
-  @version "0.4.6"
+  @version "0.4.7"
   @source_url "https://github.com/seeken/selecto_db_postgresql"
 
   def project do

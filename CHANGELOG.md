@@ -1,6 +1,19 @@
 CHANGES
 =======
 
+V 0.4.7
+--------
+
+- Added adapter-owned compilation for portable non-empty `IN` predicates and
+  system-time values used by governed multi-row actions.
+- Wrapped individual write commands in PostgreSQL transactions so exact
+  cardinality mismatches roll back instead of committing partial mutations.
+- Added optional Ecto Repo connection routing inside the PostgreSQL adapter
+  while keeping native Postgrex connections independent of Ecto configuration.
+- Added regression coverage for bound target identifiers, portable timestamps,
+  and transactional cardinality enforcement.
+- Bump package version to `0.4.7`.
+
 V 0.4.6
 ----------
 
