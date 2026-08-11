@@ -1,6 +1,15 @@
 CHANGES
 =======
 
+Unreleased
+----------
+
+- Require portable upsert commands to carry a domain-governed update-field
+  list, reject unknown assignments, and compile an empty list as
+  `DO NOTHING`.
+- Prevent conflict updates from implicitly rewriting every inserted column,
+  including tenant, foreign-key, immutable, and external-identifier fields.
+
 V 0.4.7
 --------
 

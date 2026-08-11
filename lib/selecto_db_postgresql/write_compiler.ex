@@ -67,12 +67,14 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
            assignments != [] or
              {:error, Error.new(:invalid_command, "upsert requires at least one assignment")},
          {:ok, conflict_target} <- compile_conflict_target(command.metadata),
+         {:ok, update_assignments} <-
+           compile_upsert_update_fields(command.metadata, assignments),
          {:ok, returning} <- compile_returning(command.returning) do
       {columns, values, params} = assignment_parts(assignments)
 
       with {:ok, guards} <-
              compile_foreign_key_guards(command.metadata, assignments, length(params)) do
-        update_set = Enum.map_join(columns, ", ", &"#{&1} = EXCLUDED.#{&1}")
+        conflict_action = compile_conflict_action(update_assignments)
 
         values_clause =
           case guards.text do
@@ -83,7 +85,7 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
         {:ok,
          %{
            text:
-             "INSERT INTO #{quote_relation(command.relation)} (#{Enum.join(columns, ", ")}) #{values_clause} ON CONFLICT (#{conflict_target}) DO UPDATE SET #{update_set}#{returning}",
+             "INSERT INTO #{quote_relation(command.relation)} (#{Enum.join(columns, ", ")}) #{values_clause} ON CONFLICT (#{conflict_target}) #{conflict_action}#{returning}",
            params: params ++ guards.params
          }}
       end
@@ -360,6 +362,56 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
            details: %{required: :conflict_target}
          )}
     end
+  end
+
+  defp compile_upsert_update_fields(metadata, assignments) do
+    case Map.fetch(metadata, :upsert_update_fields) do
+      {:ok, fields} when is_list(fields) ->
+        normalized_fields = Enum.map(fields, &to_string/1)
+        assigned_fields = MapSet.new(assignments, &to_string(&1.field))
+
+        cond do
+          Enum.any?(fields, &(not field_ref?(&1))) ->
+            invalid_upsert_update_fields(fields, :invalid_field)
+
+          length(normalized_fields) != MapSet.size(MapSet.new(normalized_fields)) ->
+            invalid_upsert_update_fields(fields, :duplicate_field)
+
+          Enum.any?(normalized_fields, &(not MapSet.member?(assigned_fields, &1))) ->
+            invalid_upsert_update_fields(fields, :field_not_assigned)
+
+          true ->
+            update_fields = MapSet.new(normalized_fields)
+
+            {:ok, Enum.filter(assignments, &MapSet.member?(update_fields, to_string(&1.field)))}
+        end
+
+      _ ->
+        {:error,
+         Error.new(
+           :invalid_command,
+           "upsert requires a domain-governed update field list",
+           details: %{required: :upsert_update_fields}
+         )}
+    end
+  end
+
+  defp invalid_upsert_update_fields(fields, reason) do
+    {:error,
+     Error.new(:invalid_command, "invalid domain-governed upsert update field list",
+       details: %{upsert_update_fields: fields, reason: reason}
+     )}
+  end
+
+  defp compile_conflict_action([]), do: "DO NOTHING"
+
+  defp compile_conflict_action(assignments) do
+    update_set =
+      Enum.map_join(assignments, ", ", fn assignment ->
+        "#{assignment.column} = EXCLUDED.#{assignment.column}"
+      end)
+
+    "DO UPDATE SET " <> update_set
   end
 
   defp map_commands(commands, fun) do

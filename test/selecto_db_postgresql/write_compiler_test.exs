@@ -88,7 +88,7 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
     assert capabilities.returning
   end
 
-  test "previews a portable upsert with an explicit conflict target" do
+  test "previews a portable upsert with domain-governed conflict and update fields" do
     {:ok, command} =
       Command.new(%{
         operation: :upsert,
@@ -97,14 +97,60 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
           %{field: :external_id, value: {:literal, "external-1"}},
           %{field: :name, value: {:literal, "new item"}}
         ],
-        metadata: %{conflict_target: [:external_id]}
+        metadata: %{conflict_target: [:external_id], upsert_update_fields: [:name]}
       })
 
     assert {:ok, %{statements: [%{text: sql, params: ["external-1", "new item"]}]}} =
              Adapter.preview_write(:unused, command)
 
     assert sql ==
-             "INSERT INTO \"items\" (\"external_id\", \"name\") VALUES ($1, $2) ON CONFLICT (\"external_id\") DO UPDATE SET \"external_id\" = EXCLUDED.\"external_id\", \"name\" = EXCLUDED.\"name\""
+             "INSERT INTO \"items\" (\"external_id\", \"name\") VALUES ($1, $2) ON CONFLICT (\"external_id\") DO UPDATE SET \"name\" = EXCLUDED.\"name\""
+  end
+
+  test "fails closed when an upsert lacks a domain-governed update field list" do
+    {:ok, command} =
+      Command.new(%{
+        operation: :upsert,
+        relation: :items,
+        assignments: [%{field: :external_id, value: {:literal, "external-1"}}],
+        metadata: %{conflict_target: [:external_id]}
+      })
+
+    assert {:error, %Error{type: :invalid_command, details: %{required: required}}} =
+             Adapter.preview_write(:unused, command)
+
+    assert required == :upsert_update_fields
+  end
+
+  test "compiles an empty governed upsert update set as DO NOTHING" do
+    {:ok, command} =
+      Command.new(%{
+        operation: :upsert,
+        relation: :items,
+        assignments: [%{field: :external_id, value: {:literal, "external-1"}}],
+        metadata: %{conflict_target: [:external_id], upsert_update_fields: []}
+      })
+
+    assert {:ok, %{statements: [%{text: sql}]}} = Adapter.preview_write(:unused, command)
+
+    assert sql ==
+             "INSERT INTO \"items\" (\"external_id\") VALUES ($1) ON CONFLICT (\"external_id\") DO NOTHING"
+  end
+
+  test "rejects governed upsert update fields that were not assigned" do
+    {:ok, command} =
+      Command.new(%{
+        operation: :upsert,
+        relation: :items,
+        assignments: [%{field: :external_id, value: {:literal, "external-1"}}],
+        metadata: %{
+          conflict_target: [:external_id],
+          upsert_update_fields: [:name]
+        }
+      })
+
+    assert {:error, %Error{type: :invalid_command, details: %{reason: :field_not_assigned}}} =
+             Adapter.preview_write(:unused, command)
   end
 
   test "compiles domain-provided foreign-key guards as parameterized reference checks" do
