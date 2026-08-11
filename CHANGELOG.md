@@ -1,6 +1,22 @@
 CHANGES
 =======
 
+V 0.4.9
+--------
+
+- Added atomic execution and preview for portable `Selecto.Write.Graph` values,
+  including topological generated-key propagation and normalized root results.
+- Added PostgreSQL 17+ owned-set `MERGE` compilation with typed parameter
+  sources, `RETURNING`, `merge_action()`, and delete-missing reconciliation.
+- Added an atomic ordered fallback for servers without the complete required
+  MERGE semantics; newly inserted identities are preserved during cleanup.
+- Added connection-aware MERGE capability reporting and real-database tests for
+  insert, sync, delete-missing, cross-owner rejection, and whole-graph rollback.
+- Fixed placeholder numbering when SQL expressions such as
+  `CURRENT_TIMESTAMP` occur between bound assignments.
+- Updated the coordinated Selecto dependency baseline to `0.4.11`.
+- Bump package version to `0.4.9`.
+
 V 0.4.8
 --------
 

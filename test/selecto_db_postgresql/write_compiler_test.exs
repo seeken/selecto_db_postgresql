@@ -68,6 +68,25 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
     assert params == ["archived", 41]
   end
 
+  test "does not leave parameter gaps when expressions appear between bound assignments" do
+    {:ok, command} =
+      Command.new(%{
+        operation: :insert,
+        relation: :items,
+        assignments: [
+          %{field: :name, value: {:literal, "new item"}},
+          %{field: :inserted_at, value: {:literal, {:system, :now}}},
+          %{field: :quantity, value: {:literal, 2}}
+        ]
+      })
+
+    assert {:ok, %{statements: [%{text: sql, params: ["new item", 2]}]}} =
+             Adapter.preview_write(:unused, command)
+
+    assert sql ==
+             "INSERT INTO \"items\" (\"name\", \"inserted_at\", \"quantity\") VALUES ($1, CURRENT_TIMESTAMP, $2)"
+  end
+
   test "fails closed for missing tenant context and raw SQL" do
     assert {:error, %Error{type: :missing_context}} =
              Adapter.preview_write(:unused, command!(:update))

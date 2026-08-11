@@ -49,6 +49,21 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
     assert SelectoDBPostgreSQL.Adapter.supports?(:materialized_view_refresh_concurrently)
   end
 
+  test "write capabilities report version-dependent MERGE semantics" do
+    pg18 = SelectoDBPostgreSQL.Adapter.write_capabilities(Pg18MockRepo)
+
+    assert pg18.write_graph
+    assert pg18.merge
+    assert pg18.merge_returning
+    assert pg18.merge_delete_missing
+    assert pg18.server_major == 18
+
+    unknown = SelectoDBPostgreSQL.Adapter.write_capabilities(:unused)
+    assert unknown.write_graph
+    refute unknown.merge
+    refute unknown.merge_returning
+  end
+
   test "postgres adapter lists tables through schema introspection" do
     connection = %{
       query_fun: fn query, params, _opts ->

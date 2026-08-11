@@ -142,20 +142,21 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
 
   defp compile_assignments(assignments, opts) do
     assignments
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {%{field: field, value: value}, index}, {:ok, acc} ->
-      case compile_value(value, opts, index) do
+    |> Enum.reduce_while({:ok, [], 0}, fn %{field: field, value: value},
+                                          {:ok, acc, next_offset} ->
+      case compile_value(value, opts, next_offset) do
         {:ok, %{text: text, params: params}} ->
           {:cont,
            {:ok,
-            [%{field: field, column: quote_identifier(field), text: text, params: params} | acc]}}
+            [%{field: field, column: quote_identifier(field), text: text, params: params} | acc],
+            next_offset + length(params)}}
 
         {:error, _} = error ->
           {:halt, error}
       end
     end)
     |> case do
-      {:ok, assignments} -> {:ok, Enum.reverse(assignments)}
+      {:ok, assignments, _offset} -> {:ok, Enum.reverse(assignments)}
       error -> error
     end
   end
@@ -214,20 +215,23 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
   defp field_ref?(value) when is_binary(value), do: String.trim(value) != ""
   defp field_ref?(_), do: false
 
-  defp compile_predicate({:and, predicates}, opts, offset) when is_list(predicates),
+  @doc false
+  def compile_predicate(predicate, opts \\ [], offset \\ 0)
+
+  def compile_predicate({:and, predicates}, opts, offset) when is_list(predicates),
     do: compile_predicate_list(predicates, " AND ", opts, offset)
 
-  defp compile_predicate({:or, predicates}, opts, offset) when is_list(predicates),
+  def compile_predicate({:or, predicates}, opts, offset) when is_list(predicates),
     do: compile_predicate_list(predicates, " OR ", opts, offset)
 
-  defp compile_predicate({:not, predicate}, opts, offset) do
+  def compile_predicate({:not, predicate}, opts, offset) do
     with {:ok, compiled} <- compile_predicate(predicate, opts, offset) do
       {:ok, %{text: "NOT (#{compiled.text})", params: compiled.params}}
     end
   end
 
-  defp compile_predicate({:in, {:field, field}, values}, opts, offset)
-       when is_list(values) and values != [] do
+  def compile_predicate({:in, {:field, field}, values}, opts, offset)
+      when is_list(values) and values != [] do
     values
     |> Enum.reduce_while({:ok, [], [], offset}, fn value, {:ok, texts, params, next_offset} ->
       case compile_value(value, opts, next_offset) do
@@ -244,7 +248,7 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
       {:ok, texts, params, _next_offset} ->
         {:ok,
          %{
-           text: "#{quote_identifier(field)} IN (#{texts |> Enum.reverse() |> Enum.join(", ")})",
+           text: "#{quote_field(field, opts)} IN (#{texts |> Enum.reverse() |> Enum.join(", ")})",
            params: params
          }}
 
@@ -253,26 +257,26 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     end
   end
 
-  defp compile_predicate({operator, {:field, field}, value}, opts, offset)
-       when operator in [:eq, :neq, :gt, :gte, :lt, :lte] do
+  def compile_predicate({operator, {:field, field}, value}, opts, offset)
+      when operator in [:eq, :neq, :gt, :gte, :lt, :lte] do
     with {:ok, compiled_value} <- compile_value(value, opts, offset) do
       operator_text = %{eq: "=", neq: "!=", gt: ">", gte: ">=", lt: "<", lte: "<="}[operator]
 
       {:ok,
        %{
-         text: "#{quote_identifier(field)} #{operator_text} #{compiled_value.text}",
+         text: "#{quote_field(field, opts)} #{operator_text} #{compiled_value.text}",
          params: compiled_value.params
        }}
     end
   end
 
-  defp compile_predicate({:is_null, {:field, field}}, _opts, _offset),
-    do: {:ok, %{text: "#{quote_identifier(field)} IS NULL", params: []}}
+  def compile_predicate({:is_null, {:field, field}}, opts, _offset),
+    do: {:ok, %{text: "#{quote_field(field, opts)} IS NULL", params: []}}
 
-  defp compile_predicate({:not_null, {:field, field}}, _opts, _offset),
-    do: {:ok, %{text: "#{quote_identifier(field)} IS NOT NULL", params: []}}
+  def compile_predicate({:not_null, {:field, field}}, opts, _offset),
+    do: {:ok, %{text: "#{quote_field(field, opts)} IS NOT NULL", params: []}}
 
-  defp compile_predicate(predicate, _opts, _offset) do
+  def compile_predicate(predicate, _opts, _offset) do
     {:error,
      Error.new(:invalid_predicate, "unsupported portable PostgreSQL predicate",
        details: %{predicate: predicate}
@@ -306,12 +310,15 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     end
   end
 
-  defp compile_value({:literal, {:system, :now}}, _opts, _offset),
+  @doc false
+  def compile_value(value, opts \\ [], offset \\ 0)
+
+  def compile_value({:literal, {:system, :now}}, _opts, _offset),
     do: {:ok, %{text: "CURRENT_TIMESTAMP", params: []}}
 
-  defp compile_value({:literal, value}, _opts, offset), do: parameter(value, offset)
+  def compile_value({:literal, value}, _opts, offset), do: parameter(value, offset)
 
-  defp compile_value({:context, key}, opts, offset) do
+  def compile_value({:context, key}, opts, offset) do
     context = Keyword.get(opts, :context, %{})
 
     case fetch_context(context, key) do
@@ -326,16 +333,16 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     end
   end
 
-  defp compile_value({:field, field}, _opts, _offset),
-    do: {:ok, %{text: quote_identifier(field), params: []}}
+  def compile_value({:field, field}, opts, _offset),
+    do: {:ok, %{text: quote_field(field, opts), params: []}}
 
-  defp compile_value({:unsafe_sql, _}, _opts, _offset),
+  def compile_value({:unsafe_sql, _}, _opts, _offset),
     do: {:error, Error.new(:invalid_command, "raw SQL is not allowed in portable writes")}
 
-  defp compile_value({:unsafe_fragment, _}, _opts, _offset),
+  def compile_value({:unsafe_fragment, _}, _opts, _offset),
     do: {:error, Error.new(:invalid_command, "raw SQL is not allowed in portable writes")}
 
-  defp compile_value(value, _opts, offset), do: parameter(value, offset)
+  def compile_value(value, _opts, offset), do: parameter(value, offset)
 
   defp parameter(value, offset), do: {:ok, %{text: "$#{offset + 1}", params: [value]}}
 
@@ -440,6 +447,13 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     |> to_string()
     |> String.replace("\"", "\"\"")
     |> then(&"\"#{&1}\"")
+  end
+
+  defp quote_field(field, opts) do
+    case Keyword.get(opts, :predicate_relation_alias) do
+      nil -> quote_identifier(field)
+      alias_name -> quote_identifier(alias_name) <> "." <> quote_identifier(field)
+    end
   end
 
   defp fetch_context(context, key) when is_map(context) do

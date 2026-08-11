@@ -7,8 +7,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @behaviour Selecto.DB.WriteAdapter
 
   alias SelectoDBPostgreSQL.Identifier
+  alias SelectoDBPostgreSQL.GraphCompiler
   alias SelectoDBPostgreSQL.WriteCompiler
-  alias Selecto.Write.{Batch, Command, Error, Result}
+  alias Selecto.Write.{Batch, Command, Error, Graph, Result}
 
   @impl true
   def name, do: :postgresql
@@ -56,21 +57,38 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def execute(connection, _query, _params, _opts), do: {:error, {:invalid_connection, connection}}
 
   @impl Selecto.DB.WriteAdapter
-  def write_capabilities(_connection) do
+  def write_capabilities(connection) do
+    server_major =
+      case server_version_major(connection) do
+        {:ok, major} -> major
+        _ -> nil
+      end
+
     %{
       insert: true,
       update: true,
       upsert: true,
       delete: true,
+      write_graph: true,
       returning: true,
       atomic_batch: true,
       transactions: true,
-      dialect: :postgresql
+      dialect: :postgresql,
+      server_major: server_major,
+      merge: is_integer(server_major) and server_major >= 15,
+      merge_returning: is_integer(server_major) and server_major >= 17,
+      merge_delete_missing: is_integer(server_major) and server_major >= 17
     }
   end
 
   @impl Selecto.DB.WriteAdapter
-  def preview_write(_connection, command, opts \\ []) do
+  def preview_write(connection, command, opts \\ [])
+
+  def preview_write(connection, %Graph{} = graph, opts) do
+    GraphCompiler.preview(graph, graph_server_major(connection, opts), opts)
+  end
+
+  def preview_write(_connection, command, opts) do
     WriteCompiler.preview(command, opts)
   end
 
@@ -97,6 +115,132 @@ defmodule SelectoDBPostgreSQL.Adapter do
         {:error, error} -> {:error, error}
       end
     end)
+  end
+
+  def execute_write(connection, %Graph{} = graph, opts) do
+    server_major = graph_server_major(connection, opts)
+
+    with_postgres_transaction(connection, opts, fn transactional_connection ->
+      execute_graph(transactional_connection, graph, server_major, opts)
+    end)
+  end
+
+  defp execute_graph(connection, %Graph{} = graph, server_major, opts) do
+    graph.nodes
+    |> Enum.reduce_while({:ok, %{}, 0, []}, fn node, {:ok, results, affected_rows, strategies} ->
+      with {:ok, materialized} <- GraphCompiler.materialize_node(node, results),
+           {:ok, node_results, node_affected, strategy} <-
+             execute_graph_node(connection, materialized, server_major, opts) do
+        results =
+          Map.merge(
+            results,
+            Map.new(node_results, fn {row_id, result} -> {{node.id, row_id}, result} end)
+          )
+
+        {:cont,
+         {:ok, results, affected_rows + node_affected, strategies ++ [{node.id, strategy}]}}
+      else
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, results, affected_rows, strategies} ->
+        root_result = Map.get(results, graph.root)
+
+        {:ok,
+         %Result{
+           operation: :graph,
+           affected_rows: affected_rows,
+           rows: graph_root_rows(root_result, graph_root_returning(graph)),
+           metadata: %{
+             dialect: :postgresql,
+             atomic?: true,
+             server_major: server_major,
+             node_strategies: Map.new(strategies)
+           }
+         }}
+
+      error ->
+        error
+    end
+  end
+
+  defp execute_graph_node(connection, node, server_major, opts) do
+    if GraphCompiler.merge_eligible?(node, server_major) do
+      with {:ok, statement} <- GraphCompiler.compile_merge(node, opts),
+           {:ok, query_result} <- execute(connection, statement.text, statement.params, opts),
+           {:ok, {results, affected_rows}} <- GraphCompiler.merge_results(node, query_result) do
+        {:ok, results, affected_rows, :merge}
+      else
+        {:error, %Error{} = error} -> {:error, error}
+        {:error, reason} -> {:error, write_error(:execution_failed, reason)}
+      end
+    else
+      execute_graph_node_fallback(connection, node, opts)
+    end
+  end
+
+  defp execute_graph_node_fallback(connection, node, opts) do
+    with {:ok, row_results, affected_rows} <- execute_graph_rows(connection, node.rows, opts),
+         {:ok, cleanup} <- GraphCompiler.delete_missing_command(node, row_results),
+         {:ok, cleanup_affected} <- execute_graph_cleanup(connection, cleanup, opts) do
+      {:ok, row_results, affected_rows + cleanup_affected, :ordered_fallback}
+    end
+  end
+
+  defp execute_graph_rows(connection, rows, opts) do
+    Enum.reduce_while(rows, {:ok, %{}, 0}, fn row, {:ok, results, affected_rows} ->
+      case execute_write_command(connection, row.command, opts) do
+        {:ok, result} ->
+          {:cont, {:ok, Map.put(results, row.id, result), affected_rows + result.affected_rows}}
+
+        {:error, _} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp execute_graph_cleanup(_connection, nil, _opts), do: {:ok, 0}
+
+  defp execute_graph_cleanup(connection, command, opts) do
+    case execute_write_command(connection, command, opts) do
+      {:ok, result} -> {:ok, result.affected_rows}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp graph_root_rows(_root_result, :none), do: []
+  defp graph_root_rows(%Result{rows: rows}, :all), do: rows
+
+  defp graph_root_rows(%Result{rows: rows}, fields) when is_list(fields) do
+    field_ids = MapSet.new(fields, &to_string/1)
+
+    Enum.map(rows, fn row ->
+      Map.new(row, fn {field, value} -> {field, value} end)
+      |> Map.filter(fn {field, _value} -> MapSet.member?(field_ids, to_string(field)) end)
+    end)
+  end
+
+  defp graph_root_rows(_root_result, _returning), do: []
+
+  defp graph_root_returning(graph) do
+    case Map.fetch(graph.metadata, :root_returning) do
+      {:ok, returning} -> returning
+      :error -> :all
+    end
+  end
+
+  defp graph_server_major(connection, opts) do
+    case Keyword.fetch(opts, :server_version_major) do
+      {:ok, major} when is_integer(major) and major > 0 ->
+        major
+
+      _ ->
+        case server_version_major(connection) do
+          {:ok, major} -> major
+          _ -> 0
+        end
+    end
   end
 
   defp execute_write_command(connection, %Command{} = command, opts) do
