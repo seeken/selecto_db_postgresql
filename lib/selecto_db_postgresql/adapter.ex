@@ -60,6 +60,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     %{
       insert: true,
       update: true,
+      upsert: true,
       delete: true,
       returning: true,
       atomic_batch: true,

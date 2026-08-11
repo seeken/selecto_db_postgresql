@@ -1,14 +1,21 @@
 CHANGES
 =======
 
-Unreleased
-----------
+V 0.4.8
+--------
 
+- Added the reusable Selecto write-adapter conformance suite for insert,
+  update, upsert, delete, and atomic batch previews.
+- Added a real-database release test proving a cardinality mismatch rolls back
+  every tentative row mutation.
+- Advertised upsert explicitly in adapter write capabilities.
 - Require portable upsert commands to carry a domain-governed update-field
   list, reject unknown assignments, and compile an empty list as
   `DO NOTHING`.
 - Prevent conflict updates from implicitly rewriting every inserted column,
   including tenant, foreign-key, immutable, and external-identifier fields.
+- Updated the coordinated Selecto dependency baseline to `0.4.10`.
+- Bump package version to `0.4.8`.
 
 V 0.4.7
 --------
