@@ -14,6 +14,8 @@ V 0.4.9
   insert, sync, delete-missing, cross-owner rejection, and whole-graph rollback.
 - Fixed placeholder numbering when SQL expressions such as
   `CURRENT_TIMESTAMP` occur between bound assignments.
+- Direct graph preview and execution now validate the complete portable graph
+  before compiling SQL or opening a transaction.
 - Updated the coordinated Selecto dependency baseline to `0.4.11`.
 - Bump package version to `0.4.9`.
 

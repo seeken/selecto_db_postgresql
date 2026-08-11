@@ -85,7 +85,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def preview_write(connection, command, opts \\ [])
 
   def preview_write(connection, %Graph{} = graph, opts) do
-    GraphCompiler.preview(graph, graph_server_major(connection, opts), opts)
+    with :ok <- Graph.validate(graph) do
+      GraphCompiler.preview(graph, graph_server_major(connection, opts), opts)
+    end
   end
 
   def preview_write(_connection, command, opts) do
@@ -118,11 +120,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   def execute_write(connection, %Graph{} = graph, opts) do
-    server_major = graph_server_major(connection, opts)
+    with :ok <- Graph.validate(graph) do
+      server_major = graph_server_major(connection, opts)
 
-    with_postgres_transaction(connection, opts, fn transactional_connection ->
-      execute_graph(transactional_connection, graph, server_major, opts)
-    end)
+      with_postgres_transaction(connection, opts, fn transactional_connection ->
+        execute_graph(transactional_connection, graph, server_major, opts)
+      end)
+    end
   end
 
   defp execute_graph(connection, %Graph{} = graph, server_major, opts) do

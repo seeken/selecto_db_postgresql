@@ -68,6 +68,16 @@ defmodule SelectoDBPostgreSQL.GraphCompilerTest do
     refute GraphCompiler.merge_eligible?(guarded_node, 17)
   end
 
+  test "direct adapter graph calls validate before preview or transaction dispatch" do
+    malformed = %Graph{nodes: [:not_a_node], root: {"root", "root"}}
+
+    assert {:error, %{type: :invalid_graph}} =
+             Adapter.preview_write(:unused, malformed, server_version_major: 17)
+
+    assert {:error, %{type: :invalid_graph}} =
+             Adapter.execute_write(:unused, malformed, server_version_major: 17)
+  end
+
   defp graph! do
     root =
       command!(%{
