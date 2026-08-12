@@ -7,21 +7,7 @@ defmodule SelectoDBPostgreSQL.WriteRollbackIntegrationTest do
   @moduletag :postgres
 
   setup do
-    options =
-      case System.get_env("SELECTO_POSTGRES_TEST_URL") do
-        nil ->
-          [
-            hostname: "localhost",
-            username: "postgres",
-            password: "postgres",
-            database: "selecto_example_dev"
-          ]
-
-        url ->
-          [url: url]
-      end
-
-    {:ok, connection} = Adapter.connect(options)
+    {:ok, connection} = Adapter.connect(SelectoDBPostgreSQL.PostgresTestConnection.options())
     Process.unlink(connection)
 
     on_exit(fn ->

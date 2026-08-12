@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  ELIXIR_VERSION: "1.20.0"
+  OTP_VERSION: "29.0"
+  SELECTO_ECOSYSTEM_USE_LOCAL: "1"
+  SELECTO_ECOSYSTEM_SELECTO_PATH: "selecto"
+
+jobs:
+  quality:
+    name: Test and quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PostgreSQL adapter
+        uses: actions/checkout@v4
+
+      - name: Checkout coordinated Selecto
+        uses: actions/checkout@v4
+        with:
+          repository: seeken/selecto
+          path: selecto
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Cache dependencies and PLT
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            priv/plts
+          key: ${{ runner.os }}-postgresql-adapter-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.exs', 'mix.lock', 'selecto/mix.exs', 'selecto/mix.lock') }}
+
+      - name: Install locked dependencies
+        run: mix deps.get --locked
+
+      - name: Run precommit gates
+        run: mix precommit
+
+      - name: Generate strict documentation
+        run: mix docs --warnings-as-errors
+
+      - name: Run Dialyzer
+        run: mix dialyzer
+
+      - name: Verify Hex package contents
+        run: mix hex.build
+
+  postgres-live:
+    name: PostgreSQL ${{ matrix.postgres-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres-version: ["13", "14", "15", "16", "17", "18"]
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres-version }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout PostgreSQL adapter
+        uses: actions/checkout@v4
+
+      - name: Checkout coordinated Selecto
+        uses: actions/checkout@v4
+        with:
+          repository: seeken/selecto
+          path: selecto
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Install locked dependencies
+        run: mix deps.get --locked
+
+      - name: Run live adapter suite
+        env:
+          SELECTO_POSTGRES_TEST_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: mix test --include postgres

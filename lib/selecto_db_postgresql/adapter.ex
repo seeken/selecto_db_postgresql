@@ -16,17 +16,36 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @impl true
   def connect({:pool, _} = pool_ref), do: {:ok, pool_ref}
-  def connect(connection) when is_pid(connection) or is_atom(connection), do: {:ok, connection}
+
+  def connect(connection) when is_pid(connection) do
+    if Process.alive?(connection),
+      do: {:ok, connection},
+      else: {:error, {:invalid_connection, connection}}
+  end
+
+  def connect(connection) when is_atom(connection) and not is_nil(connection) do
+    if valid_named_connection?(connection),
+      do: {:ok, connection},
+      else: {:error, {:invalid_connection, connection}}
+  end
+
   def connect(opts) when is_map(opts), do: connect(Map.to_list(opts))
 
   def connect(opts) when is_list(opts) do
-    with {:ok, _started_apps} <- Application.ensure_all_started(:postgrex),
-         {:ok, conn} <- Postgrex.start_link(opts) do
-      {:ok, conn}
+    cond do
+      not Keyword.keyword?(opts) ->
+        {:error, {:invalid_connection_options, :expected_keyword_list}}
+
+      Keyword.has_key?(opts, :url) ->
+        {:error, {:invalid_connection_options, :url_option_not_supported}}
+
+      true ->
+        connect_postgrex(opts)
     end
   end
 
-  def connect(other), do: {:error, {:invalid_connection_options, other}}
+  def connect(_other),
+    do: {:error, {:invalid_connection_options, :expected_options_or_connection}}
 
   @impl true
   def execute({:pool, pool_ref}, query, params, opts) do
@@ -37,21 +56,21 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   def execute(connection, query, params, opts) when is_atom(connection) do
-    execute_module_connection(connection, query, params, opts)
+    if valid_named_connection?(connection) do
+      execute_module_connection(connection, query, params, opts)
+    else
+      {:error, {:invalid_connection, connection}}
+    end
   end
 
   def execute(connection, query, params, opts) when is_pid(connection) do
-    case Postgrex.query(connection, normalize_query(query), params, opts) do
-      {:ok, result} -> {:ok, normalize_result(result)}
-      {:error, reason} -> {:error, reason}
-    end
+    if Process.alive?(connection),
+      do: query_postgrex(connection, query, params, opts),
+      else: {:error, {:invalid_connection, connection}}
   end
 
   def execute(%DBConnection{} = connection, query, params, opts) do
-    case Postgrex.query(connection, normalize_query(query), params, opts) do
-      {:ok, result} -> {:ok, normalize_result(result)}
-      {:error, reason} -> {:error, reason}
-    end
+    query_postgrex(connection, query, params, opts)
   end
 
   def execute(connection, _query, _params, _opts), do: {:error, {:invalid_connection, connection}}
@@ -85,48 +104,75 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def preview_write(connection, command, opts \\ [])
 
   def preview_write(connection, %Graph{} = graph, opts) do
-    with :ok <- Graph.validate(graph) do
+    with :ok <- validate_write_graph(graph) do
       GraphCompiler.preview(graph, graph_server_major(connection, opts), opts)
     end
   end
 
-  def preview_write(_connection, command, opts) do
-    WriteCompiler.preview(command, opts)
+  def preview_write(_connection, %Batch{} = batch, opts) do
+    with :ok <- validate_write_batch(batch) do
+      WriteCompiler.preview(batch, opts)
+    end
   end
+
+  def preview_write(_connection, %Command{} = command, opts) do
+    with :ok <- validate_write_command(command) do
+      WriteCompiler.preview(command, opts)
+    end
+  end
+
+  def preview_write(_connection, command, _opts), do: invalid_write_input(command)
 
   @impl Selecto.DB.WriteAdapter
   def execute_write(connection, command, opts \\ [])
 
   def execute_write(connection, %Command{} = command, opts) do
-    with_postgres_transaction(connection, opts, fn transactional_connection ->
-      execute_write_command(transactional_connection, command, opts)
-    end)
+    with :ok <- validate_write_command(command) do
+      with_postgres_transaction(connection, opts, fn transactional_connection ->
+        execute_write_command(transactional_connection, command, opts)
+      end)
+    end
   end
 
   def execute_write(connection, %Batch{} = batch, opts) do
-    with_postgres_transaction(connection, opts, fn transactional_connection ->
-      batch.commands
-      |> Enum.reduce_while({:ok, []}, fn command, {:ok, results} ->
-        case execute_write_command(transactional_connection, command, opts) do
-          {:ok, result} -> {:cont, {:ok, [result | results]}}
-          {:error, %Error{} = error} -> {:halt, {:error, error}}
+    with :ok <- validate_write_batch(batch) do
+      with_postgres_transaction(connection, opts, fn transactional_connection ->
+        batch.commands
+        |> Enum.reduce_while({:ok, []}, fn command, {:ok, results} ->
+          case execute_write_command(transactional_connection, command, opts) do
+            {:ok, result} -> {:cont, {:ok, [result | results]}}
+            {:error, %Error{} = error} -> {:halt, {:error, error}}
+          end
+        end)
+        |> case do
+          {:ok, results} -> {:ok, Enum.reverse(results)}
+          {:error, error} -> {:error, error}
         end
       end)
-      |> case do
-        {:ok, results} -> {:ok, Enum.reverse(results)}
-        {:error, error} -> {:error, error}
-      end
-    end)
+    end
   end
 
   def execute_write(connection, %Graph{} = graph, opts) do
-    with :ok <- Graph.validate(graph) do
+    with :ok <- validate_write_graph(graph) do
       server_major = graph_server_major(connection, opts)
 
       with_postgres_transaction(connection, opts, fn transactional_connection ->
         execute_graph(transactional_connection, graph, server_major, opts)
       end)
     end
+  end
+
+  def execute_write(_connection, command, _opts), do: invalid_write_input(command)
+
+  defp validate_write_batch(%Batch{} = batch), do: Batch.validate(batch)
+  defp validate_write_graph(%Graph{} = graph), do: Graph.validate(graph)
+  defp validate_write_command(%Command{} = command), do: Command.validate(command)
+
+  defp invalid_write_input(command) do
+    {:error,
+     Error.new(:invalid_command, "expected a portable write command, batch, or graph",
+       details: %{actual: command}
+     )}
   end
 
   defp execute_graph(connection, %Graph{} = graph, server_major, opts) do
@@ -271,7 +317,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
     case Selecto.ConnectionPool.get_pool_pid(pool_ref) do
       {:ok, pool_pid} ->
-        execute_with_pool_pid(pool_pid, query, params, cache_key, opts)
+        cond do
+          is_pid(pool_pid) and Process.alive?(pool_pid) ->
+            execute_with_pool_pid(pool_pid, query, params, cache_key, opts)
+
+          is_pid(pool_pid) ->
+            {:error,
+             Selecto.Error.connection_error("PostgreSQL connection pool is not available", %{
+               reason: :pool_process_not_alive
+             })}
+
+          true ->
+            {:error,
+             Selecto.Error.connection_error("PostgreSQL connection pool is not available", %{
+               reason: :invalid_pool_process
+             })}
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -290,9 +351,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
       is_atom(connection) and ecto_repo?(connection) ->
         execute_ecto_query(connection, query, params)
 
-      is_pid(connection) or (is_atom(connection) and not is_nil(connection)) ->
-        case Postgrex.query(connection, normalize_query(query), params) do
-          {:ok, result} -> {:ok, normalize_result(result)}
+      valid_postgrex_connection?(connection) ->
+        case execute(connection, query, params, []) do
+          {:ok, result} -> {:ok, result}
           {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
         end
 
@@ -341,14 +402,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @impl true
   def refresh_materialized_view(connection, database_name, opts \\ []) do
-    query =
-      Selecto.ViewPublisher.refresh_sql(database_name,
-        concurrently: Keyword.get(opts, :concurrently, false)
-      )
+    with {:ok, quoted_name} <- Selecto.SQL.QualifiedIdentifier.quote(database_name) do
+      concurrently = if Keyword.get(opts, :concurrently, false), do: " CONCURRENTLY", else: ""
+      query = "REFRESH MATERIALIZED VIEW#{concurrently} #{quoted_name};"
 
-    case introspection_query(connection, query, []) do
-      {:ok, result} -> {:ok, result}
-      {:error, reason} -> {:error, reason}
+      case introspection_query(connection, query, []) do
+        {:ok, result} -> {:ok, result}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 
@@ -492,8 +553,16 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  def stream(conn, query, params, opts) when is_pid(conn) or is_atom(conn) do
-    {:ok, build_postgrex_cursor_stream(conn, query, params, opts)}
+  def stream(conn, query, params, opts) when is_pid(conn) do
+    if Process.alive?(conn),
+      do: {:ok, build_postgrex_cursor_stream(conn, query, params, opts)},
+      else: {:error, {:invalid_connection, conn}}
+  end
+
+  def stream(conn, query, params, opts) when is_atom(conn) and not is_nil(conn) do
+    if valid_named_connection?(conn),
+      do: {:ok, build_postgrex_cursor_stream(conn, query, params, opts)},
+      else: {:error, {:invalid_connection, conn}}
   end
 
   def stream(connection, _query, _params, _opts) do
@@ -504,13 +573,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @impl true
   def server_version_major(connection) do
-    with {:ok, version_num} <- fetch_server_version_num(connection),
-         true <- is_integer(version_num) and version_num > 0 do
-      {:ok, div(version_num, 10_000)}
-    else
-      false -> {:error, :invalid_server_version_num}
+    case fetch_server_version_num(connection) do
+      {:ok, version_num} -> {:ok, div(version_num, 10_000)}
       {:error, _reason} = error -> error
-      _ -> {:error, :invalid_server_version_num}
     end
   end
 
@@ -518,7 +583,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def validate_connection(connection) do
     cond do
       is_atom(connection) and not is_nil(connection) ->
-        :ok
+        if valid_named_connection?(connection),
+          do: :ok,
+          else: {:error, "Named Postgrex connection is not registered"}
 
       match?({:pool, _}, connection) ->
         validate_pool_connection(connection)
@@ -537,7 +604,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def connection_info(connection) do
     cond do
       is_atom(connection) and not is_nil(connection) ->
-        %{type: :postgrex, pid: connection, status: :connected}
+        %{
+          type: :postgrex,
+          pid: connection,
+          status: if(valid_named_connection?(connection), do: :connected, else: :disconnected)
+        }
 
       match?({:pool, _}, connection) ->
         %{
@@ -653,26 +724,69 @@ defmodule SelectoDBPostgreSQL.Adapter do
     if ecto_repo?(connection) do
       execute_ecto_query(connection, query, params)
     else
-      case Postgrex.query(connection, normalize_query(query), params, opts) do
-        {:ok, result} -> {:ok, normalize_result(result)}
-        {:error, reason} -> {:error, reason}
-      end
+      query_postgrex(connection, query, params, opts)
     end
   end
 
   defp execute_ecto_query(repo, query, params) do
-    case apply(Ecto.Adapters.SQL, :query, [repo, normalize_query(query), params]) do
+    case apply(ecto_sql_module(), :query, [repo, normalize_query(query), params]) do
       {:ok, result} -> {:ok, normalize_result(result)}
       {:error, reason} -> {:error, reason}
     end
+  rescue
+    exception -> {:error, {:query_exception, exception.__struct__, Exception.message(exception)}}
+  catch
+    :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
   defp ecto_repo?(module) when is_atom(module) do
-    Code.ensure_loaded?(module) and function_exported?(module, :__adapter__, 0) and
-      Code.ensure_loaded?(Ecto.Adapters.SQL) and function_exported?(Ecto.Adapters.SQL, :query, 3)
+    module_exports?(module, :__adapter__, 0) and module_exports?(ecto_sql_module(), :query, 3)
   end
 
   defp ecto_repo?(_), do: false
+
+  defp ecto_sql_module, do: :"Elixir.Ecto.Adapters.SQL"
+
+  defp module_exports?(module, function, arity) do
+    case :code.ensure_loaded(module) do
+      {:module, ^module} -> function_exported?(module, function, arity)
+      {:error, _reason} -> false
+    end
+  end
+
+  defp valid_named_connection?(connection) when is_atom(connection) and not is_nil(connection) do
+    ecto_repo?(connection) or is_pid(Process.whereis(connection))
+  end
+
+  defp valid_named_connection?(_connection), do: false
+
+  defp valid_postgrex_connection?(connection) when is_pid(connection),
+    do: Process.alive?(connection)
+
+  defp valid_postgrex_connection?(connection), do: valid_named_connection?(connection)
+
+  defp connect_postgrex(opts) do
+    with {:ok, _started_apps} <- Application.ensure_all_started(:postgrex),
+         {:ok, connection} <- Postgrex.start_link(opts) do
+      {:ok, connection}
+    end
+  rescue
+    exception ->
+      {:error, {:invalid_connection_options, exception.__struct__, Exception.message(exception)}}
+  catch
+    :exit, reason -> {:error, {:connection_exit, reason}}
+  end
+
+  defp query_postgrex(connection, query, params, opts) do
+    case Postgrex.query(connection, normalize_query(query), params, opts) do
+      {:ok, result} -> {:ok, normalize_result(result)}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    exception -> {:error, {:query_exception, exception.__struct__, Exception.message(exception)}}
+  catch
+    :exit, reason -> {:error, {:connection_exit, reason}}
+  end
 
   defp introspection_query(connection, query, params) do
     case connection do
@@ -1199,6 +1313,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
       e ->
         {:error, Selecto.Error.query_error(Exception.message(e), query, params, %{exception: e})}
+    catch
+      :exit, reason ->
+        {:error,
+         Selecto.Error.connection_error("PostgreSQL connection pool exited", %{
+           exit_reason: reason
+         })}
     end
   end
 
@@ -1257,7 +1377,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp cardinality_matches?(_count, :many), do: true
 
   defp result_rows(%{rows: rows, columns: columns}) do
-    Enum.map(rows || [], fn row -> Enum.zip(columns || [], row) |> Map.new() end)
+    Enum.map(rows, fn row -> Enum.zip(columns, row) |> Map.new() end)
   end
 
   defp with_postgres_transaction({:pool, pool_ref}, opts, fun) do
@@ -1269,19 +1389,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp with_postgres_transaction(connection, opts, fun)
        when is_pid(connection) or is_atom(connection) do
-    case Postgrex.transaction(
-           connection,
-           fn transaction_connection ->
-             case fun.(transaction_connection) do
-               {:ok, results} -> results
-               {:error, error} -> Postgrex.rollback(transaction_connection, error)
-             end
-           end,
-           opts
-         ) do
-      {:ok, results} -> {:ok, results}
-      {:error, %Error{} = error} -> {:error, error}
-      {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+    if valid_postgrex_connection?(connection) do
+      case postgres_transaction(connection, opts, fun) do
+        {:ok, results} -> {:ok, results}
+        {:error, %Error{} = error} -> {:error, error}
+        {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+      end
+    else
+      {:error, write_error(:transaction_failed, {:invalid_connection, connection})}
     end
   end
 
@@ -1293,13 +1408,39 @@ defmodule SelectoDBPostgreSQL.Adapter do
     Error.new(type, "PostgreSQL write failed", details: %{reason: reason})
   end
 
-  defp resolve_stream_pool_connection(pool_ref) when is_pid(pool_ref) or is_atom(pool_ref) do
-    {:ok, pool_ref}
+  defp postgres_transaction(connection, opts, fun) do
+    Postgrex.transaction(
+      connection,
+      fn transaction_connection ->
+        case fun.(transaction_connection) do
+          {:ok, results} -> results
+          {:error, error} -> Postgrex.rollback(transaction_connection, error)
+        end
+      end,
+      opts
+    )
+  rescue
+    exception ->
+      {:error, {:transaction_exception, exception.__struct__, Exception.message(exception)}}
+  catch
+    :exit, reason -> {:error, {:connection_exit, reason}}
+  end
+
+  defp resolve_stream_pool_connection(pool_ref) when is_pid(pool_ref) do
+    if Process.alive?(pool_ref),
+      do: {:ok, pool_ref},
+      else: {:error, %{stream_context: :pool, pool_ref: inspect(pool_ref)}}
+  end
+
+  defp resolve_stream_pool_connection(pool_ref) when is_atom(pool_ref) and not is_nil(pool_ref) do
+    if valid_named_connection?(pool_ref),
+      do: {:ok, pool_ref},
+      else: {:error, %{stream_context: :pool, pool_ref: inspect(pool_ref)}}
   end
 
   defp resolve_stream_pool_connection(%{pool: pool_conn})
        when is_pid(pool_conn) or is_atom(pool_conn) do
-    {:ok, pool_conn}
+    resolve_stream_pool_connection(pool_conn)
   end
 
   defp resolve_stream_pool_connection(pool_ref) do
@@ -1307,8 +1448,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp build_postgrex_cursor_stream(conn, query, params, opts) do
-    parent = self()
-    ref = make_ref()
     max_rows = Keyword.get(opts, :max_rows, 500)
     stream_timeout = Keyword.get(opts, :stream_timeout, 30_000)
     receive_timeout = Keyword.get(opts, :receive_timeout, 60_000)
@@ -1331,20 +1470,35 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
     Stream.resource(
       fn ->
+        parent = self()
+        ref = make_ref()
+
         task =
           Selecto.TaskSupervisor.async(fn ->
             tx_result =
-              producer.(fn rows, columns ->
-                send(parent, {ref, {:chunk, rows, columns}})
-              end)
+              try do
+                producer.(fn rows, columns ->
+                  send(parent, {ref, {:chunk, rows, columns}})
+                end)
+              rescue
+                exception ->
+                  {:producer_failed,
+                   {:exception, exception.__struct__, Exception.message(exception)}}
+              catch
+                kind, reason -> {:producer_failed, {kind, reason}}
+              end
 
-            send(parent, {ref, {:done, tx_result}})
+            case tx_result do
+              {:producer_failed, reason} -> send(parent, {ref, {:producer_failed, reason}})
+              result -> send(parent, {ref, {:done, result}})
+            end
           end)
 
-        %{task: task, ref: ref}
+        %{task: task, ref: ref, monitor_ref: task.ref}
       end,
       fn state ->
         ref = state.ref
+        monitor_ref = state.monitor_ref
 
         receive do
           {^ref, {:chunk, rows, columns}} ->
@@ -1352,16 +1506,31 @@ defmodule SelectoDBPostgreSQL.Adapter do
             {stream_rows, state}
 
           {^ref, {:done, {:ok, _}}} ->
+            Process.demonitor(monitor_ref, [:flush])
             {:halt, state}
 
           {^ref, {:done, {:error, reason}}} ->
             raise "PostgreSQL stream transaction failed: #{inspect(reason)}"
+
+          {^ref, {:producer_failed, reason}} ->
+            raise "PostgreSQL stream producer failed: #{inspect(reason)}"
+
+          {^monitor_ref, _reply} ->
+            {:halt, state}
+
+          {:DOWN, ^monitor_ref, :process, _pid, :normal} ->
+            {:halt, state}
+
+          {:DOWN, ^monitor_ref, :process, _pid, reason} ->
+            raise "PostgreSQL stream producer failed: #{inspect(reason)}"
         after
           receive_timeout ->
             raise "Timed out waiting for streamed rows after #{receive_timeout}ms"
         end
       end,
       fn state ->
+        Process.demonitor(state.monitor_ref, [:flush])
+
         case Task.shutdown(state.task, queue_timeout) do
           nil -> :ok
           {:exit, _} -> :ok
@@ -1440,11 +1609,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp extract_server_version_num(_result), do: {:error, :missing_server_version_num}
 
-  defp parse_server_version_num(value) when is_integer(value), do: {:ok, value}
+  defp parse_server_version_num(value) when is_integer(value) and value > 0, do: {:ok, value}
 
   defp parse_server_version_num(value) when is_binary(value) do
     case Integer.parse(value) do
-      {parsed, ""} -> {:ok, parsed}
+      {parsed, ""} when parsed > 0 -> {:ok, parsed}
       _ -> {:error, :invalid_server_version_num}
     end
   end

@@ -1,7 +1,7 @@
 defmodule SelectoDBPostgreSQL.MixProject do
   use Mix.Project
 
-  @version "0.4.9"
+  @version "0.4.10"
   @source_url "https://github.com/seeken/selecto_db_postgresql"
 
   def project do
@@ -11,11 +11,18 @@ defmodule SelectoDBPostgreSQL.MixProject do
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      aliases: aliases(),
+      cli: cli(),
       name: "SelectoDBPostgreSQL",
       description: "PostgreSQL adapter package for Selecto",
       source_url: @source_url,
       docs: docs(),
-      package: package()
+      package: package(),
+      dialyzer: [
+        plt_add_apps: [:mix],
+        plt_core_path: "priv/plts",
+        plt_file: {:no_warn, "priv/plts/dialyzer.plt"}
+      ]
     ]
   end
 
@@ -29,16 +36,24 @@ defmodule SelectoDBPostgreSQL.MixProject do
     [
       selecto_dep(),
       {:postgrex, ">= 0.0.0"},
-      {:ex_doc, "~> 0.29", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.29", only: :dev, runtime: false},
+      {:dialyxir, "~> 1.4", only: :dev, runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
 
   defp selecto_dep do
     if use_local_ecosystem?() do
-      {:selecto, path: "../selecto"}
+      {:selecto, path: local_selecto_path()}
     else
-      {:selecto, ">= 0.4.11 and < 0.6.0"}
+      {:selecto, ">= 0.4.12 and < 0.6.0"}
     end
+  end
+
+  defp local_selecto_path do
+    "SELECTO_ECOSYSTEM_SELECTO_PATH"
+    |> System.get_env("../selecto")
+    |> Path.expand(__DIR__)
   end
 
   defp use_local_ecosystem? do
@@ -49,9 +64,29 @@ defmodule SelectoDBPostgreSQL.MixProject do
     end
   end
 
+  def cli do
+    [preferred_envs: [precommit: :test]]
+  end
+
+  defp aliases do
+    [
+      "credo.atom_audit": ["credo -C atom_audit --all-priorities --strict"],
+      precommit: [
+        "compile --force --warnings-as-errors",
+        "format --check-formatted",
+        "credo --strict",
+        "credo.atom_audit",
+        "test",
+        "selecto_db_postgresql.verify",
+        "xref graph --format cycles --label compile-connected --fail-above 0"
+      ]
+    ]
+  end
+
   defp package do
     [
-      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE .formatter.exs),
+      files:
+        ~w(lib mix.exs README.md CHANGELOG.md LICENSE docs/formal_verification.md .formatter.exs),
       licenses: ["MIT"],
       links: %{
         "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md",
@@ -64,7 +99,7 @@ defmodule SelectoDBPostgreSQL.MixProject do
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md", "LICENSE"]
+      extras: ["README.md", "CHANGELOG.md", "LICENSE", "docs/formal_verification.md"]
     ]
   end
 end

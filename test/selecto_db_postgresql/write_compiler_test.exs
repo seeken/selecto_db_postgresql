@@ -1,7 +1,7 @@
 defmodule SelectoDBPostgreSQL.WriteCompilerTest do
   use ExUnit.Case, async: true
 
-  alias Selecto.Write.{Command, Error}
+  alias Selecto.Write.{Batch, Command, Error}
   alias SelectoDBPostgreSQL.Adapter
 
   test "previews a parameterized insert without any ORM or application configuration" do
@@ -97,6 +97,70 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
                relation: :items,
                predicate: {:unsafe_sql, "tenant_id = 7"}
              })
+  end
+
+  test "public write entrypoints validate malformed command structs before dispatch" do
+    malformed = %Command{
+      operation: :insert,
+      relation: :items,
+      assignments: [:not_an_assignment]
+    }
+
+    assert {:error, %Error{type: :invalid_command}} =
+             Adapter.preview_write(:unused, malformed)
+
+    assert {:error, %Error{type: :invalid_command}} =
+             Adapter.execute_write(:unregistered_connection, malformed)
+
+    assert {:error, %Error{type: :invalid_command}} =
+             Adapter.preview_write(:unused, %{operation: :insert})
+
+    assert {:error, %Error{type: :invalid_command}} =
+             Adapter.execute_write(:unregistered_connection, %{operation: :insert})
+  end
+
+  test "rejects assignment fields that collide after identifier normalization" do
+    duplicate = %Command{
+      operation: :insert,
+      relation: :items,
+      assignments: [
+        %{field: :name, value: {:literal, "first"}},
+        %{field: "name", value: {:literal, "second"}}
+      ]
+    }
+
+    assert {:error,
+            %Error{
+              type: :invalid_command,
+              details: %{code: :duplicate_assignment_identifier, fields: ["name"]}
+            }} =
+             Adapter.preview_write(:unused, duplicate)
+
+    batch = %Batch{commands: [duplicate]}
+
+    assert {:error,
+            %Error{type: :invalid_command, details: %{code: :duplicate_assignment_identifier}}} =
+             Adapter.preview_write(:unused, batch)
+
+    assert {:error,
+            %Error{type: :invalid_command, details: %{code: :duplicate_assignment_identifier}}} =
+             Adapter.execute_write(:unregistered_connection, batch)
+  end
+
+  test "rejects returning fields that collide after identifier normalization" do
+    duplicate = %Command{
+      operation: :insert,
+      relation: :items,
+      assignments: [%{field: :name, value: {:literal, "item"}}],
+      returning: [:id, "id"]
+    }
+
+    assert {:error,
+            %Error{
+              type: :invalid_command,
+              details: %{code: :duplicate_returning_identifier, fields: ["id"]}
+            }} =
+             Adapter.preview_write(:unused, duplicate)
   end
 
   test "advertises native PostgreSQL write capability without Ecto" do

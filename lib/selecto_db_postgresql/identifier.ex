@@ -52,6 +52,10 @@ defmodule SelectoDBPostgreSQL.Identifier do
     count = :atomics.add_get(counter, 1, 1)
 
     if count <= @max_dynamic_identifiers do
+      # Introspection's published atom-keyed schema contract requires this
+      # conversion. Validation, serialization through `:global.trans/2`, and
+      # the VM-lifetime cap above make this the single reviewed interning edge.
+      # credo:disable-for-next-line Credo.Check.Warning.UnsafeToAtom
       String.to_atom(value)
     else
       :atomics.sub_get(counter, 1, 1)

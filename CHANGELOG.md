@@ -1,6 +1,25 @@
 CHANGES
 =======
 
+V 0.4.10
+--------
+
+- Validated portable commands, batches, and graphs before every public preview
+  and execution boundary, returning structured errors for malformed values and
+  normalized identifier collisions.
+- Rejected dead and unregistered direct and pool connection references without
+  process exits, propagated stream-producer failures immediately instead of
+  timing out, and gave each stream enumeration its own consumer-bound cursor
+  delivery identity.
+- Parsed `SELECTO_POSTGRES_TEST_URL` into current Postgrex options and added
+  environment-based connection harness coverage.
+- Validated and quoted materialized-view identifiers before refresh dispatch.
+- Added a 48-check bounded adapter-safety model, blocking Credo/Dialyzer/docs
+  gates, and live PostgreSQL 13–18 CI coverage.
+- Removed stale lockfile entries and updated the coordinated Selecto baseline
+  to `0.4.12`.
+- Bumped the package version to `0.4.10`.
+
 V 0.4.9
 --------
 
@@ -61,8 +80,8 @@ V 0.4.5
 ----------
 
 - Start the `:postgrex` application before opening direct adapter connections
-  so `SelectoDBPostgreSQL.Adapter.connect/1` works reliably in script and
-  generator contexts that have not already started dependency applications.
+  so direct adapter connections work reliably in script and generator contexts
+  that have not already started dependency applications.
 - Bump package version to `0.4.5`.
 
 V 0.4.4

@@ -4,6 +4,8 @@
 /*.ez
 erl_crash.dump
 /doc/
+/priv/plts/
+selecto_db_postgresql-*.tar
 
 .expert/
 .DS_Store

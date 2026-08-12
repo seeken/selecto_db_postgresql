@@ -27,6 +27,22 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
              {:error, {:invalid_connection, 123}}
   end
 
+  test "connection URLs are rejected cleanly instead of reaching Postgrex as unsupported options" do
+    url = "postgres://user:secret@example.test/database"
+
+    assert {:error, {:invalid_connection_options, :expected_options_or_connection}} =
+             SelectoDBPostgreSQL.Adapter.connect(url)
+
+    assert {:error, {:invalid_connection_options, :url_option_not_supported}} =
+             SelectoDBPostgreSQL.Adapter.connect(url: url)
+
+    assert {:error, {:invalid_connection_options, :url_option_not_supported}} =
+             SelectoDBPostgreSQL.Adapter.connect(%{url: url})
+
+    assert {:error, {:invalid_connection_options, :expected_keyword_list}} =
+             SelectoDBPostgreSQL.Adapter.connect([:not_a_keyword])
+  end
+
   test "postgres adapter supports pool references" do
     assert SelectoDBPostgreSQL.Adapter.connect({:pool, %{name: :demo}}) ==
              {:ok, {:pool, %{name: :demo}}}
@@ -110,7 +126,9 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
   test "postgres adapter refreshes materialized views" do
     connection = %{
       query_fun: fn query, params, opts ->
-        assert query == "REFRESH MATERIALIZED VIEW CONCURRENTLY reporting.daily_rollup;"
+        assert query ==
+                 ~s(REFRESH MATERIALIZED VIEW CONCURRENTLY "reporting"."daily_rollup";)
+
         assert params == []
         assert opts == [prepared: false]
 
@@ -124,6 +142,38 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
                "reporting.daily_rollup",
                concurrently: true
              )
+  end
+
+  test "materialized-view refresh quotes safe names and rejects SQL-shaped names before dispatch" do
+    parent = self()
+
+    connection = %{
+      query_fun: fn query, params, opts ->
+        send(parent, {:dispatched, query, params, opts})
+        {:ok, %{rows: [], columns: []}}
+      end
+    }
+
+    assert {:ok, _} =
+             SelectoDBPostgreSQL.Adapter.refresh_materialized_view(
+               connection,
+               "reporting.daily_rollup"
+             )
+
+    assert_receive {:dispatched, ~s(REFRESH MATERIALIZED VIEW "reporting"."daily_rollup";), [],
+                    [prepared: false]}
+
+    malicious = "reporting.safe; DROP TABLE accounts; --"
+
+    assert {:error,
+            %{
+              code: :invalid_sql_identifier,
+              identifier: ^malicious,
+              reason: :invalid_characters
+            }} =
+             SelectoDBPostgreSQL.Adapter.refresh_materialized_view(connection, malicious)
+
+    refute_receive {:dispatched, _query, _params, _opts}
   end
 
   test "postgres adapter introspects table metadata and belongs_to associations" do
@@ -205,6 +255,22 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
              SelectoDBPostgreSQL.Adapter.execute_pool(:bad_ref, "select 1", [], [])
   end
 
+  test "dead pool execution fails closed instead of exiting with noproc" do
+    pool_pid = spawn(fn -> :ok end)
+    monitor = Process.monitor(pool_pid)
+    assert_receive {:DOWN, ^monitor, :process, ^pool_pid, _reason}
+
+    pool_ref = %{adapter: SelectoDBPostgreSQL.Adapter, pool: pool_pid}
+
+    assert {:error,
+            %Selecto.Error{
+              type: :connection_error,
+              message: "PostgreSQL connection pool is not available",
+              details: %{reason: :pool_process_not_alive}
+            }} =
+             SelectoDBPostgreSQL.Adapter.execute({:pool, pool_ref}, "select 1", [], [])
+  end
+
   test "postgres adapter validates invalid connection info" do
     assert {:error, "Invalid connection configuration"} =
              SelectoDBPostgreSQL.Adapter.validate_connection(123)
@@ -214,10 +280,112 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
   end
 
   test "named atom connections are treated as postgrex connections, not repos" do
+    process = spawn(fn -> Process.sleep(:infinity) end)
+    Process.register(process, :named_postgrex_conn)
+    on_exit(fn -> if Process.alive?(process), do: Process.exit(process, :kill) end)
+
+    assert {:ok, :named_postgrex_conn} =
+             SelectoDBPostgreSQL.Adapter.connect(:named_postgrex_conn)
+
     assert :ok = SelectoDBPostgreSQL.Adapter.validate_connection(:named_postgrex_conn)
 
     assert %{type: :postgrex, pid: :named_postgrex_conn, status: :connected} =
              SelectoDBPostgreSQL.Adapter.connection_info(:named_postgrex_conn)
+  end
+
+  test "unregistered named connections fail closed before Postgrex dispatch" do
+    name = :selecto_unregistered_postgrex_connection
+
+    assert {:error, {:invalid_connection, ^name}} =
+             SelectoDBPostgreSQL.Adapter.connect(name)
+
+    assert {:error, "Named Postgrex connection is not registered"} =
+             SelectoDBPostgreSQL.Adapter.validate_connection(name)
+
+    assert %{type: :postgrex, pid: ^name, status: :disconnected} =
+             SelectoDBPostgreSQL.Adapter.connection_info(name)
+
+    assert {:error, {:invalid_connection, ^name}} =
+             SelectoDBPostgreSQL.Adapter.execute(name, "select 1", [], [])
+
+    assert {:error, {:invalid_connection, ^name}} =
+             SelectoDBPostgreSQL.Adapter.stream(name, "select 1", [], [])
+  end
+
+  test "dead process connections fail closed instead of exiting with noproc" do
+    process =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    monitor = Process.monitor(process)
+    Process.exit(process, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^process, :killed}
+
+    assert {:error, {:invalid_connection, ^process}} =
+             SelectoDBPostgreSQL.Adapter.connect(process)
+
+    assert {:error, "Postgrex connection process is not alive"} =
+             SelectoDBPostgreSQL.Adapter.validate_connection(process)
+
+    assert {:error, {:invalid_connection, ^process}} =
+             SelectoDBPostgreSQL.Adapter.execute(process, "select 1", [], [])
+
+    assert {:error, {:invalid_connection, ^process}} =
+             SelectoDBPostgreSQL.Adapter.stream(process, "select 1", [], [])
+
+    assert {:error, {:invalid_stream_pool, %{stream_context: :pool}}} =
+             SelectoDBPostgreSQL.Adapter.stream({:pool, process}, "select 1", [], [])
+
+    command = %Selecto.Write.Command{
+      operation: :insert,
+      relation: :items,
+      assignments: [%{field: :name, value: {:literal, "item"}}]
+    }
+
+    assert {:error,
+            %Selecto.Write.Error{
+              type: :transaction_failed,
+              details: %{reason: {:invalid_connection, ^process}}
+            }} = SelectoDBPostgreSQL.Adapter.execute_write(process, command)
+  end
+
+  test "stream producer crashes surface promptly instead of timing out" do
+    {:ok, stream} =
+      SelectoDBPostgreSQL.Adapter.stream(self(), "select 1", [],
+        receive_timeout: 5_000,
+        stream_producer: fn _send_chunk -> exit(:producer_crashed) end
+      )
+
+    started_at = System.monotonic_time(:millisecond)
+
+    assert_raise RuntimeError,
+                 ~r/PostgreSQL stream producer failed: \{:exit, :producer_crashed\}/,
+                 fn ->
+                   Enum.to_list(stream)
+                 end
+
+    assert System.monotonic_time(:millisecond) - started_at < 1_000
+  end
+
+  test "stream delivers rows to the process that enumerates it" do
+    {:ok, stream} =
+      SelectoDBPostgreSQL.Adapter.stream(self(), "select 1", [],
+        receive_timeout: 500,
+        stream_producer: fn send_chunk ->
+          send_chunk.([[1, "one"], [2, "two"]], ["id", "name"])
+          {:ok, :complete}
+        end
+      )
+
+    enumerator = Task.async(fn -> Enum.to_list(stream) end)
+
+    assert Task.await(enumerator, 2_000) == [
+             {[1, "one"], ["id", "name"]},
+             {[2, "two"], ["id", "name"]}
+           ]
   end
 
   defp sales_domain do

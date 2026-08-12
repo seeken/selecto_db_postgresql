@@ -78,6 +78,26 @@ defmodule SelectoDBPostgreSQL.GraphCompilerTest do
              Adapter.execute_write(:unused, malformed, server_version_major: 17)
   end
 
+  test "graph commands reject identifiers that collide after normalization" do
+    graph = graph!()
+    [root_node | remaining_nodes] = graph.nodes
+    [root_row] = root_node.rows
+    duplicate_returning = %{root_row.command | returning: [:id, "id"]}
+
+    malformed = %{
+      graph
+      | nodes: [
+          %{root_node | rows: [%{root_row | command: duplicate_returning}]} | remaining_nodes
+        ]
+    }
+
+    assert {:error, %{type: :invalid_command}} =
+             Adapter.preview_write(:unused, malformed, server_version_major: 17)
+
+    assert {:error, %{type: :invalid_command}} =
+             Adapter.execute_write(:unused, malformed, server_version_major: 17)
+  end
+
   defp graph! do
     root =
       command!(%{

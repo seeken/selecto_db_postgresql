@@ -10,11 +10,24 @@ for using Selecto against PostgreSQL via `postgrex`.
 ```elixir
 def deps do
   [
-    {:selecto, ">= 0.4.11 and < 0.6.0"},
-    {:selecto_db_postgresql, ">= 0.4.9 and < 0.6.0"}
+    {:selecto, ">= 0.4.12 and < 0.6.0"},
+    {:selecto_db_postgresql, ">= 0.4.10 and < 0.6.0"}
   ]
 end
 ```
+
+## Verification
+
+Run the package tests and the deterministic bounded adapter-safety model with:
+
+```sh
+SELECTO_ECOSYSTEM_USE_LOCAL=1 mise exec -- mix precommit
+SELECTO_ECOSYSTEM_USE_LOCAL=1 mise exec -- mix selecto_db_postgresql.verify
+```
+
+The bounded report is complementary to the live PostgreSQL matrix; its exact
+state space and guarantees are documented in
+[`docs/formal_verification.md`](docs/formal_verification.md).
 
 ## Usage
 
