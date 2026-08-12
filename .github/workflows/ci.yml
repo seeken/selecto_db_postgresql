@@ -25,6 +25,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: seeken/selecto
+          ref: main
           path: selecto
 
       - name: Set up Elixir
@@ -55,7 +56,7 @@ jobs:
         run: mix dialyzer
 
       - name: Verify Hex package contents
-        run: mix hex.build
+        run: SELECTO_ECOSYSTEM_USE_LOCAL=0 mix hex.build
 
   postgres-live:
     name: PostgreSQL ${{ matrix.postgres-version }}
@@ -86,6 +87,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: seeken/selecto
+          ref: main
           path: selecto
 
       - name: Set up Elixir
@@ -100,4 +102,6 @@ jobs:
       - name: Run live adapter suite
         env:
           SELECTO_POSTGRES_TEST_URL: postgres://postgres:postgres@localhost:5432/postgres
-        run: mix test --include postgres
+        run: |
+          mix test --include postgres
+          mix selecto_db_postgresql.verify_sql

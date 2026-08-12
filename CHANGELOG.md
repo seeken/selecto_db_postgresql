@@ -11,11 +11,23 @@ V 0.4.10
   process exits, propagated stream-producer failures immediately instead of
   timing out, and gave each stream enumeration its own consumer-bound cursor
   delivery identity.
-- Parsed `SELECTO_POSTGRES_TEST_URL` into current Postgrex options and added
-  environment-based connection harness coverage.
+- Bounded cursor delivery to one acknowledgement-gated in-flight chunk and
+  drained private protocol messages after cancellation; the version-two stream
+  model now proves seven invariants across 120 states and 840 checks, backed by
+  fast-producer and live PostgreSQL cancellation conformance tests.
+- Centralized test and live-verifier connection parsing, preserving supported
+  `sslmode` settings while rejecting malformed credentials, database paths,
+  ports, and ambiguous URL options before Postgrex dispatch.
 - Validated and quoted materialized-view identifiers before refresh dispatch.
 - Added a 48-check bounded adapter-safety model, blocking Credo/Dialyzer/docs
   gates, and live PostgreSQL 13–18 CI coverage.
+- Added bounded transaction, stream, and managed-pool event-trace models with
+  shortest reproducible counterexample traces.
+- Added live Batch/Graph rollback fault injection at every first, middle, and
+  last step, plus a 232-case relational differential checker covering nullable
+  predicates, joins, aggregates, ordering, limits, and parameter contracts.
+- Made stale pool transaction and checked-out-connection paths return
+  structured connection errors instead of process exits.
 - Removed stale lockfile entries and updated the coordinated Selecto baseline
   to `0.4.12`.
 - Bumped the package version to `0.4.10`.

@@ -315,24 +315,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
     use_prepared = Keyword.get(opts, :prepared, true)
     cache_key = if use_prepared, do: Selecto.ConnectionPool.generate_cache_key(query), else: nil
 
-    case Selecto.ConnectionPool.get_pool_pid(pool_ref) do
+    case resolve_live_pool_pid(pool_ref) do
       {:ok, pool_pid} ->
-        cond do
-          is_pid(pool_pid) and Process.alive?(pool_pid) ->
-            execute_with_pool_pid(pool_pid, query, params, cache_key, opts)
-
-          is_pid(pool_pid) ->
-            {:error,
-             Selecto.Error.connection_error("PostgreSQL connection pool is not available", %{
-               reason: :pool_process_not_alive
-             })}
-
-          true ->
-            {:error,
-             Selecto.Error.connection_error("PostgreSQL connection pool is not available", %{
-               reason: :invalid_pool_process
-             })}
-        end
+        execute_with_pool_pid(pool_pid, query, params, cache_key, opts)
 
       {:error, reason} ->
         {:error, reason}
@@ -632,7 +617,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @impl true
   def with_connection(pool_ref, fun) when is_function(fun, 1) do
-    case Selecto.ConnectionPool.get_pool_pid(pool_ref) do
+    case resolve_live_pool_pid(pool_ref) do
       {:ok, pool_pid} ->
         try do
           result = fun.(pool_pid)
@@ -643,6 +628,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
           e ->
             {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
+        catch
+          :exit, reason ->
+            {:error,
+             Selecto.Error.connection_error("PostgreSQL connection pool exited", %{
+               exit_reason: reason
+             })}
         end
 
       {:error, reason} ->
@@ -652,9 +643,26 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @impl true
   def transaction(pool_ref, fun, opts \\ []) when is_function(fun, 1) do
-    case Selecto.ConnectionPool.get_pool_pid(pool_ref) do
+    case resolve_live_pool_pid(pool_ref) do
       {:ok, pool_pid} ->
-        Postgrex.transaction(pool_pid, fun, opts)
+        try do
+          Postgrex.transaction(pool_pid, fun, opts)
+        rescue
+          e in DBConnection.ConnectionError ->
+            {:error, Selecto.Error.connection_error(Exception.message(e), %{exception: e})}
+
+          e in Postgrex.Error ->
+            {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
+
+          e ->
+            {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
+        catch
+          :exit, reason ->
+            {:error,
+             Selecto.Error.connection_error("PostgreSQL connection pool exited", %{
+               exit_reason: reason
+             })}
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -716,6 +724,29 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)
+
+  defp resolve_live_pool_pid(pool_ref) do
+    case Selecto.ConnectionPool.get_pool_pid(pool_ref) do
+      {:ok, pool_pid} when is_pid(pool_pid) ->
+        if Process.alive?(pool_pid) do
+          {:ok, pool_pid}
+        else
+          {:error,
+           Selecto.Error.connection_error("PostgreSQL connection pool is not available", %{
+             reason: :pool_process_not_alive
+           })}
+        end
+
+      {:ok, _pool_pid} ->
+        {:error,
+         Selecto.Error.connection_error("PostgreSQL connection pool is not available", %{
+           reason: :invalid_pool_process
+         })}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   # An Ecto repository is a supervision tree, not a DBConnection process. Route it
   # through Ecto when the host application has Ecto available; keep it optional so
@@ -1475,38 +1506,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
         task =
           Selecto.TaskSupervisor.async(fn ->
-            tx_result =
-              try do
-                producer.(fn rows, columns ->
-                  send(parent, {ref, {:chunk, rows, columns}})
-                end)
-              rescue
-                exception ->
-                  {:producer_failed,
-                   {:exception, exception.__struct__, Exception.message(exception)}}
-              catch
-                kind, reason -> {:producer_failed, {kind, reason}}
-              end
-
-            case tx_result do
-              {:producer_failed, reason} -> send(parent, {ref, {:producer_failed, reason}})
-              result -> send(parent, {ref, {:done, result}})
-            end
+            run_stream_producer(parent, ref, producer)
           end)
 
-        %{task: task, ref: ref, monitor_ref: task.ref}
+        %{task: task, ref: ref, monitor_ref: task.ref, awaiting_ack?: false}
       end,
       fn state ->
+        state = acknowledge_stream_chunk(state)
         ref = state.ref
         monitor_ref = state.monitor_ref
 
         receive do
           {^ref, {:chunk, rows, columns}} ->
             stream_rows = Enum.map(rows, &{&1, columns || []})
-            {stream_rows, state}
+            {stream_rows, %{state | awaiting_ack?: true}}
 
           {^ref, {:done, {:ok, _}}} ->
-            Process.demonitor(monitor_ref, [:flush])
             {:halt, state}
 
           {^ref, {:done, {:error, reason}}} ->
@@ -1529,15 +1544,73 @@ defmodule SelectoDBPostgreSQL.Adapter do
         end
       end,
       fn state ->
-        Process.demonitor(state.monitor_ref, [:flush])
-
-        case Task.shutdown(state.task, queue_timeout) do
-          nil -> :ok
-          {:exit, _} -> :ok
-          _ -> :ok
-        end
+        stop_stream_producer(state, queue_timeout)
       end
     )
+  end
+
+  defp run_stream_producer(parent, ref, producer) do
+    parent_monitor_ref = Process.monitor(parent)
+
+    tx_result =
+      try do
+        producer.(fn rows, columns ->
+          send(parent, {ref, {:chunk, rows, columns}})
+          await_stream_ack(parent, parent_monitor_ref, ref)
+        end)
+      rescue
+        exception ->
+          {:producer_failed, {:exception, exception.__struct__, Exception.message(exception)}}
+      catch
+        :throw, {:selecto_stream_cancelled, ^ref} ->
+          {:consumer_cancelled, ref}
+
+        kind, reason ->
+          {:producer_failed, {kind, reason}}
+      after
+        Process.demonitor(parent_monitor_ref, [:flush])
+      end
+
+    case tx_result do
+      {:consumer_cancelled, ^ref} -> :ok
+      {:producer_failed, reason} -> send(parent, {ref, {:producer_failed, reason}})
+      result -> send(parent, {ref, {:done, result}})
+    end
+  end
+
+  defp await_stream_ack(parent, parent_monitor_ref, ref) do
+    receive do
+      {^ref, :ack} ->
+        :ok
+
+      {^ref, :cancel} ->
+        throw({:selecto_stream_cancelled, ref})
+
+      {:DOWN, ^parent_monitor_ref, :process, ^parent, _reason} ->
+        throw({:selecto_stream_cancelled, ref})
+    end
+  end
+
+  defp acknowledge_stream_chunk(%{awaiting_ack?: false} = state), do: state
+
+  defp acknowledge_stream_chunk(%{task: task, ref: ref, awaiting_ack?: true} = state) do
+    send(task.pid, {ref, :ack})
+    %{state | awaiting_ack?: false}
+  end
+
+  defp stop_stream_producer(state, queue_timeout) do
+    send(state.task.pid, {state.ref, :cancel})
+    _result = Task.shutdown(state.task, queue_timeout)
+    Process.demonitor(state.monitor_ref, [:flush])
+    drain_stream_messages(state.ref)
+  end
+
+  defp drain_stream_messages(ref) do
+    receive do
+      {^ref, _message} -> drain_stream_messages(ref)
+    after
+      0 -> :ok
+    end
   end
 
   defp fetch_server_version_num({:pool, pool_ref}) do

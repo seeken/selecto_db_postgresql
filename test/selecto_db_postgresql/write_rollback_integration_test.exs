@@ -7,7 +7,9 @@ defmodule SelectoDBPostgreSQL.WriteRollbackIntegrationTest do
   @moduletag :postgres
 
   setup do
-    {:ok, connection} = Adapter.connect(SelectoDBPostgreSQL.PostgresTestConnection.options())
+    {:ok, connection} =
+      Adapter.connect(SelectoDBPostgreSQL.Verification.ConnectionOptions.options())
+
     Process.unlink(connection)
 
     on_exit(fn ->

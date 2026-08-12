@@ -23,10 +23,13 @@ Run the package tests and the deterministic bounded adapter-safety model with:
 ```sh
 SELECTO_ECOSYSTEM_USE_LOCAL=1 mise exec -- mix precommit
 SELECTO_ECOSYSTEM_USE_LOCAL=1 mise exec -- mix selecto_db_postgresql.verify
+SELECTO_POSTGRES_TEST_URL=postgres://postgres:postgres@localhost:5432/postgres \
+  SELECTO_ECOSYSTEM_USE_LOCAL=1 mise exec -- mix selecto_db_postgresql.verify_sql
 ```
 
-The bounded report is complementary to the live PostgreSQL matrix; its exact
-state space and guarantees are documented in
+The database-independent bounded reports and live relational differential report
+are complementary to the PostgreSQL matrix; their exact state spaces and
+guarantees are documented in
 [`docs/formal_verification.md`](docs/formal_verification.md).
 
 ## Usage

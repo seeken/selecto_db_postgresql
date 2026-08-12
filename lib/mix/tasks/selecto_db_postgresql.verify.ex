@@ -9,7 +9,7 @@ defmodule Mix.Tasks.SelectoDbPostgresql.Verify do
       mix selecto_db_postgresql.verify
       mix selecto_db_postgresql.verify --output tmp/postgresql-verification.json
 
-  Exit status is non-zero if the model produces a counterexample.
+  Exit status is non-zero if any model produces a counterexample.
   """
 
   @impl Mix.Task
@@ -20,7 +20,22 @@ defmodule Mix.Tasks.SelectoDbPostgresql.Verify do
       Mix.raise("usage: mix selecto_db_postgresql.verify [--output PATH]")
     end
 
-    report = SelectoDBPostgreSQL.Verification.AdapterSafety.check()
+    reports = [
+      SelectoDBPostgreSQL.Verification.AdapterSafety.check(),
+      SelectoDBPostgreSQL.Verification.TransactionProtocol.check(),
+      SelectoDBPostgreSQL.Verification.StreamProtocol.check(),
+      SelectoDBPostgreSQL.Verification.PoolProtocol.check()
+    ]
+
+    Enum.each(reports, &print_report/1)
+    maybe_write(reports, opts[:output])
+
+    unless Enum.all?(reports, & &1.proved?) do
+      Mix.raise("PostgreSQL adapter formal verification found counterexamples")
+    end
+  end
+
+  defp print_report(report) do
     status = if report.proved?, do: "PROVED", else: "FAILED"
 
     Mix.shell().info(
@@ -32,23 +47,17 @@ defmodule Mix.Tasks.SelectoDbPostgresql.Verify do
     Enum.each(report.counterexamples, fn counterexample ->
       Mix.shell().error("counterexample: #{inspect(counterexample, pretty: true)}")
     end)
-
-    maybe_write(report, opts[:output])
-
-    unless report.proved? do
-      Mix.raise("PostgreSQL adapter formal verification found counterexamples")
-    end
   end
 
-  defp maybe_write(_report, nil), do: :ok
+  defp maybe_write(_reports, nil), do: :ok
 
-  defp maybe_write(report, path) do
+  defp maybe_write(reports, path) do
     artifact = %{
       format: "selecto.formal_verification_suite",
       format_version: 1,
       generated_at: DateTime.utc_now() |> DateTime.to_iso8601(),
-      proved?: report.proved?,
-      reports: [report]
+      proved?: Enum.all?(reports, & &1.proved?),
+      reports: reports
     }
 
     path = Path.expand(path)
