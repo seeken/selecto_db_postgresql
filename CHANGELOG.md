@@ -1,6 +1,15 @@
 CHANGES
 =======
 
+V 0.4.11
+--------
+
+- Adopted the versioned Selecto write capability protocol and reported the
+  PostgreSQL generated-key mechanism explicitly.
+- Replaced adapter-local graph materialization and result-selection code with
+  the dialect-neutral Selecto 0.4.13 helpers while retaining all PostgreSQL
+  SQL, transaction, driver, and MERGE ownership in this package.
+
 V 0.4.10
 --------
 

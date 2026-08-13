@@ -348,8 +348,10 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
     assert {:error,
             %Selecto.Write.Error{
               type: :transaction_failed,
-              details: %{reason: {:invalid_connection, ^process}}
-            }} = SelectoDBPostgreSQL.Adapter.execute_write(process, command)
+              details: %{adapter: :postgresql, reason: :invalid_connection}
+            } = error} = SelectoDBPostgreSQL.Adapter.execute_write(process, command)
+
+    refute inspect(error) =~ inspect(process)
   end
 
   test "stream producer crashes surface promptly instead of timing out" do

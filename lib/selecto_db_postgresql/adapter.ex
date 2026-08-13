@@ -10,6 +10,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   alias SelectoDBPostgreSQL.GraphCompiler
   alias SelectoDBPostgreSQL.WriteCompiler
   alias Selecto.Write.{Batch, Command, Error, Graph, Result}
+  alias Selecto.Write.Graph.Materializer
 
   @impl true
   def name, do: :postgresql
@@ -84,12 +85,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
       end
 
     %{
+      protocol_version: Selecto.Write.Capabilities.protocol_version(),
       insert: true,
       update: true,
       upsert: true,
       delete: true,
       write_graph: true,
       returning: true,
+      generated_keys: :returning,
       atomic_batch: true,
       transactions: true,
       dialect: :postgresql,
@@ -178,7 +181,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_graph(connection, %Graph{} = graph, server_major, opts) do
     graph.nodes
     |> Enum.reduce_while({:ok, %{}, 0, []}, fn node, {:ok, results, affected_rows, strategies} ->
-      with {:ok, materialized} <- GraphCompiler.materialize_node(node, results),
+      with {:ok, materialized} <- Materializer.materialize_node(node, results),
            {:ok, node_results, node_affected, strategy} <-
              execute_graph_node(connection, materialized, server_major, opts) do
         results =
@@ -195,13 +198,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end)
     |> case do
       {:ok, results, affected_rows, strategies} ->
-        root_result = Map.get(results, graph.root)
-
         {:ok,
          %Result{
            operation: :graph,
            affected_rows: affected_rows,
-           rows: graph_root_rows(root_result, graph_root_returning(graph)),
+           rows: Materializer.root_rows(graph, results),
            metadata: %{
              dialect: :postgresql,
              atomic?: true,
@@ -232,7 +233,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp execute_graph_node_fallback(connection, node, opts) do
     with {:ok, row_results, affected_rows} <- execute_graph_rows(connection, node.rows, opts),
-         {:ok, cleanup} <- GraphCompiler.delete_missing_command(node, row_results),
+         {:ok, cleanup} <- Materializer.delete_missing_command(node, row_results),
          {:ok, cleanup_affected} <- execute_graph_cleanup(connection, cleanup, opts) do
       {:ok, row_results, affected_rows + cleanup_affected, :ordered_fallback}
     end
@@ -256,27 +257,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
     case execute_write_command(connection, command, opts) do
       {:ok, result} -> {:ok, result.affected_rows}
       {:error, _} = error -> error
-    end
-  end
-
-  defp graph_root_rows(_root_result, :none), do: []
-  defp graph_root_rows(%Result{rows: rows}, :all), do: rows
-
-  defp graph_root_rows(%Result{rows: rows}, fields) when is_list(fields) do
-    field_ids = MapSet.new(fields, &to_string/1)
-
-    Enum.map(rows, fn row ->
-      Map.new(row, fn {field, value} -> {field, value} end)
-      |> Map.filter(fn {field, _value} -> MapSet.member?(field_ids, to_string(field)) end)
-    end)
-  end
-
-  defp graph_root_rows(_root_result, _returning), do: []
-
-  defp graph_root_returning(graph) do
-    case Map.fetch(graph.metadata, :root_returning) do
-      {:ok, returning} -> returning
-      :error -> :all
     end
   end
 
@@ -1436,7 +1416,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp write_error(type, reason) do
-    Error.new(type, "PostgreSQL write failed", details: %{reason: reason})
+    Error.adapter_failure(type, :postgresql, reason, "PostgreSQL write failed")
   end
 
   defp postgres_transaction(connection, opts, fun) do
