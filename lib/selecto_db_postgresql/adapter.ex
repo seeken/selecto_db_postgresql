@@ -13,8 +13,108 @@ defmodule SelectoDBPostgreSQL.Adapter do
   alias Selecto.Write.{Batch, Command, Error, Graph, Result}
   alias Selecto.Write.Graph.Materializer
 
+  @native_type_mappings %{
+    "int2" => :integer,
+    "int4" => :integer,
+    "int8" => :integer,
+    "float4" => :float,
+    "float8" => :float,
+    "money" => :decimal,
+    "bpchar" => :string,
+    "name" => :string,
+    "citext" => :string,
+    "bool" => :boolean,
+    "timestamptz" => :utc_datetime,
+    "jsonb" => :map,
+    "_int4" => {:array, :integer},
+    "_text" => {:array, :string},
+    "_varchar" => {:array, :string},
+    "inet" => :string,
+    "cidr" => :string,
+    "macaddr" => :string,
+    "point" => :string,
+    "line" => :string,
+    "lseg" => :string,
+    "box" => :string,
+    "path" => :string,
+    "polygon" => :string,
+    "circle" => :string,
+    "public.geometry" => :geometry,
+    "public.geography" => :geography,
+    "bytea" => :binary,
+    "tsvector" => :text_search_document
+  }
+
   @impl true
   def name, do: :postgresql
+
+  @impl true
+  def dialect, do: SelectoDBPostgreSQL.Dialect
+
+  @impl true
+  def identifier_policy, do: %{max_bytes: 63}
+
+  @impl true
+  def capability(:text_search) do
+    %{
+      feature: :text_search,
+      supported?: true,
+      modes: [:websearch, :plain, :phrase, :boolean, :natural],
+      default_mode: :websearch,
+      document_type: :text_search_document,
+      help: "Full-text search with web-style, plain, phrase, or boolean query modes."
+    }
+  end
+
+  def capability(feature) do
+    %{feature: feature, supported?: supports?(feature)}
+  end
+
+  @impl true
+  def analyze_query(selecto, options),
+    do: SelectoDBPostgreSQL.QueryAnalyzer.analyze_query(selecto, options)
+
+  @impl true
+  def analyze_index_usage(selecto, options),
+    do: SelectoDBPostgreSQL.QueryAnalyzer.analyze_index_usage(selecto, options)
+
+  @impl true
+  def table_statistics(selecto, _options),
+    do: SelectoDBPostgreSQL.QueryAnalyzer.get_table_statistics(selecto)
+
+  @impl true
+  def normalize_type(type) when is_binary(type) do
+    normalized = type |> String.trim() |> String.downcase()
+    Map.get(@native_type_mappings, normalized, type)
+  end
+
+  def normalize_type(:jsonb), do: :map
+  def normalize_type(:tsvector), do: :text_search_document
+  def normalize_type(:citext), do: :string
+  def normalize_type(type), do: Selecto.TypeSystem.normalize_type(type)
+
+  @impl true
+  def type_family(type), do: type |> normalize_type() |> Selecto.TypeFamily.of()
+
+  @impl true
+  def normalize_execution_result(result), do: {:ok, normalize_result(result)}
+
+  @impl true
+  def normalize_error(%Selecto.Error{} = error), do: error
+
+  def normalize_error(%Postgrex.Error{} = error) do
+    native = Map.get(error, :postgres) || %{}
+    category = normalize_error_category(Map.get(native, :code) || Map.get(native, :pg_code))
+
+    Selecto.Error.query_error(Exception.message(error), nil, [], %{
+      category: category,
+      constraint: Map.get(native, :constraint),
+      column: Map.get(native, :column),
+      recoverable?: category in [:unique_violation, :foreign_key_violation, :not_null_violation]
+    })
+  end
+
+  def normalize_error(reason), do: Selecto.Error.from_reason(reason)
 
   @impl true
   def connect({:pool, _} = pool_ref), do: {:ok, pool_ref}
@@ -48,6 +148,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   def connect(_other),
     do: {:error, {:invalid_connection_options, :expected_options_or_connection}}
+
+  @impl true
+  def disconnect(connection) when is_pid(connection) do
+    if Process.alive?(connection), do: GenServer.stop(connection)
+    :ok
+  end
+
+  def disconnect(_connection), do: :ok
 
   @impl true
   def execute({:pool, pool_ref}, query, params, opts) do
@@ -347,6 +455,15 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def quote_identifier(identifier), do: identifier |> to_string() |> quote_identifier()
 
   @impl true
+  def format_datetime(expression, format) when is_binary(format) do
+    escaped = String.replace(format, "'", "''")
+    ["to_char(", expression, ", '", escaped, "')"]
+  end
+
+  @impl true
+  def rollup_sql(grouped_clauses), do: ["rollup( ", grouped_clauses, " )"]
+
+  @impl true
   def supports?(feature) do
     feature in [
       :cte,
@@ -380,7 +497,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @impl true
   def refresh_materialized_view(connection, database_name, opts \\ []) do
-    with {:ok, quoted_name} <- Selecto.SQL.QualifiedIdentifier.quote(database_name) do
+    with {:ok, quoted_name} <-
+           Selecto.SQL.QualifiedIdentifier.quote(database_name, __MODULE__) do
       concurrently = if Keyword.get(opts, :concurrently, false), do: " CONCURRENTLY", else: ""
       query = "REFRESH MATERIALIZED VIEW#{concurrently} #{quoted_name};"
 
@@ -809,7 +927,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp valid_named_connection?(connection) when is_atom(connection) and not is_nil(connection) do
-    ecto_repo?(connection) or named_postgrex_connection?(connection)
+    ecto_repo?(connection) or module_exports?(connection, :query, 2) or
+      named_postgrex_connection?(connection)
   end
 
   defp valid_named_connection?(_connection), do: false
@@ -1481,6 +1600,17 @@ defmodule SelectoDBPostgreSQL.Adapter do
       num_rows: Map.get(result, :num_rows, length(rows || []))
     }
   end
+
+  defp normalize_error_category(code) when code in [:unique_violation, "23505"],
+    do: :unique_violation
+
+  defp normalize_error_category(code) when code in [:foreign_key_violation, "23503"],
+    do: :foreign_key_violation
+
+  defp normalize_error_category(code) when code in [:not_null_violation, "23502"],
+    do: :not_null_violation
+
+  defp normalize_error_category(_code), do: :database_error
 
   defp enforce_cardinality(%Command{expected_cardinality: expected}, result) do
     affected_rows = Map.get(result, :num_rows, length(Map.get(result, :rows, [])))

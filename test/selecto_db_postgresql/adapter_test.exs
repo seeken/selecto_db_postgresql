@@ -7,6 +7,12 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
     end
   end
 
+  defmodule Pg17MockRepo do
+    def query("show server_version_num", []) do
+      {:ok, %{rows: [["170001"]]}}
+    end
+  end
+
   test "adapter exposes the selecto adapter contract" do
     assert Code.ensure_loaded?(SelectoDBPostgreSQL.Adapter)
     assert function_exported?(SelectoDBPostgreSQL.Adapter, :name, 0)
@@ -20,6 +26,35 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
   test "postgres adapter reports expected placeholder and quoting strategy" do
     assert SelectoDBPostgreSQL.Adapter.placeholder(3) |> IO.iodata_to_binary() == "$3"
     assert SelectoDBPostgreSQL.Adapter.quote_identifier("order") == "\"order\""
+  end
+
+  test "postgres adapter owns native result type normalization" do
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("int4") == :integer
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("timestamptz") == :utc_datetime
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("jsonb") == :map
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("_int4") == {:array, :integer}
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("bytea") == :binary
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("tsvector") == :text_search_document
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("public.geometry") == :geometry
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("public.geography") == :geography
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("custom_domain") == "custom_domain"
+  end
+
+  test "core coercion consumes adapter-normalized native type evidence" do
+    assert Selecto.Output.TypeCoercion.coerce_value(
+             "42",
+             "int4",
+             :safe,
+             %{},
+             SelectoDBPostgreSQL.Adapter
+           ) == 42
+
+    assert Selecto.Output.TypeCoercion.get_elixir_type(
+             "jsonb",
+             SelectoDBPostgreSQL.Adapter
+           ) == :map
+
+    assert Selecto.TypeSystem.parse_sql_type("int4", SelectoDBPostgreSQL.Adapter) == :integer
   end
 
   test "postgres adapter rejects invalid connection values" do
@@ -239,7 +274,7 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
   test "postgres rollup uses compatibility wrapper by default" do
     selecto =
       sales_domain()
-      |> Selecto.configure(:mock_connection,
+      |> Selecto.configure(Pg17MockRepo,
         adapter: SelectoDBPostgreSQL.Adapter,
         validate: false
       )

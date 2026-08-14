@@ -1,6 +1,21 @@
 CHANGES
 =======
 
+V 0.5.0
+--------
+
+- Raised the Selecto baseline to `0.5.0` and became the sole owner of
+  PostgreSQL runtime, Postgrex execution, pooling, transactions, streaming,
+  native types/errors, JSONB/array/text-search/interval rendering, hierarchy
+  path SQL, query analysis, and benchmark behavior.
+- Added the typed PostgreSQL dialect implementation and structured capability
+  rejection required by the adapter-neutral core contract.
+- Added adapter-owned date/time formatting and extraction, text normalization,
+  finite bucket rendering, and case-insensitive comparison SQL used by
+  Components' portable query intent.
+- Retained connected function verification, write/graph compilation, live
+  protocol tests, and bounded live-differential verification in this package.
+
 V 0.4.12
 --------
 

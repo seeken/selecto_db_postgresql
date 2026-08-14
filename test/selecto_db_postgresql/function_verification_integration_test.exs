@@ -29,6 +29,7 @@ defmodule SelectoDBPostgreSQL.FunctionVerificationIntegrationTest do
       if Process.alive?(connection) do
         execute!(connection, "RESET ROLE")
         drop_functions(connection)
+        execute!(connection, "REVOKE USAGE ON SCHEMA public FROM #{@restricted_role}")
         execute!(connection, "DROP ROLE IF EXISTS #{@restricted_role}")
       end
     end)
@@ -219,6 +220,7 @@ defmodule SelectoDBPostgreSQL.FunctionVerificationIntegrationTest do
   defp create_restricted_role(connection) do
     execute!(connection, "DROP ROLE IF EXISTS #{@restricted_role}")
     execute!(connection, "CREATE ROLE #{@restricted_role} NOLOGIN")
+    execute!(connection, "GRANT USAGE ON SCHEMA public TO #{@restricted_role}")
   end
 
   defp drop_functions(connection) do

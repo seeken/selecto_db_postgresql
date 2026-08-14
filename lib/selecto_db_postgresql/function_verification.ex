@@ -331,6 +331,13 @@ defmodule SelectoDBPostgreSQL.FunctionVerification do
     end
   end
 
+  defp postgres_type({:native, :postgresql, :jsonb}), do: {:ok, "jsonb"}
+  defp postgres_type({:native, :postgresql, "jsonb"}), do: {:ok, "jsonb"}
+  defp postgres_type({:native, :postgresql, :tsvector}), do: {:ok, "tsvector"}
+  defp postgres_type({:native, :postgresql, "tsvector"}), do: {:ok, "tsvector"}
+  defp postgres_type({:native, :postgresql, :bytea}), do: {:ok, "bytea"}
+  defp postgres_type({:native, :postgresql, "bytea"}), do: {:ok, "bytea"}
+
   defp postgres_type(type) do
     case type do
       :integer ->

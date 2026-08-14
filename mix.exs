@@ -1,7 +1,7 @@
 defmodule SelectoDBPostgreSQL.MixProject do
   use Mix.Project
 
-  @version "0.4.12"
+  @version "0.5.0"
   @source_url "https://github.com/seeken/selecto_db_postgresql"
 
   def project do
@@ -36,6 +36,9 @@ defmodule SelectoDBPostgreSQL.MixProject do
     [
       selecto_dep(),
       {:postgrex, ">= 0.0.0"},
+      {:ecto_sql, "~> 3.13", optional: true},
+      {:benchee, "~> 1.5", only: [:dev, :test], optional: true},
+      {:benchee_html, "~> 1.0", only: [:dev, :test], optional: true},
       {:ex_doc, "~> 0.29", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
@@ -46,7 +49,7 @@ defmodule SelectoDBPostgreSQL.MixProject do
     if use_local_ecosystem?() do
       {:selecto, path: local_selecto_path()}
     else
-      {:selecto, ">= 0.4.13 and < 0.6.0"}
+      {:selecto, ">= 0.5.0 and < 0.6.0"}
     end
   end
 
