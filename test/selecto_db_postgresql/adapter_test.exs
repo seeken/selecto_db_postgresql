@@ -212,6 +212,30 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
            }
   end
 
+  test "expanded introspection propagates association query failures" do
+    query_fun = fn query, _params, _opts ->
+      cond do
+        String.contains?(query, "FROM information_schema.columns") ->
+          {:ok, %{rows: [["id", "integer", "int4", "NO", nil, nil, 32, 0, 1]]}}
+
+        String.contains?(query, "AND i.indisprimary") ->
+          {:ok, %{rows: [["id"]]}}
+
+        String.contains?(query, "AND tc.table_name = $2") ->
+          {:ok, %{rows: []}}
+
+        String.contains?(query, "AND ccu.table_name = $2") ->
+          {:error, :permission_denied}
+      end
+    end
+
+    assert {:error, {:reverse_foreign_keys_query_failed, :permission_denied}} =
+             SelectoDBPostgreSQL.Adapter.introspect_table(%{query_fun: query_fun}, "products",
+               schema: "public",
+               expand: true
+             )
+  end
+
   test "postgres rollup uses compatibility wrapper by default" do
     selecto =
       sales_domain()
@@ -279,17 +303,18 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
              SelectoDBPostgreSQL.Adapter.connection_info(123)
   end
 
-  test "named atom connections are treated as postgrex connections, not repos" do
+  test "arbitrary registered processes are not treated as named Postgrex connections" do
     process = spawn(fn -> Process.sleep(:infinity) end)
     Process.register(process, :named_postgrex_conn)
     on_exit(fn -> if Process.alive?(process), do: Process.exit(process, :kill) end)
 
-    assert {:ok, :named_postgrex_conn} =
+    assert {:error, {:invalid_connection, :named_postgrex_conn}} =
              SelectoDBPostgreSQL.Adapter.connect(:named_postgrex_conn)
 
-    assert :ok = SelectoDBPostgreSQL.Adapter.validate_connection(:named_postgrex_conn)
+    assert {:error, "Named Postgrex connection is not registered"} =
+             SelectoDBPostgreSQL.Adapter.validate_connection(:named_postgrex_conn)
 
-    assert %{type: :postgrex, pid: :named_postgrex_conn, status: :connected} =
+    assert %{type: :postgrex, pid: :named_postgrex_conn, status: :disconnected} =
              SelectoDBPostgreSQL.Adapter.connection_info(:named_postgrex_conn)
   end
 

@@ -292,6 +292,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @impl true
   def execute_pool(pool_ref, query, params, opts) do
+    query = normalize_query(query)
     use_prepared = Keyword.get(opts, :prepared, true)
     cache_key = if use_prepared, do: Selecto.ConnectionPool.generate_cache_key(query), else: nil
 
@@ -457,47 +458,77 @@ defmodule SelectoDBPostgreSQL.Adapter do
           {column.column_name, map_pg_type(connection, column.data_type, column.udt_name)}
         end)
 
-      associations =
-        cond do
-          not include_associations ->
-            %{}
+      with {:ok, associations} <-
+             table_associations(
+               connection,
+               table_name,
+               schema,
+               primary_key,
+               foreign_keys,
+               include_associations,
+               expand
+             ) do
+        column_metadata =
+          Enum.into(columns, %{}, fn column ->
+            {column.column_name,
+             %{
+               type: Map.get(field_types, column.column_name),
+               nullable: column.is_nullable == "YES",
+               default: column.column_default,
+               max_length: column.character_maximum_length,
+               precision: column.numeric_precision,
+               scale: column.numeric_scale
+             }}
+          end)
 
-          expand ->
-            case build_expanded_associations(connection, table_name, schema, primary_key) do
-              {:ok, expanded_associations} -> expanded_associations
-              {:error, _reason} -> build_associations(foreign_keys)
-            end
-
-          true ->
-            build_associations(foreign_keys)
-        end
-
-      column_metadata =
-        Enum.into(columns, %{}, fn column ->
-          {column.column_name,
-           %{
-             type: Map.get(field_types, column.column_name),
-             nullable: column.is_nullable == "YES",
-             default: column.column_default,
-             max_length: column.character_maximum_length,
-             precision: column.numeric_precision,
-             scale: column.numeric_scale
-           }}
-        end)
-
-      {:ok,
-       %{
-         table_name: table_name,
-         schema: schema,
-         fields: fields,
-         field_types: field_types,
-         primary_key: primary_key,
-         associations: associations,
-         columns: column_metadata,
-         source: :postgresql
-       }}
+        {:ok,
+         %{
+           table_name: table_name,
+           schema: schema,
+           fields: fields,
+           field_types: field_types,
+           primary_key: primary_key,
+           associations: associations,
+           columns: column_metadata,
+           source: :postgresql
+         }}
+      end
     end
   end
+
+  defp table_associations(
+         _connection,
+         _table_name,
+         _schema,
+         _primary_key,
+         _foreign_keys,
+         false,
+         _expand
+       ),
+       do: {:ok, %{}}
+
+  defp table_associations(
+         connection,
+         table_name,
+         schema,
+         primary_key,
+         _foreign_keys,
+         true,
+         true
+       ) do
+    build_expanded_associations(connection, table_name, schema, primary_key)
+  end
+
+  defp table_associations(
+         _connection,
+         _table_name,
+         _schema,
+         _primary_key,
+         foreign_keys,
+         true,
+         false
+       ),
+       do: {:ok, build_associations(foreign_keys)}
 
   @impl true
   def rollup_literal_order(index), do: [Integer.to_string(index), " asc nulls first"]
@@ -766,10 +797,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp valid_named_connection?(connection) when is_atom(connection) and not is_nil(connection) do
-    ecto_repo?(connection) or is_pid(Process.whereis(connection))
+    ecto_repo?(connection) or named_postgrex_connection?(connection)
   end
 
   defp valid_named_connection?(_connection), do: false
+
+  defp named_postgrex_connection?(connection) do
+    with pid when is_pid(pid) <- Process.whereis(connection),
+         {:dictionary, dictionary} <- Process.info(pid, :dictionary) do
+      Keyword.get(dictionary, :connection_module) == Postgrex.Protocol
+    else
+      _other -> false
+    end
+  end
 
   defp valid_postgrex_connection?(connection) when is_pid(connection),
     do: Process.alive?(connection)
@@ -1069,15 +1109,17 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp detect_junction_tables(connection, schema) do
     with {:ok, tables} <- list_tables(connection, schema: schema) do
-      junction_tables =
-        Enum.flat_map(tables, fn table ->
-          case analyze_junction_table(connection, table, schema) do
-            {:ok, junction_table} -> [junction_table]
-            _ -> []
-          end
-        end)
-
-      {:ok, junction_tables}
+      Enum.reduce_while(tables, {:ok, []}, fn table, {:ok, junction_tables} ->
+        case analyze_junction_table(connection, table, schema) do
+          {:ok, junction_table} -> {:cont, {:ok, [junction_table | junction_tables]}}
+          {:error, :not_junction_table} -> {:cont, {:ok, junction_tables}}
+          {:error, reason} -> {:halt, {:error, {:junction_introspection_failed, table, reason}}}
+        end
+      end)
+      |> case do
+        {:ok, junction_tables} -> {:ok, Enum.reverse(junction_tables)}
+        {:error, _reason} = error -> error
+      end
     end
   end
 
@@ -1459,6 +1501,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp build_postgrex_cursor_stream(conn, query, params, opts) do
+    query = normalize_query(query)
     max_rows = Keyword.get(opts, :max_rows, 500)
     stream_timeout = Keyword.get(opts, :stream_timeout, 30_000)
     receive_timeout = Keyword.get(opts, :receive_timeout, 60_000)
