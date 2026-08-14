@@ -14,6 +14,19 @@ V 0.4.12
 V 0.4.11
 --------
 
+- Added connected registered-function verification using exact `pg_proc`
+  catalog identity resolution plus Postgrex parse/describe without argument
+  binding or function execution.
+- Added fail-closed evidence for missing functions, signature and return-shape
+  mismatches, execute privilege, required extensions, minimum PostgreSQL
+  version, volatility, unsupported types, and driver/connection failures.
+- Added unit coverage and live scalar, predicate, and table-function tests; the
+  scalar fixture raises if executed, proving the verification path stops after
+  parse/describe.
+- Added a separate controlled semantic-fixture suite that executes only after
+  connected resolution succeeds and covers null/empty/representative text,
+  signed integer boundaries, predicate cases, table row shape, and bounded
+  invariants for a volatile result without claiming deterministic semantics.
 - Adopted the versioned Selecto write capability protocol and reported the
   PostgreSQL generated-key mechanism explicitly.
 - Replaced adapter-local graph materialization and result-selection code with

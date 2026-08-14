@@ -6,6 +6,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @behaviour Selecto.DB.Adapter
   @behaviour Selecto.DB.WriteAdapter
 
+  alias SelectoDBPostgreSQL.FunctionVerification
   alias SelectoDBPostgreSQL.Identifier
   alias SelectoDBPostgreSQL.GraphCompiler
   alias SelectoDBPostgreSQL.WriteCompiler
@@ -360,10 +361,21 @@ defmodule SelectoDBPostgreSQL.Adapter do
       :lateral_join,
       :prefix,
       :stream,
+      :function_verification,
       :schema_introspection,
       :materialized_view_refresh,
       :materialized_view_refresh_concurrently
     ]
+  end
+
+  @impl true
+  def verify_function(connection, %Selecto.FunctionVerification.Request{} = request, opts) do
+    FunctionVerification.verify(
+      request,
+      opts,
+      fn query, params -> introspection_query(connection, query, params) end,
+      fn statement, probe_opts -> prepare_function_probe(connection, statement, probe_opts) end
+    )
   end
 
   @impl true
@@ -846,6 +858,69 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
       _ ->
         execute(connection, query, params, prepared: false)
+    end
+  end
+
+  defp prepare_function_probe(%{prepare_fun: prepare_fun}, statement, opts)
+       when is_function(prepare_fun, 2) do
+    prepare_fun.(statement, opts)
+  end
+
+  defp prepare_function_probe(connection, statement, opts) do
+    with {:ok, target} <- function_probe_target(connection) do
+      DBConnection.run(target, fn checked_out_connection ->
+        case Postgrex.prepare(checked_out_connection, "", statement, opts) do
+          {:ok, query} ->
+            probe = %{
+              columns: query.columns || [],
+              result_oids: query.result_oids || []
+            }
+
+            case Postgrex.close(checked_out_connection, query, opts) do
+              :ok -> {:ok, probe}
+              {:error, reason} -> {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end)
+    end
+  rescue
+    exception -> {:error, {:probe_exception, exception.__struct__}}
+  catch
+    :exit, _reason -> {:error, :probe_connection_exit}
+  end
+
+  defp function_probe_target({:pool, pool_ref}), do: resolve_live_pool_pid(pool_ref)
+  defp function_probe_target(%DBConnection{} = connection), do: {:ok, connection}
+
+  defp function_probe_target(connection) when is_pid(connection) do
+    if Process.alive?(connection),
+      do: {:ok, connection},
+      else: {:error, :invalid_probe_connection}
+  end
+
+  defp function_probe_target(connection) when is_atom(connection) and not is_nil(connection) do
+    cond do
+      ecto_repo?(connection) -> ecto_pool_target(connection)
+      is_pid(Process.whereis(connection)) -> {:ok, connection}
+      true -> {:error, :invalid_probe_connection}
+    end
+  end
+
+  defp function_probe_target(_connection), do: {:error, :unsupported_probe_connection}
+
+  defp ecto_pool_target(repo) do
+    ecto_adapter = :"Elixir.Ecto.Adapter"
+
+    if module_exports?(ecto_adapter, :lookup_meta, 1) do
+      case apply(ecto_adapter, :lookup_meta, [repo]) do
+        %{pid: pool_pid} when is_pid(pool_pid) -> {:ok, pool_pid}
+        _metadata -> {:error, :unsupported_ecto_pool}
+      end
+    else
+      {:error, :unsupported_ecto_pool}
     end
   end
 

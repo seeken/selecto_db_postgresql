@@ -43,6 +43,72 @@ selecto =
   )
 ```
 
+## Connected database-function verification
+
+The adapter advertises Selecto's `:function_verification` capability. Given a
+normalized registered-function signature, `Selecto.verify_function/4` can ask
+the connected PostgreSQL database to verify that exact signature before the
+application relies on it:
+
+```elixir
+{:ok, report} =
+  Selecto.verify_function(
+    selecto,
+    "similarity",
+    ["product_name", {:param, "mountain"}],
+    call_site: :select,
+    mode: :strict
+  )
+
+report.status
+#=> :database_resolved
+```
+
+The PostgreSQL verifier performs two complementary, non-executing checks:
+
+1. It resolves the explicit PostgreSQL identity with `to_regprocedure` and
+   reads `pg_proc`/`pg_namespace` metadata for the return shape, set-returning
+   flag, volatility, current-database execute privilege, server version, and
+   required extensions.
+2. It submits a typed `SELECT` to Postgrex's parse/describe operation, then
+   immediately closes the unnamed prepared statement. It does not bind values
+   or execute the statement.
+
+The verification request contains declared argument types, never runtime
+argument values. Its evidence records `function_executed: false` and
+`argument_values_transmitted: false`. A successful report proves only that the
+exact declared signature resolves for the current connection context and that
+the declared result shape and requirements match the current catalog. It does
+not prove function semantics for any input.
+
+Selecto types are mapped explicitly to PostgreSQL identities. Notable defaults
+are `:string` to `text`, `:decimal` to `numeric`, `:float` to
+`double precision`, `:naive_datetime` to `timestamp without time zone`, and
+`:utc_datetime` to `timestamp with time zone`; arrays preserve the mapped
+element type. `:unknown` and unsupported types produce `:indeterminate`
+evidence without database dispatch.
+
+The adapter distinguishes missing names, same-name signature mismatches,
+return-shape mismatches, missing `EXECUTE` privilege, unmet extension/version/
+volatility requirements, and indeterminate driver or connection failures.
+Only `:database_resolved` satisfies Selecto's `mode: :strict` policy.
+
+Connected resolution remains separate from semantic fixture evidence. The live
+test suite first requires `:database_resolved`, then executes only package-owned
+synthetic functions over null, empty, representative text, integer boundary,
+predicate, and table-shape cases. Its volatile fixture asserts only result type,
+finite row shape, and range invariants—never a deterministic value. Run these
+controlled fixtures explicitly with:
+
+```sh
+SELECTO_ECOSYSTEM_USE_LOCAL=1 mise exec -- mix test \
+  test/selecto_db_postgresql/function_semantics_integration_test.exs \
+  --include postgres
+```
+
+Passing those fixtures is `:controlled_live_fixture` evidence for the enumerated
+synthetic cases. It is not proof about arbitrary functions or inputs.
+
 ## Notes
 
 - Placeholder style is `$N`.
