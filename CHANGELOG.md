@@ -1,6 +1,16 @@
 CHANGES
 =======
 
+V 0.4.12
+--------
+
+- Restricted named direct connections to Ecto repositories or registered
+  Postgrex connection processes instead of accepting every registered atom.
+- Normalized iodata queries before pool cache-key generation, pool execution,
+  and cursor streaming.
+- Made expanded association and junction-table introspection propagate query
+  failures instead of silently returning incomplete metadata.
+
 V 0.4.11
 --------
 
