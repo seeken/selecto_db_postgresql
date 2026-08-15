@@ -30,6 +30,9 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
 
   test "postgres adapter owns native result type normalization" do
     assert SelectoDBPostgreSQL.Adapter.normalize_type("int4") == :integer
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("numeric") == :decimal
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("DECIMAL") == :decimal
+    assert SelectoDBPostgreSQL.Adapter.normalize_type("_numeric") == {:array, :decimal}
     assert SelectoDBPostgreSQL.Adapter.normalize_type("timestamptz") == :utc_datetime
     assert SelectoDBPostgreSQL.Adapter.normalize_type("jsonb") == :map
     assert SelectoDBPostgreSQL.Adapter.normalize_type("_int4") == {:array, :integer}
