@@ -472,10 +472,10 @@ defmodule SelectoDBPostgreSQL.Dialect do
   @impl true
   def render_json_operation(%Operation{} = operation, selecto) do
     case operation.operation do
-      kind when kind in [:json_extract, :json_extract_path] ->
+      :json_extract ->
         operation_extraction(operation, false, selecto)
 
-      kind when kind in [:json_extract_text, :json_extract_path_text] ->
+      :json_extract_text ->
         operation_extraction(operation, true, selecto)
 
       :json_contains ->
@@ -514,18 +514,6 @@ defmodule SelectoDBPostgreSQL.Dialect do
         {:ok,
          [
            "JSONB_SET(",
-           operation_column(operation),
-           ", ",
-           postgres_path(operation.path),
-           ", ",
-           json_value(operation.value),
-           ")"
-         ]}
-
-      :json_insert ->
-        {:ok,
-         [
-           "JSONB_INSERT(",
            operation_column(operation),
            ", ",
            postgres_path(operation.path),

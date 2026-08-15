@@ -4,6 +4,8 @@ CHANGES
 V 0.5.0
 --------
 
+- Removed renderer aliases for the retired `json_extract_path`,
+  `json_extract_path_text`, and `json_insert` core operations.
 - Raised the Selecto baseline to `0.5.0` and became the sole owner of
   PostgreSQL runtime, Postgrex execution, pooling, transactions, streaming,
   native types/errors, JSONB/array/text-search/interval rendering, hierarchy
