@@ -15,6 +15,8 @@ V 0.5.0
 - Added adapter-owned date/time formatting and extraction, text normalization,
   finite bucket rendering, and case-insensitive comparison SQL used by
   Components' portable query intent.
+- Normalized PostgreSQL `numeric`, `decimal`, and `numeric[]` result metadata to
+  Selecto's portable decimal types.
 - Retained connected function verification, write/graph compilation, live
   protocol tests, and bounded live-differential verification in this package.
 
