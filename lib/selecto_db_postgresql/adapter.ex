@@ -1649,7 +1649,24 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp with_postgres_transaction(connection, opts, fun)
-       when is_pid(connection) or is_atom(connection) do
+       when is_atom(connection) and not is_nil(connection) do
+    if ecto_repo?(connection) do
+      with_ecto_transaction(connection, opts, fun)
+    else
+      with_native_postgres_transaction(connection, opts, fun)
+    end
+  end
+
+  defp with_postgres_transaction(connection, opts, fun)
+       when is_pid(connection) do
+    with_native_postgres_transaction(connection, opts, fun)
+  end
+
+  defp with_postgres_transaction(connection, _opts, _fun) do
+    {:error, write_error(:transaction_failed, {:invalid_connection, connection})}
+  end
+
+  defp with_native_postgres_transaction(connection, opts, fun) do
     if valid_postgrex_connection?(connection) do
       case postgres_transaction(connection, opts, fun) do
         {:ok, results} -> {:ok, results}
@@ -1661,8 +1678,33 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp with_postgres_transaction(connection, _opts, _fun) do
-    {:error, write_error(:transaction_failed, {:invalid_connection, connection})}
+  defp with_ecto_transaction(repo, opts, fun) do
+    transaction_opts = Keyword.take(opts, [:timeout, :log])
+
+    case apply(repo, :transaction, [
+           fn -> ecto_transaction_result(repo, fun) end,
+           transaction_opts
+         ]) do
+      {:ok, results} -> {:ok, results}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+    end
+  rescue
+    exception ->
+      {:error,
+       write_error(
+         :transaction_failed,
+         {:transaction_exception, exception.__struct__, Exception.message(exception)}
+       )}
+  catch
+    :exit, reason -> {:error, write_error(:transaction_failed, {:connection_exit, reason})}
+  end
+
+  defp ecto_transaction_result(repo, fun) do
+    case fun.(repo) do
+      {:ok, results} -> results
+      {:error, error} -> apply(repo, :rollback, [error])
+    end
   end
 
   defp write_error(type, reason) do

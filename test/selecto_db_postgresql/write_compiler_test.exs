@@ -4,6 +4,22 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
   alias Selecto.Write.{Batch, Command, Error}
   alias SelectoDBPostgreSQL.Adapter
 
+  defmodule EctoTransactionProbeRepo do
+    def __adapter__, do: Ecto.Adapters.Postgres
+
+    def transaction(fun, opts) do
+      send(self(), {:ecto_transaction, opts})
+
+      try do
+        {:ok, fun.()}
+      catch
+        {:rollback, reason} -> {:error, reason}
+      end
+    end
+
+    def rollback(reason), do: throw({:rollback, reason})
+  end
+
   test "previews a parameterized insert without any ORM or application configuration" do
     command = command!(:insert, returning: [:id])
 
@@ -169,6 +185,15 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
     assert capabilities.dialect == :postgresql
     assert capabilities.atomic_batch
     assert capabilities.returning
+  end
+
+  test "routes Ecto Repo writes through the Repo transaction boundary" do
+    assert {:error, %Error{}} =
+             Adapter.execute_write(EctoTransactionProbeRepo, command!(:update),
+               context: %{tenant_id: 7}
+             )
+
+    assert_receive {:ecto_transaction, []}
   end
 
   test "previews a portable upsert with domain-governed conflict and update fields" do
