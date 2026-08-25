@@ -42,6 +42,18 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
     assert [%{"id" => order_id}] = insert_result.rows
 
+    assert [
+             %{path: [:items, 0], operation: :create, identity: %{"id" => first_created_id}},
+             %{path: [:items, 1], operation: :create, identity: %{"id" => second_created_id}}
+           ] = insert_result.metadata.nested_outcomes
+
+    assert [
+             %{client_identity: "new-0", identity: %{"id" => mapped_first_id}},
+             %{client_identity: "new-1", identity: %{"id" => mapped_second_id}}
+           ] = insert_result.metadata.identity_mappings
+
+    assert {mapped_first_id, mapped_second_id} == {first_created_id, second_created_id}
+
     assert {:ok, %{rows: [[first_id, "A"], [second_id, "B"]]}} =
              Adapter.execute(
                connection,
@@ -61,6 +73,16 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
 
     assert sync_result.metadata.node_strategies["items"] == expected_strategy
 
+    assert [
+             %{path: [:items, 0], operation: :update, identity: %{"id" => ^first_id}},
+             %{path: [:items, 1], operation: :create, identity: %{"id" => created_id}}
+           ] = sync_result.metadata.nested_outcomes
+
+    assert [%{client_identity: "new-C", identity: %{"id" => mapped_created_id}}] =
+             sync_result.metadata.identity_mappings
+
+    assert mapped_created_id == created_id
+
     assert {:ok, %{rows: [[^first_id, "A-updated", 4], [new_id, "C", 1]]}} =
              Adapter.execute(
                connection,
@@ -70,6 +92,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
              )
 
     assert new_id != second_id
+    assert new_id == created_id
   end
 
   test "ownership mismatch rolls back root and child changes", %{connection: connection} do
@@ -146,7 +169,8 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
           id: row_id,
           path: [:items, String.to_integer(row_id)],
           command: command,
-          bindings: [order_binding()]
+          bindings: [order_binding()],
+          metadata: %{client_identity: "new-#{row_id}", semantic_operation: :create}
         }
       end)
 
@@ -157,6 +181,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
         path: [:items],
         relation: :selecto_graph_items,
         strategy: :ordered,
+        identity_fields: [:id],
         rows: child_rows
       }
     ])
@@ -239,14 +264,14 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
             path: [:items, 0],
             command: existing,
             bindings: [order_binding()],
-            metadata: %{identity: %{id: existing_item_id}}
+            metadata: %{identity: %{id: existing_item_id}, semantic_operation: :update}
           },
           %Row{
             id: "1",
             path: [:items, 1],
             command: new,
             bindings: [order_binding()],
-            metadata: %{identity: %{}}
+            metadata: %{identity: %{}, client_identity: "new-C", semantic_operation: :create}
           }
         ]
       }
