@@ -185,6 +185,7 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
     assert capabilities.dialect == :postgresql
     assert capabilities.atomic_batch
     assert capabilities.returning
+    assert capabilities.committed_effect_sink
   end
 
   test "routes Ecto Repo writes through the Repo transaction boundary" do

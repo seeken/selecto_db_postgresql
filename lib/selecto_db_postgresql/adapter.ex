@@ -10,7 +10,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   alias SelectoDBPostgreSQL.Identifier
   alias SelectoDBPostgreSQL.GraphCompiler
   alias SelectoDBPostgreSQL.WriteCompiler
-  alias Selecto.Write.{Batch, Command, Error, Graph, Result}
+  alias Selecto.Write.{Batch, Command, CommittedEffectSink, Error, Graph, Result}
   alias Selecto.Write.Graph.Materializer
 
   @native_type_mappings %{
@@ -207,6 +207,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       generated_keys: :returning,
       atomic_batch: true,
       transactions: true,
+      committed_effect_sink: true,
       dialect: :postgresql,
       server_major: server_major,
       merge: is_integer(server_major) and server_major >= 15,
@@ -244,7 +245,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def execute_write(connection, %Command{} = command, opts) do
     with :ok <- validate_write_command(command) do
       with_postgres_transaction(connection, opts, fn transactional_connection ->
-        execute_write_command(transactional_connection, command, opts)
+        with {:ok, result} <- execute_write_command(transactional_connection, command, opts),
+             :ok <- invoke_committed_effect_sink(transactional_connection, result, command, opts) do
+          {:ok, result}
+        end
       end)
     end
   end
@@ -260,8 +264,21 @@ defmodule SelectoDBPostgreSQL.Adapter do
           end
         end)
         |> case do
-          {:ok, results} -> {:ok, Enum.reverse(results)}
-          {:error, error} -> {:error, error}
+          {:ok, results} ->
+            results = Enum.reverse(results)
+
+            with :ok <-
+                   invoke_committed_effect_sink(
+                     transactional_connection,
+                     results,
+                     batch,
+                     opts
+                   ) do
+              {:ok, results}
+            end
+
+          {:error, error} ->
+            {:error, error}
         end
       end)
     end
@@ -272,7 +289,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
       server_major = graph_server_major(connection, opts)
 
       with_postgres_transaction(connection, opts, fn transactional_connection ->
-        execute_graph(transactional_connection, graph, server_major, opts)
+        with {:ok, result} <- execute_graph(transactional_connection, graph, server_major, opts),
+             :ok <- invoke_committed_effect_sink(transactional_connection, result, graph, opts) do
+          {:ok, result}
+        end
       end)
     end
   end
@@ -288,6 +308,15 @@ defmodule SelectoDBPostgreSQL.Adapter do
      Error.new(:invalid_command, "expected a portable write command, batch, or graph",
        details: %{actual: command}
      )}
+  end
+
+  defp invoke_committed_effect_sink(connection, result, write, opts) do
+    CommittedEffectSink.invoke(
+      Keyword.get(opts, :committed_effect_sink),
+      connection,
+      result,
+      %{adapter: :postgresql, write: write}
+    )
   end
 
   defp execute_graph(connection, %Graph{} = graph, server_major, opts) do
@@ -788,31 +817,52 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   @impl true
-  def transaction(pool_ref, fun, opts \\ []) when is_function(fun, 1) do
+  def transaction(connection, fun, opts \\ [])
+
+  def transaction(%DBConnection{} = connection, fun, opts) when is_function(fun, 1) do
+    run_postgrex_transaction(connection, fun, opts)
+  end
+
+  def transaction(connection, fun, opts)
+      when is_function(fun, 1) and (is_pid(connection) or is_atom(connection)) do
+    if not ecto_repo?(connection) and valid_postgrex_connection?(connection) do
+      run_postgrex_transaction(connection, fun, opts)
+    else
+      transaction_from_managed_pool(connection, fun, opts)
+    end
+  end
+
+  def transaction(pool_ref, fun, opts) when is_function(fun, 1) do
+    transaction_from_managed_pool(pool_ref, fun, opts)
+  end
+
+  defp transaction_from_managed_pool(pool_ref, fun, opts) do
     case resolve_live_pool_pid(pool_ref) do
       {:ok, pool_pid} ->
-        try do
-          Postgrex.transaction(pool_pid, fun, opts)
-        rescue
-          e in DBConnection.ConnectionError ->
-            {:error, Selecto.Error.connection_error(Exception.message(e), %{exception: e})}
-
-          e in Postgrex.Error ->
-            {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
-
-          e ->
-            {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
-        catch
-          :exit, reason ->
-            {:error,
-             Selecto.Error.connection_error("PostgreSQL connection pool exited", %{
-               exit_reason: reason
-             })}
-        end
+        run_postgrex_transaction(pool_pid, fun, opts)
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp run_postgrex_transaction(connection, fun, opts) do
+    Postgrex.transaction(connection, fun, opts)
+  rescue
+    e in DBConnection.ConnectionError ->
+      {:error, Selecto.Error.connection_error(Exception.message(e), %{exception: e})}
+
+    e in Postgrex.Error ->
+      {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
+
+    e ->
+      {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
+  catch
+    :exit, reason ->
+      {:error,
+       Selecto.Error.connection_error("PostgreSQL connection pool exited", %{
+         exit_reason: reason
+       })}
   end
 
   defp normalize_relation_source_kind("table"), do: :table
@@ -1663,6 +1713,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
        when is_pid(connection) do
     with_native_postgres_transaction(connection, opts, fun)
   end
+
+  defp with_postgres_transaction(%DBConnection{} = connection, _opts, fun),
+    do: fun.(connection)
 
   defp with_postgres_transaction(connection, _opts, _fun) do
     {:error, write_error(:transaction_failed, {:invalid_connection, connection})}
