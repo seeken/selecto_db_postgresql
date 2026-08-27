@@ -19,6 +19,9 @@ V 0.5.0
   Selecto's portable decimal types.
 - Retained connected function verification, write/graph compilation, live
   protocol tests, and bounded live-differential verification in this package.
+- Reuse checked-out `%DBConnection{}` transaction handles directly during
+  server-version and write-capability discovery instead of interpreting the
+  struct as fresh Postgrex connection options.
 
 V 0.4.12
 --------

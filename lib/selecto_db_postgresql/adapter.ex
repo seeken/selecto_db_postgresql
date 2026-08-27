@@ -1987,6 +1987,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
+  defp fetch_server_version_num(%DBConnection{} = connection) do
+    fetch_server_version_num_with_postgrex(connection)
+  end
+
   defp fetch_server_version_num(connection) when is_map(connection) do
     connection
     |> Map.to_list()

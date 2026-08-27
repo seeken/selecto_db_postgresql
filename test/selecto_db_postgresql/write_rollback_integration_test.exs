@@ -149,6 +149,21 @@ defmodule SelectoDBPostgreSQL.WriteRollbackIntegrationTest do
              )
   end
 
+  test "capability discovery reuses an already checked-out transaction connection", %{
+    connection: connection
+  } do
+    assert {:ok, :verified} =
+             Postgrex.transaction(connection, fn transaction_connection ->
+               assert %DBConnection{} = transaction_connection
+
+               assert %{server_major: major, committed_effect_sink: true} =
+                        Adapter.write_capabilities(transaction_connection)
+
+               assert is_integer(major) and major > 0
+               :verified
+             end)
+  end
+
   defp update_state_command!(state) do
     {:ok, command} =
       Command.new(%{
