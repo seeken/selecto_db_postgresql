@@ -1,6 +1,7 @@
 defmodule SelectoDBPostgreSQL.MixProject do
   use Mix.Project
 
+  @selecto_ref "130f97bfd6857f1703beb2b794068e0e122e249e"
   @version "0.5.0"
   @source_url "https://github.com/seeken/selecto_db_postgresql"
 
@@ -49,7 +50,7 @@ defmodule SelectoDBPostgreSQL.MixProject do
     if use_local_ecosystem?() do
       {:selecto, path: local_selecto_path()}
     else
-      {:selecto, ">= 0.5.0 and < 0.6.0"}
+      {:selecto, github: "seeken/selecto", ref: @selecto_ref}
     end
   end
 

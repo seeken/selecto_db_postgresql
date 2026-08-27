@@ -144,3 +144,7 @@ SELECTO_ECOSYSTEM_USE_LOCAL=true
 ```
 
 When enabled, this package resolves a local path for `selecto`.
+
+For a non-local build, set `SELECTO_ECOSYSTEM_USE_LOCAL=0`. The current interim
+profile resolves Selecto from an exact GitHub commit; public Hex publication is
+deferred.
