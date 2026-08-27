@@ -134,6 +134,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
       else: {:error, {:invalid_connection, connection}}
   end
 
+  def connect(%DBConnection{} = connection), do: {:ok, connection}
+
   def connect(opts) when is_map(opts), do: connect(Map.to_list(opts))
 
   def connect(opts) when is_list(opts) do

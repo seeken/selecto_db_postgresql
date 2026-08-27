@@ -317,6 +317,12 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
              SelectoDBPostgreSQL.Adapter.execute_pool(:bad_ref, "select 1", [], [])
   end
 
+  test "postgres adapter preserves checked-out DBConnection transactions" do
+    connection = struct(DBConnection)
+
+    assert {:ok, ^connection} = SelectoDBPostgreSQL.Adapter.connect(connection)
+  end
+
   test "dead pool execution fails closed instead of exiting with noproc" do
     pool_pid = spawn(fn -> :ok end)
     monitor = Process.monitor(pool_pid)
