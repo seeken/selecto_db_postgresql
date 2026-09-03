@@ -62,7 +62,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
     %{
       feature: :text_search,
       supported?: true,
-      modes: [:websearch, :plain, :phrase, :boolean, :natural],
+      modes: [:websearch, :plain, :phrase, :boolean, :natural, :prefix],
+      governed_lookup?: true,
       default_mode: :websearch,
       document_type: :text_search_document,
       help: "Full-text search with web-style, plain, phrase, or boolean query modes."

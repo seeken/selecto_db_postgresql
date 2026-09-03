@@ -975,6 +975,36 @@ defmodule SelectoDBPostgreSQL.Dialect do
   defp escape_literal(value), do: value |> to_string() |> String.replace("'", "''")
 
   @impl true
+  def render_text_search_predicate(%Predicate{configuration: configuration} = predicate, _selecto)
+      when is_binary(configuration) do
+    with :ok <- lookup_configuration(configuration),
+         {:ok, function} <- query_function(predicate.mode) do
+      document =
+        predicate.selectors
+        |> Enum.map(&["COALESCE(CAST(", &1, " AS TEXT), '')"])
+        |> Enum.intersperse(" || ' ' || ")
+
+      if predicate.selectors == [] do
+        error("Text search requires at least one governed field")
+      else
+        {:ok,
+         [
+           "TO_TSVECTOR(",
+           {:param, configuration},
+           "::text::regconfig, ",
+           document,
+           ") @@ ",
+           function,
+           "(",
+           {:param, configuration},
+           "::text::regconfig, ",
+           {:param, predicate.query},
+           ")"
+         ]}
+      end
+    end
+  end
+
   def render_text_search_predicate(%Predicate{} = predicate, _selecto) do
     with :ok <- require_single_selector(predicate.selectors),
          {:ok, query_function} <- query_function(predicate.mode) do
@@ -994,6 +1024,19 @@ defmodule SelectoDBPostgreSQL.Dialect do
   end
 
   @impl true
+  def render_text_search_rank(%Rank{configuration: configuration} = rank, _selecto)
+      when is_binary(configuration) do
+    with :ok <- lookup_configuration(configuration),
+         :ok <- require_rank_query(rank.query),
+         :ok <- reject_rank_weights(rank.weights),
+         {:ok, function} <- query_function(rank.mode) do
+      document = {:func, :concat_ws, [{:literal, " "} | rank.fields]}
+      vector = {:func, :to_tsvector, [{:literal, configuration}, document]}
+      tsquery = {:func, function, [{:literal, configuration}, {:param, rank.query}]}
+      {:ok, {:field, {:func, :ts_rank, [vector, tsquery]}, rank.alias}}
+    end
+  end
+
   def render_text_search_rank(%Rank{} = rank, selecto) do
     with :ok <- require_rank_query(rank.query),
          :ok <- reject_rank_weights(rank.weights),
@@ -1013,7 +1056,14 @@ defmodule SelectoDBPostgreSQL.Dialect do
   defp query_function(mode) when mode in [:plain, :natural], do: {:ok, :plainto_tsquery}
   defp query_function(:phrase), do: {:ok, :phraseto_tsquery}
   defp query_function(:boolean), do: {:ok, :to_tsquery}
+  defp query_function(:prefix), do: {:ok, :to_tsquery}
   defp query_function(mode), do: error("Unsupported PostgreSQL text-search mode", mode: mode)
+
+  defp lookup_configuration(configuration) do
+    if configuration in ~w(simple english danish dutch finnish french german hungarian italian norwegian portuguese romanian russian spanish swedish turkish),
+      do: :ok,
+      else: error("Text search configuration is not available")
+  end
 
   defp require_single_selector([_selector]), do: :ok
 

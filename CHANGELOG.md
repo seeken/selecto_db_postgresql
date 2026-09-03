@@ -1,6 +1,12 @@
 CHANGES
 =======
 
+Unreleased
+----------
+
+- Added governed co-domain lookup support with bound prefix search, allowlisted
+  text-search configuration, ranking, and live tenant/segment isolation tests.
+
 V 0.5.0
 --------
 
