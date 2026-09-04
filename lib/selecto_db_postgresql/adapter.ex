@@ -1931,7 +1931,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp stop_stream_producer(state, queue_timeout) do
     send(state.task.pid, {state.ref, :cancel})
-    _result = Task.shutdown(state.task, queue_timeout)
+    # Give the cancellation handshake time to unwind the cursor transaction.
+    # Task.shutdown/2 sends an exit immediately and can discard the DB session
+    # before Postgrex has rolled back and returned it to the pool.
+    _result = Task.yield(state.task, queue_timeout) || Task.shutdown(state.task, :brutal_kill)
     Process.demonitor(state.monitor_ref, [:flush])
     drain_stream_messages(state.ref)
   end

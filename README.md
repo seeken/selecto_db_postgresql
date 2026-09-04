@@ -135,6 +135,19 @@ through `MERGE`. Updato does not expose a strategy switch. Capability reporting
 includes `merge`, `merge_returning`, and `merge_delete_missing` so diagnostics
 can explain the selected path.
 
+## Stream cancellation
+
+Early stream termination sends a cooperative cancellation message and waits
+for the cursor worker to unwind before using a bounded forced shutdown. This
+preserves the checked-out PostgreSQL session instead of unnecessarily killing
+and reconnecting it. The connected stream regression checks the same backend
+PID and a session-local temporary table after cancellation.
+
+Run `mix test --include postgres` for connected adapter tests. The sibling
+SPA API's `scripts/verify_postgres_exports.exs` additionally exercises exact
+scalar exports, early cancellation, disk-backed worksheet rollover and the
+canonical API engine helper against synthetic session-local data.
+
 ## Local Workspace Development
 
 For local multi-repo workspace development, set:

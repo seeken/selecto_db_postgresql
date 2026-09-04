@@ -126,6 +126,17 @@ defmodule SelectoDBPostgreSQL.StreamProtocolConformanceTest do
       if Process.alive?(connection), do: GenServer.stop(connection)
     end)
 
+    assert {:ok, %{rows: [[backend_pid]]}} =
+             Adapter.execute(connection, "SELECT pg_backend_pid()", [], [])
+
+    assert {:ok, _} =
+             Adapter.execute(
+               connection,
+               "CREATE TEMP TABLE selecto_stream_session_witness (id integer)",
+               [],
+               []
+             )
+
     {:ok, complete_stream} =
       Adapter.stream(
         connection,
@@ -153,6 +164,17 @@ defmodule SelectoDBPostgreSQL.StreamProtocolConformanceTest do
     assert Enum.take(cancelled_stream, 1) == [{[1], ["value"]}]
     assert stream_protocol_messages() == []
     assert {:ok, %{rows: [[1]]}} = Adapter.execute(connection, "SELECT 1", [], [])
+
+    assert {:ok, %{rows: [[^backend_pid]]}} =
+             Adapter.execute(connection, "SELECT pg_backend_pid()", [], [])
+
+    assert {:ok, %{rows: [[0]]}} =
+             Adapter.execute(
+               connection,
+               "SELECT count(*) FROM selecto_stream_session_witness",
+               [],
+               []
+             )
   end
 
   defp stream_protocol_messages do
