@@ -328,6 +328,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
            :ok <- validate_prepared_write(write),
            :ok <- Capabilities.require(write_capabilities(transactional_connection), write),
            write_opts = Keyword.put(opts, :context, context),
+           :ok <- lock_prepared_membership_parent(transactional_connection, write, write_opts),
            {:ok, result} <- execute_prepared(transactional_connection, write, write_opts),
            :ok <-
              invoke_committed_effect_sink(transactional_connection, result, write, write_opts) do
@@ -412,6 +413,80 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp execute_prepared(connection, %Graph{} = graph, opts),
     do: execute_graph(connection, graph, graph_server_major(connection, opts), opts)
+
+  # Candidate rules acquire this lock while loading the protected collection.
+  # Nested membership writers without a candidate rule still need the same
+  # boundary, so Updato marks the root lock obligation on its governed graph.
+  # Direct raw graphs are deliberately outside this claim and have no marker.
+  defp lock_prepared_membership_parent(connection, %Graph{} = graph, opts) do
+    case Map.get(graph.metadata, :membership_parent_lock) do
+      nil -> :ok
+      %{parent_key: parent_key} -> lock_graph_root_parent(connection, graph, parent_key, opts)
+      _other -> invalid_membership_parent_lock(graph)
+    end
+  end
+
+  defp lock_prepared_membership_parent(_connection, _write, _opts), do: :ok
+
+  defp lock_graph_root_parent(
+         connection,
+         %Graph{root: {node_id, row_id}} = graph,
+         parent_key,
+         opts
+       ) do
+    with true <- candidate_identifier?(parent_key),
+         {:ok, root_command} <- graph_root_command(graph, node_id, row_id),
+         true <- root_command.operation in [:update, :delete],
+         false <- is_nil(root_command.predicate),
+         {:ok, predicate} <-
+           WriteCompiler.compile_predicate(root_command.predicate,
+             context: Keyword.get(opts, :context, %{})
+           ),
+         query =
+           "SELECT #{quote_identifier(parent_key)} FROM #{quote_relation(root_command.relation)} " <>
+             "WHERE #{predicate.text} FOR UPDATE",
+         {:ok, result} <- execute_candidate_query(connection, query, predicate.params, opts),
+         :ok <- exactly_one_locked_parent(result, root_command, parent_key) do
+      :ok
+    else
+      false -> invalid_membership_parent_lock(graph)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp lock_graph_root_parent(_connection, graph, _parent_key, _opts),
+    do: invalid_membership_parent_lock(graph)
+
+  defp graph_root_command(%Graph{nodes: nodes}, node_id, row_id) do
+    with %Graph.Node{rows: rows} <- Enum.find(nodes, &(&1.id == node_id)),
+         %Graph.Row{command: %Command{} = command} <- Enum.find(rows, &(&1.id == row_id)) do
+      {:ok, command}
+    else
+      _ -> {:error, Error.new(:invalid_membership_parent_lock, "graph root is unavailable")}
+    end
+  end
+
+  defp exactly_one_locked_parent(%{rows: [[_parent_id]]}, _command, _parent_key), do: :ok
+
+  defp exactly_one_locked_parent(result, command, parent_key) do
+    {:error,
+     Error.new(:cardinality_mismatch, "membership parent lock requires exactly one root row",
+       details: %{
+         relation: command.relation,
+         parent_key: parent_key,
+         actual: length(Map.get(result, :rows, []))
+       }
+     )}
+  end
+
+  defp invalid_membership_parent_lock(graph) do
+    {:error,
+     Error.new(
+       :invalid_membership_parent_lock,
+       "governed nested graph has an invalid parent lock obligation",
+       details: %{root: graph.root}
+     )}
+  end
 
   defp invoke_prepare(prepare_fun, candidate_loader) do
     case prepare_fun.(candidate_loader) do

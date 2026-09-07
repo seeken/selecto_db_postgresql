@@ -203,6 +203,38 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
              )
   end
 
+  test "prepared governed graph locks its root before a membership sync", %{
+    connection: connection
+  } do
+    assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
+    [%{"id" => order_id}] = insert_result.rows
+
+    assert {:ok, %{rows: [[first_id]]}} =
+             Adapter.execute(
+               connection,
+               "SELECT id FROM selecto_graph_items WHERE order_id = $1 ORDER BY id LIMIT 1",
+               [order_id],
+               []
+             )
+
+    graph =
+      sync_graph!(order_id, first_id)
+      |> Map.update!(:metadata, &Map.put(&1, :membership_parent_lock, %{parent_key: :id}))
+
+    assert {:ok, %Selecto.Write.Result{operation: :graph}} =
+             Adapter.execute_prepared_write(connection, fn _candidate_loader ->
+               {:ok, graph, %{governed: true}}
+             end)
+
+    assert {:ok, %{rows: [["SO-100-R"]]}} =
+             Adapter.execute(
+               connection,
+               "SELECT reference FROM selecto_graph_orders WHERE id = $1",
+               [order_id],
+               []
+             )
+  end
+
   defp parent_update!(order_id, reference) do
     command!(%{
       operation: :update,
