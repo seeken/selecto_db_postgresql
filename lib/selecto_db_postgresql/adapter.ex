@@ -418,6 +418,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
       {:ok, write, context} when is_map(context) ->
         {:ok, write, context}
 
+      {:error, %Error{} = error} ->
+        {:error, error}
+
+      {:error, %{type: type, message: message, details: details}}
+      when is_atom(type) and is_binary(message) and is_map(details) ->
+        {:error, Error.new(type, message, details: details)}
+
       {:error, _reason} = error ->
         error
 
