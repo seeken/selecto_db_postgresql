@@ -147,6 +147,29 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
              )
   end
 
+  test "returns a sanitized native constraint error for a duplicate write", %{
+    connection: connection
+  } do
+    execute!(
+      connection,
+      "ALTER TABLE selecto_graph_orders ADD CONSTRAINT graph_orders_reference_key UNIQUE (reference)"
+    )
+
+    assert {:ok, _result} = Adapter.execute_write(connection, insert_graph!())
+
+    assert {:error,
+            %Error{
+              type: :native_constraint_violation,
+              details: %{
+                adapter: :postgresql,
+                write_stage: :execution_failed,
+                category: :unique_violation,
+                constraint: "graph_orders_reference_key",
+                recoverable?: true
+              }
+            }} = Adapter.execute_write(connection, insert_graph!())
+  end
+
   test "loads protected candidate state and executes the prepared write in one transaction", %{
     connection: connection
   } do

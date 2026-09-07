@@ -2155,6 +2155,26 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
+  defp write_error(type, %Postgrex.Error{} = reason) do
+    native = Map.get(reason, :postgres) || %{}
+    category = normalize_error_category(Map.get(native, :code) || Map.get(native, :pg_code))
+
+    if category in [:unique_violation, :foreign_key_violation, :not_null_violation] do
+      Error.new(:native_constraint_violation, "PostgreSQL constraint rejected write",
+        details: %{
+          adapter: :postgresql,
+          write_stage: type,
+          category: category,
+          constraint: Map.get(native, :constraint),
+          column: Map.get(native, :column),
+          recoverable?: true
+        }
+      )
+    else
+      Error.adapter_failure(type, :postgresql, reason, "PostgreSQL write failed")
+    end
+  end
+
   defp write_error(type, reason) do
     Error.adapter_failure(type, :postgresql, reason, "PostgreSQL write failed")
   end
