@@ -23,6 +23,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
     Result
   }
 
+  alias Selecto.Write.{RecordRequest, RecordState}
+
   alias Selecto.Write.Graph.Materializer
 
   @native_type_mappings %{
@@ -321,10 +323,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def execute_prepared_write(connection, prepare_fun, opts)
       when is_function(prepare_fun, 1) do
     with_postgres_transaction(connection, opts, fn transactional_connection ->
-      candidate_loader =
-        &load_candidate_state(transactional_connection, &1, opts)
+      protected_state_loader =
+        &load_prepared_state(transactional_connection, &1, opts)
 
-      with {:ok, write, context} <- invoke_prepare(prepare_fun, candidate_loader),
+      with {:ok, write, context} <- invoke_prepare(prepare_fun, protected_state_loader),
            :ok <- validate_prepared_write(write),
            :ok <- Capabilities.require(write_capabilities(transactional_connection), write),
            write_opts = Keyword.put(opts, :context, context),
@@ -379,6 +381,46 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def load_candidate_state(_connection, request, _opts) do
     {:error,
      Error.new(:invalid_candidate_request, "expected a portable candidate-state request",
+       details: %{actual: request}
+     )}
+  end
+
+  @doc false
+  @spec load_record_state(term(), RecordRequest.t(), keyword()) ::
+          {:ok, RecordState.t()} | {:error, Error.t()}
+  def load_record_state(connection, request, opts \\ [])
+
+  def load_record_state(connection, %RecordRequest{} = request, opts) do
+    with :ok <- validate_record_request(request),
+         {:ok, predicate} <-
+           WriteCompiler.compile_predicate(request.predicate, context: request.context),
+         fields = request.fields |> Enum.map(&to_string/1) |> Enum.uniq() |> Enum.sort(),
+         selected = Enum.map_join(fields, ", ", &quote_identifier/1),
+         query =
+           "SELECT #{selected} FROM #{quote_relation(request.relation)} " <>
+             "WHERE #{predicate.text} FOR UPDATE",
+         {:ok, result} <- execute_candidate_query(connection, query, predicate.params, opts),
+         {:ok, values} <- exactly_one_record(result, request) do
+      {:ok, %RecordState{values: values, complete?: true, protection: :locked}}
+    end
+  end
+
+  def load_record_state(_connection, request, _opts) do
+    {:error,
+     Error.new(:invalid_record_request, "expected a portable record-state request",
+       details: %{actual: request}
+     )}
+  end
+
+  defp load_prepared_state(connection, %CandidateRequest{} = request, opts),
+    do: load_candidate_state(connection, request, opts)
+
+  defp load_prepared_state(connection, %RecordRequest{} = request, opts),
+    do: load_record_state(connection, request, opts)
+
+  defp load_prepared_state(_connection, request, _opts) do
+    {:error,
+     Error.new(:invalid_preparation, "prepared state loader received an unsupported request",
        details: %{actual: request}
      )}
   end
@@ -566,6 +608,24 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
+  defp validate_record_request(%RecordRequest{} = request) do
+    identifiers = [request.relation | request.fields]
+
+    cond do
+      request.operation not in [:update, "update"] ->
+        {:error, Error.new(:invalid_record_request, "record state is only available for updates")}
+
+      is_nil(request.predicate) ->
+        {:error, Error.new(:invalid_record_request, "record state requires a scoped predicate")}
+
+      request.fields == [] or not Enum.all?(identifiers, &candidate_identifier?/1) ->
+        {:error, Error.new(:invalid_record_request, "record-state identifiers are invalid")}
+
+      true ->
+        :ok
+    end
+  end
+
   defp candidate_identifier?(identifier) when is_atom(identifier), do: not is_nil(identifier)
 
   defp candidate_identifier?(identifier) when is_binary(identifier),
@@ -586,6 +646,16 @@ defmodule SelectoDBPostgreSQL.Adapter do
     {:error,
      Error.new(:cardinality_mismatch, "candidate parent matched an unexpected number of rows",
        details: %{relationship: request.relationship, expected: 1, actual: length(rows)}
+     )}
+  end
+
+  defp exactly_one_record(%{rows: [_row], columns: _columns} = result, _request),
+    do: {:ok, result_rows(result) |> hd()}
+
+  defp exactly_one_record(%{rows: rows}, _request) do
+    {:error,
+     Error.new(:cardinality_mismatch, "record candidate matched an unexpected number of rows",
+       details: %{expected: 1, actual: length(rows)}
      )}
   end
 

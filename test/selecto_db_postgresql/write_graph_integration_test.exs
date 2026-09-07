@@ -1,7 +1,16 @@
 defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
   use ExUnit.Case, async: false
 
-  alias Selecto.Write.{CandidateRequest, CandidateState, Command, Error, Graph}
+  alias Selecto.Write.{
+    CandidateRequest,
+    CandidateState,
+    Command,
+    Error,
+    Graph,
+    RecordRequest,
+    RecordState
+  }
+
   alias Selecto.Write.Graph.{Binding, Node, Row}
   alias SelectoDBPostgreSQL.Adapter
 
@@ -181,6 +190,34 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
                [order_id],
                []
              )
+  end
+
+  test "loads one protected root record for a prepared partial update", %{connection: connection} do
+    assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
+    [%{"id" => order_id}] = insert_result.rows
+
+    parent = parent_update!(order_id, "SO-100-ROOT-PREPARED")
+
+    request = %RecordRequest{
+      operation: :update,
+      relation: :selecto_graph_orders,
+      predicate: parent.predicate,
+      fields: ["id", "reference", "tenant_id"]
+    }
+
+    prepare = fn loader ->
+      assert {:ok,
+              %RecordState{
+                complete?: true,
+                protection: :locked,
+                values: %{"id" => ^order_id, "reference" => "SO-100", "tenant_id" => 7}
+              }} = loader.(request)
+
+      {:ok, parent, %{record_loaded?: true}}
+    end
+
+    assert {:ok, %Selecto.Write.Result{operation: :update, affected_rows: 1}} =
+             Adapter.execute_prepared_write(connection, prepare)
   end
 
   test "candidate overflow rejects and rolls back the prepared write", %{connection: connection} do
