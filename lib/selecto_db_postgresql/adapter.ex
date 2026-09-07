@@ -393,6 +393,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   def load_record_state(connection, %RecordRequest{} = request, opts) do
     with :ok <- validate_record_request(request),
+         :ok <- ensure_upsert_serializable(connection, request, opts),
          {:ok, predicate} <-
            WriteCompiler.compile_predicate(request.predicate, context: request.context),
          fields = request.fields |> Enum.map(&to_string/1) |> Enum.uniq() |> Enum.sort(),
@@ -401,8 +402,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
            "SELECT #{selected} FROM #{quote_relation(request.relation)} " <>
              "WHERE #{predicate.text} FOR UPDATE",
          {:ok, result} <- execute_candidate_query(connection, query, predicate.params, opts),
-         {:ok, values} <- exactly_one_record(result, request) do
-      {:ok, %RecordState{values: values, complete?: true, protection: :locked}}
+         {:ok, values, exists?} <- record_state_values(result, request) do
+      protection = if request.operation in [:upsert, "upsert"], do: :serializable, else: :locked
+
+      {:ok,
+       %RecordState{values: values, complete?: true, protection: protection, exists?: exists?}}
     end
   end
 
@@ -613,8 +617,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
     identifiers = [request.relation | request.fields]
 
     cond do
-      request.operation not in [:update, "update"] ->
-        {:error, Error.new(:invalid_record_request, "record state is only available for updates")}
+      request.operation not in [:update, "update", :upsert, "upsert"] ->
+        {:error,
+         Error.new(
+           :invalid_record_request,
+           "record state is only available for updates or upserts"
+         )}
 
       is_nil(request.predicate) ->
         {:error, Error.new(:invalid_record_request, "record state requires a scoped predicate")}
@@ -659,6 +667,38 @@ defmodule SelectoDBPostgreSQL.Adapter do
        details: %{expected: 1, actual: length(rows)}
      )}
   end
+
+  defp record_state_values(result, %RecordRequest{operation: operation})
+       when operation in [:upsert, "upsert"] do
+    case Map.get(result, :rows, []) do
+      [] -> {:ok, %{}, false}
+      [_row] -> with {:ok, values} <- exactly_one_record(result, nil), do: {:ok, values, true}
+      _rows -> exactly_one_record(result, nil) |> then(fn {:error, error} -> {:error, error} end)
+    end
+  end
+
+  defp record_state_values(result, request) do
+    with {:ok, values} <- exactly_one_record(result, request), do: {:ok, values, true}
+  end
+
+  # An absent conflict target has no row lock. Serializable isolation gives the
+  # branch decision its required predicate protection: a competing insert or
+  # update causes PostgreSQL to abort one transaction instead of committing an
+  # unchecked upsert branch.
+  defp ensure_upsert_serializable(connection, %RecordRequest{operation: operation}, opts)
+       when operation in [:upsert, "upsert"] do
+    case execute_candidate_query(
+           connection,
+           "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+           [],
+           opts
+         ) do
+      {:ok, _result} -> :ok
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp ensure_upsert_serializable(_connection, _request, _opts), do: :ok
 
   defp candidate_fields(request) do
     (request.fields ++ request.identity_fields)

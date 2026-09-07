@@ -334,6 +334,60 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
              Adapter.execute_prepared_write(connection, prepare)
   end
 
+  test "protects both prepared upsert branches at serializable isolation", %{
+    connection: connection
+  } do
+    execute!(
+      connection,
+      "ALTER TABLE selecto_graph_orders ADD CONSTRAINT graph_orders_reference_key UNIQUE (reference)"
+    )
+
+    request = %RecordRequest{
+      operation: :upsert,
+      relation: :selecto_graph_orders,
+      predicate: {:eq, {:field, :reference}, {:literal, "UPSERT-PREPARED"}},
+      fields: ["id", "reference", "tenant_id"]
+    }
+
+    command =
+      command!(%{
+        operation: :upsert,
+        relation: :selecto_graph_orders,
+        assignments: [
+          %{field: :tenant_id, value: {:literal, 7}},
+          %{field: :reference, value: {:literal, "UPSERT-PREPARED"}}
+        ],
+        metadata: %{conflict_target: [:reference], upsert_update_fields: [:tenant_id]},
+        returning: [:id]
+      })
+
+    assert {:ok, %Selecto.Write.Result{operation: :upsert}} =
+             Adapter.execute_prepared_write(connection, fn loader ->
+               assert {:ok,
+                       %RecordState{
+                         exists?: false,
+                         complete?: true,
+                         protection: :serializable,
+                         values: %{}
+                       }} = loader.(request)
+
+               {:ok, command, %{}}
+             end)
+
+    assert {:ok, %Selecto.Write.Result{operation: :upsert}} =
+             Adapter.execute_prepared_write(connection, fn loader ->
+               assert {:ok,
+                       %RecordState{
+                         exists?: true,
+                         complete?: true,
+                         protection: :serializable,
+                         values: %{"reference" => "UPSERT-PREPARED", "tenant_id" => 7}
+                       }} = loader.(request)
+
+               {:ok, command, %{}}
+             end)
+  end
+
   test "candidate overflow rejects and rolls back the prepared write", %{connection: connection} do
     assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
     [%{"id" => order_id}] = insert_result.rows
