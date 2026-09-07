@@ -221,6 +221,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       delete: true,
       write_graph: true,
       prepared_candidate_state: true,
+      native_constraint_mapping: true,
       returning: true,
       generated_keys: :returning,
       atomic_batch: true,
@@ -822,7 +823,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
        }}
     else
       {:error, %Error{} = error} -> {:error, error}
-      {:error, reason} -> {:error, write_error(:execution_failed, reason)}
+      {:error, reason} -> {:error, write_error(:execution_failed, reason, command)}
     end
   end
 
@@ -2058,6 +2059,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp normalize_error_category(code) when code in [:not_null_violation, "23502"],
     do: :not_null_violation
 
+  defp normalize_error_category(code) when code in [:check_violation, "23514"],
+    do: :check_violation
+
   defp normalize_error_category(_code), do: :database_error
 
   defp enforce_cardinality(%Command{expected_cardinality: expected}, result) do
@@ -2156,28 +2160,55 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp write_error(type, %Postgrex.Error{} = reason) do
+    write_error(type, reason, nil)
+  end
+
+  defp write_error(type, reason) do
+    Error.adapter_failure(type, :postgresql, reason, "PostgreSQL write failed")
+  end
+
+  defp write_error(type, %Postgrex.Error{} = reason, command) do
     native = Map.get(reason, :postgres) || %{}
     category = normalize_error_category(Map.get(native, :code) || Map.get(native, :pg_code))
 
-    if category in [:unique_violation, :foreign_key_violation, :not_null_violation] do
+    if category in [
+         :unique_violation,
+         :foreign_key_violation,
+         :not_null_violation,
+         :check_violation
+       ] do
+      details = %{
+        adapter: :postgresql,
+        write_stage: type,
+        category: category,
+        constraint: Map.get(native, :constraint),
+        column: Map.get(native, :column),
+        recoverable?: true
+      }
+
+      details =
+        case matching_native_constraint(command, category, details.constraint) do
+          nil -> details
+          native -> Map.put(details, :binding_id, native.binding_id)
+        end
+
       Error.new(:native_constraint_violation, "PostgreSQL constraint rejected write",
-        details: %{
-          adapter: :postgresql,
-          write_stage: type,
-          category: category,
-          constraint: Map.get(native, :constraint),
-          column: Map.get(native, :column),
-          recoverable?: true
-        }
+        details: details
       )
     else
       Error.adapter_failure(type, :postgresql, reason, "PostgreSQL write failed")
     end
   end
 
-  defp write_error(type, reason) do
-    Error.adapter_failure(type, :postgresql, reason, "PostgreSQL write failed")
+  defp matching_native_constraint(%Command{native_constraints: constraints}, category, constraint)
+       when is_list(constraints) and is_binary(constraint) do
+    Enum.find(constraints, fn native ->
+      native.adapter == "postgresql" and native.constraint == constraint and
+        native.category == category
+    end)
   end
+
+  defp matching_native_constraint(_command, _category, _constraint), do: nil
 
   defp postgres_transaction(connection, opts, fun) do
     Postgrex.transaction(

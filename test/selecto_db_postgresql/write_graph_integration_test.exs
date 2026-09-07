@@ -170,6 +170,53 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
             }} = Adapter.execute_write(connection, insert_graph!())
   end
 
+  test "correlates a matching declared native constraint with its rule binding", %{
+    connection: connection
+  } do
+    execute!(
+      connection,
+      "ALTER TABLE selecto_graph_items ADD CONSTRAINT graph_items_quantity_positive CHECK (quantity > 0)"
+    )
+
+    assert {:ok, %{rows: [[order_id]]}} =
+             Adapter.execute(
+               connection,
+               "INSERT INTO selecto_graph_orders (tenant_id, reference) VALUES (7, 'NATIVE') RETURNING id",
+               [],
+               []
+             )
+
+    command =
+      command!(%{
+        operation: :insert,
+        relation: :selecto_graph_items,
+        assignments: [
+          %{field: :tenant_id, value: {:literal, 7}},
+          %{field: :order_id, value: {:literal, order_id}},
+          %{field: :sku, value: {:literal, "INVALID"}},
+          %{field: :quantity, value: {:literal, 0}}
+        ],
+        native_constraints: [
+          %{
+            binding_id: "positive_quantity",
+            adapter: "postgresql",
+            constraint: "graph_items_quantity_positive",
+            category: :check_violation
+          }
+        ]
+      })
+
+    assert {:error,
+            %Error{
+              type: :native_constraint_violation,
+              details: %{
+                category: :check_violation,
+                constraint: "graph_items_quantity_positive",
+                binding_id: "positive_quantity"
+              }
+            }} = Adapter.execute_write(connection, command)
+  end
+
   test "loads protected candidate state and executes the prepared write in one transaction", %{
     connection: connection
   } do
