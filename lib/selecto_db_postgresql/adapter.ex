@@ -10,7 +10,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
   alias SelectoDBPostgreSQL.Identifier
   alias SelectoDBPostgreSQL.GraphCompiler
   alias SelectoDBPostgreSQL.WriteCompiler
-  alias Selecto.Write.{Batch, Command, CommittedEffectSink, Error, Graph, Result}
+
+  alias Selecto.Write.{
+    Batch,
+    CandidateRequest,
+    CandidateState,
+    Capabilities,
+    Command,
+    CommittedEffectSink,
+    Error,
+    Graph,
+    Result
+  }
+
   alias Selecto.Write.Graph.Materializer
 
   @native_type_mappings %{
@@ -206,6 +218,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       upsert: true,
       delete: true,
       write_graph: true,
+      prepared_candidate_state: true,
       returning: true,
       generated_keys: :returning,
       atomic_batch: true,
@@ -302,9 +315,234 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   def execute_write(_connection, command, _opts), do: invalid_write_input(command)
 
+  @impl Selecto.DB.WriteAdapter
+  def execute_prepared_write(connection, prepare_fun, opts \\ [])
+
+  def execute_prepared_write(connection, prepare_fun, opts)
+      when is_function(prepare_fun, 1) do
+    with_postgres_transaction(connection, opts, fn transactional_connection ->
+      candidate_loader =
+        &load_candidate_state(transactional_connection, &1, opts)
+
+      with {:ok, write, context} <- invoke_prepare(prepare_fun, candidate_loader),
+           :ok <- validate_prepared_write(write),
+           :ok <- Capabilities.require(write_capabilities(transactional_connection), write),
+           write_opts = Keyword.put(opts, :context, context),
+           {:ok, result} <- execute_prepared(transactional_connection, write, write_opts),
+           :ok <-
+             invoke_committed_effect_sink(transactional_connection, result, write, write_opts) do
+        {:ok, result}
+      end
+    end)
+  end
+
+  def execute_prepared_write(_connection, prepare_fun, _opts) do
+    {:error,
+     Error.new(:invalid_preparation, "prepared write requires a one-argument function",
+       details: %{actual: prepare_fun}
+     )}
+  end
+
+  @doc false
+  @spec load_candidate_state(term(), CandidateRequest.t(), keyword()) ::
+          {:ok, CandidateState.t()} | {:error, Error.t()}
+  def load_candidate_state(connection, request, opts \\ [])
+
+  def load_candidate_state(connection, %CandidateRequest{} = request, opts) do
+    with :ok <- validate_candidate_request(request),
+         {:ok, predicate} <-
+           WriteCompiler.compile_predicate(request.parent_command.predicate,
+             context: request.context
+           ),
+         parent_query =
+           "SELECT #{quote_identifier(request.parent_key)} FROM " <>
+             "#{quote_relation(request.parent_command.relation)} WHERE #{predicate.text} FOR UPDATE",
+         {:ok, parent_result} <-
+           execute_candidate_query(connection, parent_query, predicate.params, opts),
+         {:ok, parent_id} <- exactly_one_parent(parent_result, request),
+         fields = candidate_fields(request),
+         child_query = candidate_child_query(request, fields),
+         {:ok, child_result} <-
+           execute_candidate_query(connection, child_query, [parent_id], opts),
+         :ok <- ensure_candidate_bound(child_result, request) do
+      {:ok,
+       %CandidateState{
+         rows: result_rows(child_result),
+         complete?: true,
+         protection: :locked,
+         revision: %{parent_key: request.parent_key, parent_id: parent_id}
+       }}
+    end
+  end
+
+  def load_candidate_state(_connection, request, _opts) do
+    {:error,
+     Error.new(:invalid_candidate_request, "expected a portable candidate-state request",
+       details: %{actual: request}
+     )}
+  end
+
   defp validate_write_batch(%Batch{} = batch), do: Batch.validate(batch)
   defp validate_write_graph(%Graph{} = graph), do: Graph.validate(graph)
   defp validate_write_command(%Command{} = command), do: Command.validate(command)
+
+  defp validate_prepared_write(%Command{} = command), do: validate_write_command(command)
+  defp validate_prepared_write(%Batch{} = batch), do: validate_write_batch(batch)
+  defp validate_prepared_write(%Graph{} = graph), do: validate_write_graph(graph)
+
+  defp validate_prepared_write(other),
+    do: invalid_write_input(other) |> elem(1) |> then(&{:error, &1})
+
+  defp execute_prepared(connection, %Command{} = command, opts),
+    do: execute_write_command(connection, command, opts)
+
+  defp execute_prepared(connection, %Batch{} = batch, opts) do
+    batch.commands
+    |> Enum.reduce_while({:ok, []}, fn command, {:ok, results} ->
+      case execute_write_command(connection, command, opts) do
+        {:ok, result} -> {:cont, {:ok, [result | results]}}
+        {:error, %Error{} = error} -> {:halt, {:error, error}}
+      end
+    end)
+    |> case do
+      {:ok, results} -> {:ok, Enum.reverse(results)}
+      error -> error
+    end
+  end
+
+  defp execute_prepared(connection, %Graph{} = graph, opts),
+    do: execute_graph(connection, graph, graph_server_major(connection, opts), opts)
+
+  defp invoke_prepare(prepare_fun, candidate_loader) do
+    case prepare_fun.(candidate_loader) do
+      {:ok, write, context} when is_map(context) ->
+        {:ok, write, context}
+
+      {:error, _reason} = error ->
+        error
+
+      other ->
+        {:error,
+         Error.new(:invalid_preparation, "prepared write returned an invalid result",
+           details: %{actual: other}
+         )}
+    end
+  rescue
+    exception ->
+      {:error,
+       Error.adapter_failure(
+         :candidate_preparation_failed,
+         :postgresql,
+         exception.__struct__,
+         "PostgreSQL candidate preparation failed"
+       )}
+  catch
+    kind, _reason ->
+      {:error,
+       Error.adapter_failure(
+         :candidate_preparation_failed,
+         :postgresql,
+         kind,
+         "PostgreSQL candidate preparation failed"
+       )}
+  end
+
+  defp validate_candidate_request(%CandidateRequest{} = request) do
+    identifiers =
+      [
+        request.parent_command.relation,
+        request.parent_key,
+        request.child_relation,
+        request.child_key
+      ] ++ request.identity_fields ++ request.fields
+
+    cond do
+      request.parent_command.operation not in [:update, :delete] ->
+        {:error,
+         Error.new(:invalid_candidate_request, "candidate parent must be an existing row",
+           details: %{operation: request.parent_command.operation}
+         )}
+
+      is_nil(request.parent_command.predicate) ->
+        {:error,
+         Error.new(:invalid_candidate_request, "candidate parent requires a scoped predicate")}
+
+      not is_integer(request.max_rows) or request.max_rows < 1 or request.max_rows > 1_000 ->
+        {:error,
+         Error.new(:invalid_candidate_request, "candidate row bound is invalid",
+           details: %{max_rows: request.max_rows, maximum: 1_000}
+         )}
+
+      request.identity_fields == [] ->
+        {:error, Error.new(:invalid_candidate_request, "candidate identity fields are required")}
+
+      not Enum.all?(identifiers, &candidate_identifier?/1) ->
+        {:error, Error.new(:invalid_candidate_request, "candidate identifiers are invalid")}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp candidate_identifier?(identifier) when is_atom(identifier), do: not is_nil(identifier)
+
+  defp candidate_identifier?(identifier) when is_binary(identifier),
+    do: String.trim(identifier) != ""
+
+  defp candidate_identifier?(_identifier), do: false
+
+  defp execute_candidate_query(connection, query, params, opts) do
+    case execute(connection, query, params, Keyword.take(opts, [:timeout, :log])) do
+      {:ok, result} -> {:ok, result}
+      {:error, reason} -> {:error, write_error(:candidate_state_load_failed, reason)}
+    end
+  end
+
+  defp exactly_one_parent(%{rows: [[parent_id]]}, _request), do: {:ok, parent_id}
+
+  defp exactly_one_parent(%{rows: rows}, request) do
+    {:error,
+     Error.new(:cardinality_mismatch, "candidate parent matched an unexpected number of rows",
+       details: %{relationship: request.relationship, expected: 1, actual: length(rows)}
+     )}
+  end
+
+  defp candidate_fields(request) do
+    (request.fields ++ request.identity_fields)
+    |> Enum.map(&to_string/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp candidate_child_query(request, fields) do
+    selected = Enum.map_join(fields, ", ", &quote_identifier/1)
+    order = Enum.map_join(request.identity_fields, ", ", &quote_identifier/1)
+
+    "SELECT #{selected} FROM #{quote_relation(request.child_relation)} " <>
+      "WHERE #{quote_identifier(request.child_key)} = $1 ORDER BY #{order} " <>
+      "LIMIT #{request.max_rows + 1}"
+  end
+
+  defp ensure_candidate_bound(%{rows: rows}, request) when length(rows) <= request.max_rows,
+    do: :ok
+
+  defp ensure_candidate_bound(%{rows: rows}, request) do
+    {:error,
+     Error.new(:candidate_state_limit_exceeded, "candidate state exceeds its row bound",
+       details: %{
+         relationship: request.relationship,
+         max_rows: request.max_rows,
+         observed_at_least: length(rows)
+       }
+     )}
+  end
+
+  defp quote_relation(relation) do
+    relation
+    |> to_string()
+    |> String.split(".")
+    |> Enum.map_join(".", &quote_identifier/1)
+  end
 
   defp invalid_write_input(command) do
     {:error,

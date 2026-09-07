@@ -1,7 +1,7 @@
 defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
   use ExUnit.Case, async: false
 
-  alias Selecto.Write.{Command, Error, Graph}
+  alias Selecto.Write.{CandidateRequest, CandidateState, Command, Error, Graph}
   alias Selecto.Write.Graph.{Binding, Node, Row}
   alias SelectoDBPostgreSQL.Adapter
 
@@ -136,6 +136,103 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
                [order_id],
                []
              )
+  end
+
+  test "loads protected candidate state and executes the prepared write in one transaction", %{
+    connection: connection
+  } do
+    assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
+    [%{"id" => order_id}] = insert_result.rows
+
+    parent = parent_update!(order_id, "SO-100-PREPARED")
+    request = candidate_request(parent)
+    test_pid = self()
+
+    prepare = fn loader ->
+      assert {:ok,
+              %CandidateState{
+                complete?: true,
+                protection: :locked,
+                rows: rows,
+                revision: %{parent_id: ^order_id}
+              }} = loader.(request)
+
+      send(test_pid, {:candidate_rows, rows})
+      {:ok, parent, %{candidate_loaded?: true}}
+    end
+
+    assert {:ok, %Selecto.Write.Result{operation: :update, affected_rows: 1}} =
+             Adapter.execute_prepared_write(connection, prepare)
+
+    assert_receive {:candidate_rows,
+                    [
+                      %{"id" => _, "quantity" => 1, "sku" => "A"},
+                      %{
+                        "id" => _,
+                        "quantity" => 1,
+                        "sku" => "B"
+                      }
+                    ]}
+
+    assert {:ok, %{rows: [["SO-100-PREPARED"]]}} =
+             Adapter.execute(
+               connection,
+               "SELECT reference FROM selecto_graph_orders WHERE id = $1",
+               [order_id],
+               []
+             )
+  end
+
+  test "candidate overflow rejects and rolls back the prepared write", %{connection: connection} do
+    assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
+    [%{"id" => order_id}] = insert_result.rows
+    parent = parent_update!(order_id, "MUST-ROLL-BACK")
+    request = %{candidate_request(parent) | max_rows: 1}
+
+    assert {:error, %Error{type: :candidate_state_limit_exceeded}} =
+             Adapter.execute_prepared_write(connection, fn loader ->
+               with {:ok, _state} <- loader.(request), do: {:ok, parent, %{}}
+             end)
+
+    assert {:ok, %{rows: [["SO-100"]]}} =
+             Adapter.execute(
+               connection,
+               "SELECT reference FROM selecto_graph_orders WHERE id = $1",
+               [order_id],
+               []
+             )
+  end
+
+  defp parent_update!(order_id, reference) do
+    command!(%{
+      operation: :update,
+      relation: :selecto_graph_orders,
+      assignments: [%{field: :reference, value: {:literal, reference}}],
+      predicate:
+        {:and,
+         [
+           {:eq, {:field, :id}, {:literal, order_id}},
+           {:eq, {:field, :tenant_id}, {:literal, 7}}
+         ]},
+      returning: [:id],
+      expected_cardinality: {:exactly, 1}
+    })
+  end
+
+  defp candidate_request(parent) do
+    %CandidateRequest{
+      operation: :update,
+      representation: :delta,
+      relationship: "items",
+      path: [:items],
+      parent_command: parent,
+      parent_key: :id,
+      child_relation: :selecto_graph_items,
+      child_key: :order_id,
+      identity_fields: ["id"],
+      fields: ["id", "sku", "quantity"],
+      max_rows: 1_000
+    }
   end
 
   defp insert_graph! do
