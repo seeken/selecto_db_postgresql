@@ -811,7 +811,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp execute_write_command(connection, %Command{} = command, opts) do
-    with {:ok, statement} <- WriteCompiler.compile(command, opts),
+    with :ok <- verify_native_constraints(connection, command, opts),
+         {:ok, statement} <- WriteCompiler.compile(command, opts),
          {:ok, query_result} <- execute(connection, statement.text, statement.params, opts),
          {:ok, affected_rows} <- enforce_cardinality(command, query_result) do
       {:ok,
@@ -826,6 +827,58 @@ defmodule SelectoDBPostgreSQL.Adapter do
       {:error, reason} -> {:error, write_error(:execution_failed, reason, command)}
     end
   end
+
+  defp verify_native_constraints(_connection, %Command{native_constraints: []}, _opts), do: :ok
+
+  defp verify_native_constraints(
+         connection,
+         %Command{native_constraints: constraints, relation: relation},
+         opts
+       )
+       when is_list(constraints) do
+    Enum.reduce_while(constraints, :ok, fn native, :ok ->
+      case verify_native_constraint(connection, relation, native, opts) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp verify_native_constraint(connection, relation, native, opts) do
+    with %{adapter: "postgresql", constraint: constraint, category: category} <- native,
+         expected_type when is_binary(expected_type) <- native_constraint_type(category),
+         {:ok, %{rows: [[^expected_type]]}} <-
+           execute(
+             connection,
+             "SELECT c.contype FROM pg_constraint c WHERE c.conname = $1 AND c.conrelid = to_regclass($2)",
+             [constraint, to_string(relation)],
+             Keyword.take(opts, [:timeout, :log])
+           ) do
+      :ok
+    else
+      _ ->
+        {:error,
+         Error.new(
+           :native_constraint_unavailable,
+           "PostgreSQL cannot attest the declared native constraint for this relation",
+           details: %{
+             relation: to_string(relation),
+             native_constraint: safe_native_constraint(native)
+           }
+         )}
+    end
+  end
+
+  defp native_constraint_type(:unique_violation), do: "u"
+  defp native_constraint_type(:foreign_key_violation), do: "f"
+  defp native_constraint_type(:not_null_violation), do: "n"
+  defp native_constraint_type(:check_violation), do: "c"
+  defp native_constraint_type(_category), do: nil
+
+  defp safe_native_constraint(%{} = native),
+    do: Map.take(native, [:binding_id, :adapter, :constraint, :category])
+
+  defp safe_native_constraint(_native), do: %{}
 
   @impl true
   def execute_pool(pool_ref, query, params, opts) do

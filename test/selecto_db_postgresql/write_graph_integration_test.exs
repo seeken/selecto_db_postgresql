@@ -217,6 +217,50 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
             }} = Adapter.execute_write(connection, command)
   end
 
+  test "rejects an unattested native declaration before dispatch", %{connection: connection} do
+    assert {:ok, %{rows: [[order_id]]}} =
+             Adapter.execute(
+               connection,
+               "INSERT INTO selecto_graph_orders (tenant_id, reference) VALUES (7, 'UNATTESTED') RETURNING id",
+               [],
+               []
+             )
+
+    command =
+      command!(%{
+        operation: :insert,
+        relation: :selecto_graph_items,
+        assignments: [
+          %{field: :tenant_id, value: {:literal, 7}},
+          %{field: :order_id, value: {:literal, order_id}},
+          %{field: :sku, value: {:literal, "MUST-NOT-DISPATCH"}},
+          %{field: :quantity, value: {:literal, 1}}
+        ],
+        native_constraints: [
+          %{
+            binding_id: "positive_quantity",
+            adapter: "postgresql",
+            constraint: "missing_quantity_constraint",
+            category: :check_violation
+          }
+        ]
+      })
+
+    assert {:error,
+            %Error{
+              type: :native_constraint_unavailable,
+              details: %{relation: "selecto_graph_items"}
+            }} = Adapter.execute_write(connection, command)
+
+    assert {:ok, %{rows: []}} =
+             Adapter.execute(
+               connection,
+               "SELECT id FROM selecto_graph_items WHERE sku = 'MUST-NOT-DISPATCH'",
+               [],
+               []
+             )
+  end
+
   test "loads protected candidate state and executes the prepared write in one transaction", %{
     connection: connection
   } do
