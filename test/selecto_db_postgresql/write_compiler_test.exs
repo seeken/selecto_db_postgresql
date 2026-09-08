@@ -4,6 +4,10 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
   alias Selecto.Write.{Batch, Command, Error}
   alias SelectoDBPostgreSQL.Adapter
 
+  def handle_transaction_event(event, measurements, metadata, test_pid) do
+    send(test_pid, {:transaction_telemetry, event, measurements, metadata})
+  end
+
   defmodule EctoTransactionProbeRepo do
     def __adapter__, do: Ecto.Adapters.Postgres
 
@@ -189,12 +193,42 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
   end
 
   test "routes Ecto Repo writes through the Repo transaction boundary" do
+    handler_id = {__MODULE__, make_ref()}
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        [
+          [:selecto_db_postgresql, :telemetry, :transaction, :start],
+          [:selecto_db_postgresql, :telemetry, :transaction, :stop],
+          [:selecto_db_postgresql, :telemetry, :transaction, :exception]
+        ],
+        &__MODULE__.handle_transaction_event/4,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     assert {:error, %Error{}} =
              Adapter.execute_write(EctoTransactionProbeRepo, command!(:update),
                context: %{tenant_id: 7}
              )
 
     assert_receive {:ecto_transaction, []}
+
+    assert_receive {:transaction_telemetry,
+                    [:selecto_db_postgresql, :telemetry, :transaction, :start], _,
+                    %{adapter: :postgresql, schema_version: 1}}
+
+    assert_receive {:transaction_telemetry,
+                    [:selecto_db_postgresql, :telemetry, :transaction, :stop],
+                    %{duration: duration}, metadata}
+
+    assert is_integer(duration)
+    assert metadata.adapter == :postgresql
+    assert metadata.schema_version == 1
+    assert metadata.outcome in [:error, :rejected]
   end
 
   test "previews a portable upsert with domain-governed conflict and update fields" do

@@ -1334,6 +1334,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp run_postgrex_transaction(connection, fun, opts) do
+    Selecto.Telemetry.span_for(
+      [:selecto_db_postgresql, :telemetry, :transaction],
+      %{adapter: :postgresql},
+      fn -> do_run_postgrex_transaction(connection, fun, opts) end
+    )
+  end
+
+  defp do_run_postgrex_transaction(connection, fun, opts) do
     Postgrex.transaction(connection, fun, opts)
   rescue
     e in DBConnection.ConnectionError ->
@@ -2224,12 +2232,23 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp with_ecto_transaction(repo, opts, fun) do
+    Selecto.Telemetry.span_for(
+      [:selecto_db_postgresql, :telemetry, :transaction],
+      %{adapter: :postgresql},
+      fn -> do_with_ecto_transaction(repo, opts, fun) end
+    )
+  end
+
+  defp do_with_ecto_transaction(repo, opts, fun) do
     transaction_opts = Keyword.take(opts, [:timeout, :log])
 
-    case apply(repo, :transaction, [
-           fn -> ecto_transaction_result(repo, fun) end,
-           transaction_opts
-         ]) do
+    transaction_result =
+      apply(repo, :transaction, [
+        fn -> ecto_transaction_result(repo, fun) end,
+        transaction_opts
+      ])
+
+    case transaction_result do
       {:ok, results} -> {:ok, results}
       {:error, %Error{} = error} -> {:error, error}
       {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
@@ -2304,6 +2323,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp matching_native_constraint(_command, _category, _constraint), do: nil
 
   defp postgres_transaction(connection, opts, fun) do
+    Selecto.Telemetry.span_for(
+      [:selecto_db_postgresql, :telemetry, :transaction],
+      %{adapter: :postgresql},
+      fn -> do_postgres_transaction(connection, opts, fun) end
+    )
+  end
+
+  defp do_postgres_transaction(connection, opts, fun) do
     Postgrex.transaction(
       connection,
       fn transaction_connection ->
