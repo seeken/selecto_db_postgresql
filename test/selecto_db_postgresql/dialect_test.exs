@@ -132,6 +132,19 @@ defmodule SelectoDBPostgreSQL.DialectTest do
     assert {:ok, rendered_aggregate} = Dialect.render_json_operation(aggregate, %{})
     assert sql(rendered_aggregate) == ~s|json_agg("selecto_root"."payload")|
 
+    ordered_aggregate = %JsonOperation{
+      aggregate
+      | options: %{
+          column_sql: ~s("selecto_root"."payload"),
+          order_by_sql: ~s("selecto_root"."id" ASC)
+        }
+    }
+
+    assert {:ok, rendered_ordered} = Dialect.render_json_operation(ordered_aggregate, %{})
+
+    assert sql(rendered_ordered) ==
+             ~s|json_agg("selecto_root"."payload" ORDER BY "selecto_root"."id" ASC)|
+
     assert {:ok, rendered_object} = Dialect.render_json_operation(object_aggregate, %{})
 
     assert sql(rendered_object) ==

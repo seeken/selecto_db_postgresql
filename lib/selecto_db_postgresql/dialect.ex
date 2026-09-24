@@ -489,7 +489,9 @@ defmodule SelectoDBPostgreSQL.Dialect do
         render_json_key_exists(operation_key_exists(operation), selecto)
 
       :json_agg ->
-        {:ok, ["json_agg(", operation_column(operation), ")"]}
+        order_by = Map.get(operation.options, :order_by_sql, [])
+        suffix = if order_by == [], do: [], else: [" ORDER BY ", order_by]
+        {:ok, ["json_agg(", operation_column(operation), suffix, ")"]}
 
       :json_object_agg ->
         {:ok,
@@ -506,6 +508,9 @@ defmodule SelectoDBPostgreSQL.Dialect do
 
       :json_build_array ->
         {:ok, ["json_build_array(", json_values(operation.value), ")"]}
+
+      :json_exact_decimal_value ->
+        {:ok, ["CAST(", operation_column(operation), " AS text)"]}
 
       :json_empty_array ->
         {:ok, "'[]'::json"}

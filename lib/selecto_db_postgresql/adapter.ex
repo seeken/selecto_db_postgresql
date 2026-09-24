@@ -1002,7 +1002,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
       :function_verification,
       :schema_introspection,
       :materialized_view_refresh,
-      :materialized_view_refresh_concurrently
+      :materialized_view_refresh_concurrently,
+      :projection_sum
     ]
   end
 

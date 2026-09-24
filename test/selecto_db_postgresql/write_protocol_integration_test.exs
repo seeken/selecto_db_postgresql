@@ -44,9 +44,26 @@ defmodule SelectoDBPostgreSQL.WriteProtocolIntegrationTest do
 
       write = write_plan(shape, fault, index)
 
-      assert {:error, %Error{type: ^fault}} = Adapter.execute_write(connection, write)
+      assert_write_fault(connection, write, fault)
       assert database_rows(connection) == original_rows()
     end
+  end
+
+  defp assert_write_fault(connection, write, :execution_failed) do
+    assert {:error,
+            %Error{
+              type: :native_constraint_violation,
+              details: %{
+                category: :check_violation,
+                constraint: "selecto_protocol_atomicity_state_check",
+                write_stage: :execution_failed
+              }
+            }} = Adapter.execute_write(connection, write)
+  end
+
+  defp assert_write_fault(connection, write, :cardinality_mismatch) do
+    assert {:error, %Error{type: :cardinality_mismatch}} =
+             Adapter.execute_write(connection, write)
   end
 
   defp write_plan(:batch, fault, index) do
