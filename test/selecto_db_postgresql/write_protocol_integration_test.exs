@@ -58,12 +58,12 @@ defmodule SelectoDBPostgreSQL.WriteProtocolIntegrationTest do
                 constraint: "selecto_protocol_atomicity_state_check",
                 write_stage: :execution_failed
               }
-            }} = Adapter.execute_write(connection, write)
+            }} = Adapter.execute_write_unsafe(connection, write)
   end
 
   defp assert_write_fault(connection, write, :cardinality_mismatch) do
     assert {:error, %Error{type: :cardinality_mismatch}} =
-             Adapter.execute_write(connection, write)
+             Adapter.execute_write_unsafe(connection, write)
   end
 
   defp write_plan(:batch, fault, index) do

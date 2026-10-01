@@ -48,7 +48,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
   end
 
   test "executes generated-key insert and owned sync atomically", %{connection: connection} do
-    assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
+    assert {:ok, insert_result} = Adapter.execute_write_unsafe(connection, insert_graph!())
     assert [%{"id" => order_id}] = insert_result.rows
 
     assert [
@@ -72,7 +72,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
              )
 
     assert {:ok, sync_result} =
-             Adapter.execute_write(connection, sync_graph!(order_id, first_id))
+             Adapter.execute_write_unsafe(connection, sync_graph!(order_id, first_id))
 
     expected_strategy =
       case Adapter.server_version_major(connection) do
@@ -105,7 +105,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
   end
 
   test "ownership mismatch rolls back root and child changes", %{connection: connection} do
-    assert {:ok, result} = Adapter.execute_write(connection, insert_graph!())
+    assert {:ok, result} = Adapter.execute_write_unsafe(connection, insert_graph!())
     [%{"id" => order_id}] = result.rows
 
     execute!(
@@ -136,7 +136,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
              )
 
     assert {:error, %Error{type: :cardinality_mismatch}} =
-             Adapter.execute_write(connection, sync_graph!(order_id, foreign_id))
+             Adapter.execute_write_unsafe(connection, sync_graph!(order_id, foreign_id))
 
     assert {:ok, %{rows: [["SO-100"]]}} =
              Adapter.execute(
@@ -155,7 +155,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
       "ALTER TABLE selecto_graph_orders ADD CONSTRAINT graph_orders_reference_key UNIQUE (reference)"
     )
 
-    assert {:ok, _result} = Adapter.execute_write(connection, insert_graph!())
+    assert {:ok, _result} = Adapter.execute_write_unsafe(connection, insert_graph!())
 
     assert {:error,
             %Error{
@@ -167,7 +167,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
                 constraint: "graph_orders_reference_key",
                 recoverable?: true
               }
-            }} = Adapter.execute_write(connection, insert_graph!())
+            }} = Adapter.execute_write_unsafe(connection, insert_graph!())
   end
 
   test "correlates a matching declared native constraint with its rule binding", %{
@@ -214,7 +214,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
                 constraint: "graph_items_quantity_positive",
                 binding_id: "positive_quantity"
               }
-            }} = Adapter.execute_write(connection, command)
+            }} = Adapter.execute_write_unsafe(connection, command)
   end
 
   test "rejects an unattested native declaration before dispatch", %{connection: connection} do
@@ -250,7 +250,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
             %Error{
               type: :native_constraint_unavailable,
               details: %{relation: "selecto_graph_items"}
-            }} = Adapter.execute_write(connection, command)
+            }} = Adapter.execute_write_unsafe(connection, command)
 
     assert {:ok, %{rows: []}} =
              Adapter.execute(
@@ -264,7 +264,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
   test "loads protected candidate state and executes the prepared write in one transaction", %{
     connection: connection
   } do
-    assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
+    assert {:ok, insert_result} = Adapter.execute_write_unsafe(connection, insert_graph!())
     [%{"id" => order_id}] = insert_result.rows
 
     parent = parent_update!(order_id, "SO-100-PREPARED")
@@ -285,7 +285,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     end
 
     assert {:ok, %Selecto.Write.Result{operation: :update, affected_rows: 1}} =
-             Adapter.execute_prepared_write(connection, prepare)
+             Adapter.execute_prepared_write_unsafe(connection, prepare)
 
     assert_receive {:candidate_rows,
                     [
@@ -307,7 +307,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
   end
 
   test "loads one protected root record for a prepared partial update", %{connection: connection} do
-    assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
+    assert {:ok, insert_result} = Adapter.execute_write_unsafe(connection, insert_graph!())
     [%{"id" => order_id}] = insert_result.rows
 
     parent = parent_update!(order_id, "SO-100-ROOT-PREPARED")
@@ -331,7 +331,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     end
 
     assert {:ok, %Selecto.Write.Result{operation: :update, affected_rows: 1}} =
-             Adapter.execute_prepared_write(connection, prepare)
+             Adapter.execute_prepared_write_unsafe(connection, prepare)
   end
 
   test "protects both prepared upsert branches at serializable isolation", %{
@@ -362,7 +362,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
       })
 
     assert {:ok, %Selecto.Write.Result{operation: :upsert}} =
-             Adapter.execute_prepared_write(connection, fn loader ->
+             Adapter.execute_prepared_write_unsafe(connection, fn loader ->
                assert {:ok,
                        %RecordState{
                          exists?: false,
@@ -375,7 +375,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
              end)
 
     assert {:ok, %Selecto.Write.Result{operation: :upsert}} =
-             Adapter.execute_prepared_write(connection, fn loader ->
+             Adapter.execute_prepared_write_unsafe(connection, fn loader ->
                assert {:ok,
                        %RecordState{
                          exists?: true,
@@ -389,13 +389,13 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
   end
 
   test "candidate overflow rejects and rolls back the prepared write", %{connection: connection} do
-    assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
+    assert {:ok, insert_result} = Adapter.execute_write_unsafe(connection, insert_graph!())
     [%{"id" => order_id}] = insert_result.rows
     parent = parent_update!(order_id, "MUST-ROLL-BACK")
     request = %{candidate_request(parent) | max_rows: 1}
 
     assert {:error, %Error{type: :candidate_state_limit_exceeded}} =
-             Adapter.execute_prepared_write(connection, fn loader ->
+             Adapter.execute_prepared_write_unsafe(connection, fn loader ->
                with {:ok, _state} <- loader.(request), do: {:ok, parent, %{}}
              end)
 
@@ -411,7 +411,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
   test "prepared governed graph locks its root before a membership sync", %{
     connection: connection
   } do
-    assert {:ok, insert_result} = Adapter.execute_write(connection, insert_graph!())
+    assert {:ok, insert_result} = Adapter.execute_write_unsafe(connection, insert_graph!())
     [%{"id" => order_id}] = insert_result.rows
 
     assert {:ok, %{rows: [[first_id]]}} =
@@ -427,7 +427,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
       |> Map.update!(:metadata, &Map.put(&1, :membership_parent_lock, %{parent_key: :id}))
 
     assert {:ok, %Selecto.Write.Result{operation: :graph}} =
-             Adapter.execute_prepared_write(connection, fn _candidate_loader ->
+             Adapter.execute_prepared_write_unsafe(connection, fn _candidate_loader ->
                {:ok, graph, %{governed: true}}
              end)
 

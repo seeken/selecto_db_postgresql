@@ -418,7 +418,7 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
             %Selecto.Write.Error{
               type: :transaction_failed,
               details: %{adapter: :postgresql, reason: :invalid_connection}
-            } = error} = SelectoDBPostgreSQL.Adapter.execute_write(process, command)
+            } = error} = SelectoDBPostgreSQL.Adapter.execute_write_unsafe(process, command)
 
     refute inspect(error) =~ inspect(process)
   end

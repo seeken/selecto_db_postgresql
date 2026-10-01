@@ -63,7 +63,7 @@ defmodule SelectoDBPostgreSQL.WriteRollbackIntegrationTest do
             %Error{
               type: :cardinality_mismatch,
               details: %{actual: 1, expected: {:exactly, 2}}
-            }} = Adapter.execute_write(connection, command)
+            }} = Adapter.execute_write_unsafe(connection, command)
 
     assert {:ok, %{rows: [[1, "done"], [2, "open"]]}} =
              Adapter.execute(
@@ -94,7 +94,7 @@ defmodule SelectoDBPostgreSQL.WriteRollbackIntegrationTest do
     end
 
     assert {:ok, %{affected_rows: 1}} =
-             Adapter.execute_write(connection, command, committed_effect_sink: sink)
+             Adapter.execute_write_unsafe(connection, command, committed_effect_sink: sink)
 
     assert {:ok, %{rows: [["archived"]]}} =
              Adapter.execute(
@@ -130,7 +130,7 @@ defmodule SelectoDBPostgreSQL.WriteRollbackIntegrationTest do
     end
 
     assert {:error, %Error{type: :committed_effect_failed}} =
-             Adapter.execute_write(connection, command, committed_effect_sink: sink)
+             Adapter.execute_write_unsafe(connection, command, committed_effect_sink: sink)
 
     assert {:ok, %{rows: [["done"]]}} =
              Adapter.execute(

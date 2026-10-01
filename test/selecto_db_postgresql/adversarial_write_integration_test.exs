@@ -64,12 +64,12 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
       attack = task_insert(3, 80)
 
       assert {:error, %Error{type: :cardinality_mismatch}} =
-               Adapter.execute_write(connection, attack)
+               Adapter.execute_write_unsafe(connection, attack)
 
       assert task_rows(connection) == [[1, 7, 70, "t7"], [2, 8, 80, "t8"]]
 
       assert {:ok, %Result{affected_rows: 1}} =
-               Adapter.execute_write(connection, task_insert(3, 70))
+               Adapter.execute_write_unsafe(connection, task_insert(3, 70))
 
       assert task_rows(connection) == [[1, 7, 70, "t7"], [2, 8, 80, "t8"], [3, 7, 70, "new"]]
     end
@@ -78,14 +78,14 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
       connection: connection
     } do
       assert {:error, %Error{type: :cardinality_mismatch}} =
-               Adapter.execute_write(connection, task_update(1, 80))
+               Adapter.execute_write_unsafe(connection, task_update(1, 80))
 
       assert task_rows(connection) == [[1, 7, 70, "t7"], [2, 8, 80, "t8"]]
 
       execute!(connection, "INSERT INTO adv_projects VALUES (71, 7, 'p7b')")
 
       assert {:ok, %Result{affected_rows: 1}} =
-               Adapter.execute_write(connection, task_update(1, 71))
+               Adapter.execute_write_unsafe(connection, task_update(1, 71))
 
       assert task_rows(connection) == [[1, 7, 71, "t7"], [2, 8, 80, "t8"]]
     end
@@ -103,7 +103,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
           end)
         end)
 
-      assert {:error, %Error{}} = Adapter.execute_write(connection, command)
+      assert {:error, %Error{}} = Adapter.execute_write_unsafe(connection, command)
       assert task_rows(connection) == [[1, 7, 70, "t7"], [2, 8, 80, "t8"]]
     end
   end
@@ -130,7 +130,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
         })
 
       assert {:error, %Error{details: %{code: :undeclared_conflict_target}}} =
-               Adapter.execute_write(connection, command)
+               Adapter.execute_write_unsafe(connection, command)
 
       assert product_rows(connection) == [
                [1, 7, "A", "seven"],
@@ -142,7 +142,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
       connection: connection
     } do
       assert {:error, %Error{type: :native_constraint_violation, details: details}} =
-               Adapter.execute_write(connection, product_upsert("tenant-8-secret"))
+               Adapter.execute_write_unsafe(connection, product_upsert("tenant-8-secret"))
 
       assert details.category == :unique_violation
       assert details.constraint == "adv_products_sku_key"
@@ -154,7 +154,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
              ]
 
       assert {:ok, %Result{affected_rows: 1}} =
-               Adapter.execute_write(connection, product_upsert("A"))
+               Adapter.execute_write_unsafe(connection, product_upsert("A"))
 
       assert product_rows(connection) == [
                [1, 7, "A", "upserted"],

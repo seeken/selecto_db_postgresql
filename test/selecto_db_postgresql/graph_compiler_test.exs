@@ -75,7 +75,7 @@ defmodule SelectoDBPostgreSQL.GraphCompilerTest do
              Adapter.preview_write(:unused, malformed, server_version_major: 17)
 
     assert {:error, %{type: :invalid_graph}} =
-             Adapter.execute_write(:unused, malformed, server_version_major: 17)
+             Adapter.execute_write_unsafe(:unused, malformed, server_version_major: 17)
   end
 
   test "graph commands reject identifiers that collide after normalization" do
@@ -95,7 +95,7 @@ defmodule SelectoDBPostgreSQL.GraphCompilerTest do
              Adapter.preview_write(:unused, malformed, server_version_major: 17)
 
     assert {:error, %{type: :invalid_command}} =
-             Adapter.execute_write(:unused, malformed, server_version_major: 17)
+             Adapter.execute_write_unsafe(:unused, malformed, server_version_major: 17)
   end
 
   defp graph! do

@@ -48,7 +48,7 @@ defmodule SelectoDBPostgreSQL.CandidateStateConcurrencyIntegrationTest do
 
     first_task =
       Task.async(fn ->
-        Adapter.execute_prepared_write(first, fn loader ->
+        Adapter.execute_prepared_write_unsafe(first, fn loader ->
           assert {:ok, %CandidateState{rows: [%{"id" => 11, "quantity" => 1}]}} =
                    loader.(request)
 
@@ -70,7 +70,7 @@ defmodule SelectoDBPostgreSQL.CandidateStateConcurrencyIntegrationTest do
       Task.async(fn ->
         send(test_pid, :second_started)
 
-        Adapter.execute_prepared_write(second, fn loader ->
+        Adapter.execute_prepared_write_unsafe(second, fn loader ->
           with {:ok, %CandidateState{} = state} <- loader.(request) do
             send(test_pid, {:second_loaded, state.rows})
             {:ok, parent_update(orders, "second"), %{writer: :second}}

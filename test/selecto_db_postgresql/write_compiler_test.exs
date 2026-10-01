@@ -130,13 +130,13 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
              Adapter.preview_write(:unused, malformed)
 
     assert {:error, %Error{type: :invalid_command}} =
-             Adapter.execute_write(:unregistered_connection, malformed)
+             Adapter.execute_write_unsafe(:unregistered_connection, malformed)
 
     assert {:error, %Error{type: :invalid_command}} =
              Adapter.preview_write(:unused, %{operation: :insert})
 
     assert {:error, %Error{type: :invalid_command}} =
-             Adapter.execute_write(:unregistered_connection, %{operation: :insert})
+             Adapter.execute_write_unsafe(:unregistered_connection, %{operation: :insert})
   end
 
   test "rejects assignment fields that collide after identifier normalization" do
@@ -164,7 +164,7 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
 
     assert {:error,
             %Error{type: :invalid_command, details: %{code: :duplicate_assignment_identifier}}} =
-             Adapter.execute_write(:unregistered_connection, batch)
+             Adapter.execute_write_unsafe(:unregistered_connection, batch)
   end
 
   test "rejects returning fields that collide after identifier normalization" do
@@ -211,7 +211,7 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
     assert {:error, %Error{}} =
-             Adapter.execute_write(EctoTransactionProbeRepo, command!(:update),
+             Adapter.execute_write_unsafe(EctoTransactionProbeRepo, command!(:update),
                context: %{tenant_id: 7}
              )
 
