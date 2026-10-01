@@ -120,19 +120,77 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @impl true
   def normalize_error(%Selecto.Error{} = error), do: error
 
+  # Returned errors carry a stable category and PostgreSQL error code, never the
+  # server message, detail, hint, SQL text or bound parameters: those can echo
+  # other tenants' values (for example a unique-violation detail) or the query.
   def normalize_error(%Postgrex.Error{} = error) do
     native = Map.get(error, :postgres) || %{}
-    category = normalize_error_category(Map.get(native, :code) || Map.get(native, :pg_code))
+    code = Map.get(native, :code)
+    category = normalize_error_category(code || Map.get(native, :pg_code))
 
-    Selecto.Error.query_error(Exception.message(error), nil, [], %{
+    Selecto.Error.query_error(safe_query_error_message(category), nil, [], %{
+      adapter: :postgresql,
       category: category,
+      code: if(is_atom(code), do: code),
+      sqlstate: safe_sqlstate(Map.get(native, :pg_code)),
       constraint: Map.get(native, :constraint),
       column: Map.get(native, :column),
       recoverable?: category in [:unique_violation, :foreign_key_violation, :not_null_violation]
     })
   end
 
+  def normalize_error(%DBConnection.ConnectionError{}), do: safe_connection_error()
+
+  def normalize_error({:query_exception, module, _message}) when is_atom(module),
+    do: safe_exception_error(module)
+
+  def normalize_error({:connection_exit, _reason}) do
+    Selecto.Error.connection_error("PostgreSQL connection exited", %{
+      adapter: :postgresql,
+      category: :connection_exit
+    })
+  end
+
+  def normalize_error(%{__exception__: true, __struct__: module}),
+    do: safe_exception_error(module)
+
   def normalize_error(reason), do: Selecto.Error.from_reason(reason)
+
+  defp safe_exception(%Postgrex.Error{} = error), do: normalize_error(error)
+  defp safe_exception(%DBConnection.ConnectionError{}), do: safe_connection_error()
+  defp safe_exception(%{__struct__: module}), do: safe_exception_error(module)
+
+  defp safe_connection_error do
+    Selecto.Error.connection_error("PostgreSQL connection failed", %{
+      adapter: :postgresql,
+      category: :connection_error
+    })
+  end
+
+  defp safe_exception_error(module) do
+    Selecto.Error.query_error("PostgreSQL query failed", nil, [], %{
+      adapter: :postgresql,
+      category: :query_exception,
+      exception: inspect(module)
+    })
+  end
+
+  defp safe_query_error_message(:unique_violation),
+    do: "PostgreSQL rejected the query: unique constraint violated"
+
+  defp safe_query_error_message(:foreign_key_violation),
+    do: "PostgreSQL rejected the query: foreign key constraint violated"
+
+  defp safe_query_error_message(:not_null_violation),
+    do: "PostgreSQL rejected the query: not-null constraint violated"
+
+  defp safe_query_error_message(:check_violation),
+    do: "PostgreSQL rejected the query: check constraint violated"
+
+  defp safe_query_error_message(_category), do: "PostgreSQL query failed"
+
+  defp safe_sqlstate(<<_::binary-size(5)>> = sqlstate), do: sqlstate
+  defp safe_sqlstate(_sqlstate), do: nil
 
   @impl true
   def connect({:pool, _} = pool_ref), do: {:ok, pool_ref}
@@ -1286,11 +1344,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
           result = fun.(pool_pid)
           {:ok, result}
         rescue
-          e in DBConnection.ConnectionError ->
-            {:error, Selecto.Error.connection_error(Exception.message(e), %{exception: e})}
-
           e ->
-            {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
+            {:error, safe_exception(e)}
         catch
           :exit, reason ->
             {:error,
@@ -1345,14 +1400,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp do_run_postgrex_transaction(connection, fun, opts) do
     Postgrex.transaction(connection, fun, opts)
   rescue
-    e in DBConnection.ConnectionError ->
-      {:error, Selecto.Error.connection_error(Exception.message(e), %{exception: e})}
-
-    e in Postgrex.Error ->
-      {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
-
     e ->
-      {:error, Selecto.Error.query_error(Exception.message(e), nil, [], %{exception: e})}
+      {:error, safe_exception(e)}
   catch
     :exit, reason ->
       {:error,
@@ -2103,14 +2152,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
         Postgrex.query(pool_pid, query, params, timeout: timeout)
       end
     rescue
-      e in DBConnection.ConnectionError ->
-        {:error, Selecto.Error.connection_error(Exception.message(e), %{exception: e})}
-
-      e in Postgrex.Error ->
-        {:error, Selecto.Error.query_error(Exception.message(e), query, params, %{exception: e})}
-
       e ->
-        {:error, Selecto.Error.query_error(Exception.message(e), query, params, %{exception: e})}
+        {:error, safe_exception(e)}
     catch
       :exit, reason ->
         {:error,

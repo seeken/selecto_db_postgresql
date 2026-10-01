@@ -62,7 +62,8 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
   end
 
   defp compile_upsert(%Command{} = command, opts) do
-    with {:ok, assignments} <- compile_assignments(command.assignments, opts),
+    with :ok <- reject_upsert_predicate(command),
+         {:ok, assignments} <- compile_assignments(command.assignments, opts),
          true <-
            assignments != [] or
              {:error, Error.new(:invalid_command, "upsert requires at least one assignment")},
@@ -169,6 +170,11 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
   defp assignment_parameter_count(assignments),
     do: assignments |> Enum.flat_map(& &1.params) |> length()
 
+  # A guard proves the referenced row exists. A guard that names
+  # `tenant_field` must also carry `tenant_value`; the referenced row must then
+  # belong to that tenant. Its columns are qualified by a subquery alias so a
+  # column missing from the referenced relation fails instead of resolving to
+  # the outer write target.
   defp compile_foreign_key_guards(metadata, assignments, offset) do
     metadata
     |> Map.get(:foreign_key_guards, [])
@@ -176,11 +182,12 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
       with %{field: field, relation: relation, target_field: target_field} <- guard,
            %{params: [value]} <-
              Enum.find(assignments, &(to_string(&1.field) == to_string(field))),
-           true <- relation_ref?(relation) and field_ref?(target_field) do
-        text =
-          "EXISTS (SELECT 1 FROM #{quote_relation(relation)} WHERE #{quote_identifier(target_field)} = $#{next_offset + 1})"
+           true <- relation_ref?(relation) and field_ref?(target_field),
+           {:ok, tenant} <- foreign_key_guard_tenant(guard) do
+        {text, guard_params} =
+          foreign_key_guard_text(relation, target_field, value, tenant, next_offset)
 
-        {:cont, {:ok, [text | texts], params ++ [value], next_offset + 1}}
+        {:cont, {:ok, [text | texts], params ++ guard_params, next_offset + length(guard_params)}}
       else
         _ ->
           {:halt,
@@ -202,6 +209,32 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
       error ->
         error
     end
+  end
+
+  defp foreign_key_guard_tenant(guard) do
+    case {Map.fetch(guard, :tenant_field), Map.get(guard, :tenant_value)} do
+      {:error, _value} ->
+        {:ok, nil}
+
+      {{:ok, tenant_field}, tenant_value} when not is_nil(tenant_value) ->
+        if field_ref?(tenant_field), do: {:ok, {tenant_field, tenant_value}}, else: :error
+
+      _invalid ->
+        :error
+    end
+  end
+
+  defp foreign_key_guard_text(relation, target_field, value, nil, offset) do
+    {"EXISTS (SELECT 1 FROM #{quote_relation(relation)} WHERE #{quote_identifier(target_field)} = $#{offset + 1})",
+     [value]}
+  end
+
+  defp foreign_key_guard_text(relation, target_field, value, {tenant_field, tenant}, offset) do
+    alias_name = quote_identifier("selecto_fk_parent")
+
+    {"EXISTS (SELECT 1 FROM #{quote_relation(relation)} AS #{alias_name} " <>
+       "WHERE #{alias_name}.#{quote_identifier(target_field)} = $#{offset + 1} " <>
+       "AND #{alias_name}.#{quote_identifier(tenant_field)} = $#{offset + 2})", [value, tenant]}
   end
 
   defp guard_suffix(nil), do: ""
@@ -358,10 +391,23 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
      Error.new(:invalid_command, "invalid returning specification", details: %{returning: value})}
   end
 
+  # ON CONFLICT ... DO UPDATE has no mutation predicate here; a scope predicate
+  # on an upsert command would be silently dropped, so it is refused.
+  defp reject_upsert_predicate(%Command{predicate: nil}), do: :ok
+
+  defp reject_upsert_predicate(%Command{}) do
+    {:error,
+     Error.new(:invalid_command, "PostgreSQL upsert cannot enforce a command predicate",
+       details: %{code: :upsert_predicate_unsupported}
+     )}
+  end
+
   defp compile_conflict_target(metadata) do
     case Map.get(metadata, :conflict_target) do
       fields when is_list(fields) and fields != [] ->
-        {:ok, Enum.map_join(fields, ", ", &quote_identifier/1)}
+        with :ok <- ensure_declared_conflict_target(fields, metadata) do
+          {:ok, Enum.map_join(fields, ", ", &quote_identifier/1)}
+        end
 
       _ ->
         {:error,
@@ -369,6 +415,42 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
            details: %{required: :conflict_target}
          )}
     end
+  end
+
+  # When the producer publishes the domain's declared targets, the selected
+  # target must be one of them (column order is not significant).
+  defp ensure_declared_conflict_target(fields, metadata) do
+    case Map.fetch(metadata, :declared_conflict_targets) do
+      :error ->
+        :ok
+
+      {:ok, declared} when is_list(declared) ->
+        target = field_set(fields)
+
+        if not is_nil(target) and Enum.any?(declared, &(field_set(&1) == target)) do
+          :ok
+        else
+          undeclared_conflict_target(fields)
+        end
+
+      {:ok, _declared} ->
+        undeclared_conflict_target(fields)
+    end
+  end
+
+  defp field_set(fields) when is_list(fields) do
+    if Enum.all?(fields, &field_ref?/1),
+      do: fields |> Enum.map(&to_string/1) |> MapSet.new(),
+      else: nil
+  end
+
+  defp field_set(_fields), do: nil
+
+  defp undeclared_conflict_target(fields) do
+    {:error,
+     Error.new(:invalid_command, "upsert conflict target is not a declared conflict target",
+       details: %{code: :undeclared_conflict_target, conflict_target: fields}
+     )}
   end
 
   defp compile_upsert_update_fields(metadata, assignments) do
