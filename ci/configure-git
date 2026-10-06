@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+: "${RUNNER_TEMP:?disposable runner temporary directory required}"
+: "${GITHUB_ENV:?GitHub step environment file required}"
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+test -s /run/selecto-ci/creds/token
+grep -qxF seeken/selecto /run/selecto-ci/creds/siblings
+config="$RUNNER_TEMP/selecto-postgresql-gitconfig"
+umask 077
+: > "$config"
+git config --file "$config" --add credential.helper ''
+git config --file "$config" credential.https://github.com.helper "$repo_dir/ci/git_credential_readonly.py"
+git config --file "$config" credential.useHttpPath true
+printf 'GIT_CONFIG_GLOBAL=%s\nGIT_CONFIG_NOSYSTEM=1\nGIT_TERMINAL_PROMPT=0\nGIT_ASKPASS=/bin/false\n' "$config" >> "$GITHUB_ENV"
+echo 'Job-scoped read-only Core source access ready.'
