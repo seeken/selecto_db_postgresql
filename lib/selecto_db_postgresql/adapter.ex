@@ -243,15 +243,201 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   def disconnect(_connection), do: :ok
 
+  # DBConnection's per-call timeout when none is given. Before this adapter
+  # enforced Selecto's `:timeout` itself it applied to every `Selecto.execute/2`
+  # query, firing before Selecto's 30 second task timeout.
+  @postgrex_default_timeout 15_000
+
+  @doc """
+  Executes a statement.
+
+  With an integer `timeout: milliseconds` option (the time `Selecto.execute/2`
+  has left, see `supports?(:execute_timeout)`) the statement is abandoned and
+  `{:error, reason}` returned once the shorter of that time and the driver
+  timeout that applies without it has elapsed: Postgrex's 15 second default,
+  or the repository's configured `:timeout` for an Ecto repository. A
+  connection the calling process already holds checked out (a
+  `%DBConnection{}`, or an Ecto repository inside a transaction or checkout)
+  runs under its checkout's deadline, which ignores a per-call timeout, so
+  such a statement runs in a separate process that is shut down when
+  `timeout` elapses, as Selecto's own task would.
+
+  Without an integer `:timeout` the statement runs exactly as before.
+  """
   @impl true
-  def execute({:pool, pool_ref}, query, params, opts) do
+  def execute(connection, query, params, opts) do
+    case Keyword.get(opts, :timeout) do
+      timeout when is_integer(timeout) and timeout >= 0 ->
+        execute_within(connection, query, params, opts, timeout)
+
+      _other ->
+        execute_statement(connection, query, params, opts)
+    end
+  end
+
+  defp execute_within({:pool, pool_ref} = connection, query, params, opts, timeout) do
+    if own_pool_reference?(pool_ref) do
+      execute_statement(
+        connection,
+        query,
+        params,
+        bounded_opts(opts, timeout, @postgrex_default_timeout)
+      )
+    else
+      # Another adapter's pool: its execute decides how the timeout applies.
+      execute_in_process(fn -> execute_statement(connection, query, params, opts) end, timeout)
+    end
+  end
+
+  defp execute_within(connection, query, params, opts, timeout)
+       when is_atom(connection) and not is_nil(connection) do
+    cond do
+      not valid_named_connection?(connection) ->
+        {:error, {:invalid_connection, connection}}
+
+      ecto_repo?(connection) ->
+        execute_ecto_within(connection, query, params, opts, timeout)
+
+      true ->
+        query_postgrex(
+          connection,
+          query,
+          params,
+          bounded_opts(opts, timeout, @postgrex_default_timeout)
+        )
+    end
+  end
+
+  defp execute_within(connection, query, params, opts, timeout) when is_pid(connection) do
+    execute_statement(
+      connection,
+      query,
+      params,
+      bounded_opts(opts, timeout, @postgrex_default_timeout)
+    )
+  end
+
+  # A checked-out connection's deadline is set when it was checked out, and
+  # DBConnection ignores the per-call timeout.
+  defp execute_within(%DBConnection{} = connection, query, params, opts, timeout) do
+    execute_in_process(fn -> query_postgrex(connection, query, params, opts) end, timeout)
+  end
+
+  defp execute_within(connection, query, params, opts, _timeout),
+    do: execute_statement(connection, query, params, opts)
+
+  defp execute_ecto_within(repo, query, params, opts, timeout) do
+    {checked_out?, repo_timeout} = ecto_execution_context(repo)
+    opts = bounded_opts(opts, timeout, repo_timeout)
+
+    if checked_out? do
+      # Inside a transaction or checkout of the calling process Ecto would run
+      # the statement on that connection, whose deadline ignores the per-call
+      # timeout. A separate process takes its own connection, as Selecto's
+      # task did.
+      execute_in_process(fn -> execute_ecto_query(repo, query, params, opts) end, timeout)
+    else
+      execute_ecto_query(repo, query, params, opts)
+    end
+  end
+
+  # Whether the calling process holds the repository's connection, and the
+  # repository's configured query timeout (Ecto's default is DBConnection's).
+  defp ecto_execution_context(repo) do
+    meta = apply(:"Elixir.Ecto.Adapter", :lookup_meta, [repo])
+    adapter = apply(repo, :__adapter__, [])
+
+    checked_out? =
+      module_exports?(adapter, :checked_out?, 1) and apply(adapter, :checked_out?, [meta])
+
+    repo_timeout =
+      case meta do
+        %{opts: repo_opts} when is_list(repo_opts) ->
+          Keyword.get(repo_opts, :timeout, @postgrex_default_timeout)
+
+        _meta ->
+          @postgrex_default_timeout
+      end
+
+    {checked_out? == true, repo_timeout}
+  rescue
+    # A repository that is not running fails the same way when queried.
+    _exception -> {false, @postgrex_default_timeout}
+  end
+
+  # The driver timeout becomes the shorter of `timeout` and `limit` (the one
+  # that applies without `timeout`), and a deadline bounds the whole call,
+  # including DBConnection's checkout retries.
+  defp bounded_opts(opts, timeout, limit) do
+    timeout = if is_integer(limit), do: min(timeout, limit), else: timeout
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    deadline =
+      case Keyword.get(opts, :deadline) do
+        existing when is_integer(existing) -> min(existing, deadline)
+        _other -> deadline
+      end
+
+    opts
+    |> Keyword.put(:timeout, timeout)
+    |> Keyword.put(:deadline, deadline)
+  end
+
+  defp own_pool_reference?(pool_ref) do
+    pool_adapter =
+      case pool_ref do
+        %{adapter: adapter} when is_atom(adapter) -> adapter
+        _other -> Selecto.AdapterSupport.default_adapter()
+      end
+
+    pool_adapter == __MODULE__
+  end
+
+  # Runs `fun` in a separate process and abandons it when `timeout` elapses.
+  defp execute_in_process(fun, timeout) do
+    caller = self()
+    reply = make_ref()
+    callers = [caller | Process.get(:"$callers", [])]
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        Process.put(:"$callers", callers)
+        send(caller, {reply, fun.()})
+      end)
+
+    receive do
+      {^reply, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^pid, reason} ->
+        {:error, {:connection_exit, reason}}
+    after
+      timeout ->
+        Process.exit(pid, :kill)
+        Process.demonitor(monitor, [:flush])
+
+        receive do
+          {^reply, _late_result} -> :ok
+        after
+          0 -> :ok
+        end
+
+        {:error,
+         DBConnection.ConnectionError.exception(
+           "PostgreSQL statement exceeded its timeout of #{timeout}ms"
+         )}
+    end
+  end
+
+  defp execute_statement({:pool, pool_ref}, query, params, opts) do
     case Selecto.ConnectionPool.execute(pool_ref, normalize_query(query), params, opts) do
       {:ok, result} -> {:ok, normalize_result(result)}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  def execute(connection, query, params, opts) when is_atom(connection) do
+  defp execute_statement(connection, query, params, opts) when is_atom(connection) do
     if valid_named_connection?(connection) do
       execute_module_connection(connection, query, params, opts)
     else
@@ -259,17 +445,18 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  def execute(connection, query, params, opts) when is_pid(connection) do
+  defp execute_statement(connection, query, params, opts) when is_pid(connection) do
     if Process.alive?(connection),
       do: query_postgrex(connection, query, params, opts),
       else: {:error, {:invalid_connection, connection}}
   end
 
-  def execute(%DBConnection{} = connection, query, params, opts) do
+  defp execute_statement(%DBConnection{} = connection, query, params, opts) do
     query_postgrex(connection, query, params, opts)
   end
 
-  def execute(connection, _query, _params, _opts), do: {:error, {:invalid_connection, connection}}
+  defp execute_statement(connection, _query, _params, _opts),
+    do: {:error, {:invalid_connection, connection}}
 
   @impl Selecto.DB.WriteAdapter
   def write_capabilities(connection) do
@@ -761,7 +948,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp candidate_identifier?(_identifier), do: false
 
   defp execute_candidate_query(connection, query, params, opts) do
-    case execute(connection, query, params, Keyword.take(opts, [:timeout, :log])) do
+    case execute_statement(connection, query, params, Keyword.take(opts, [:timeout, :log])) do
       {:ok, result} -> {:ok, result}
       {:error, reason} -> {:error, write_error(:candidate_state_load_failed, reason)}
     end
@@ -914,7 +1101,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_graph_node(connection, node, server_major, opts) do
     if GraphCompiler.merge_eligible?(node, server_major) do
       with {:ok, statement} <- GraphCompiler.compile_merge(node, opts),
-           {:ok, query_result} <- execute(connection, statement.text, statement.params, opts),
+           {:ok, query_result} <-
+             execute_statement(connection, statement.text, statement.params, opts),
            {:ok, {results, affected_rows}} <- GraphCompiler.merge_results(node, query_result) do
         {:ok, results, affected_rows, :merge}
       else
@@ -971,7 +1159,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_write_command(connection, %Command{} = command, opts) do
     with :ok <- verify_native_constraints(connection, command, opts),
          {:ok, statement} <- WriteCompiler.compile(command, opts),
-         {:ok, query_result} <- execute(connection, statement.text, statement.params, opts),
+         {:ok, query_result} <-
+           execute_statement(connection, statement.text, statement.params, opts),
          {:ok, affected_rows} <- enforce_cardinality(command, query_result) do
       {:ok,
        %Result{
@@ -1006,7 +1195,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     with %{adapter: "postgresql", constraint: constraint, category: category} <- native,
          expected_type when is_binary(expected_type) <- native_constraint_type(category),
          {:ok, %{rows: [[^expected_type]]}} <-
-           execute(
+           execute_statement(
              connection,
              "SELECT c.contype FROM pg_constraint c WHERE c.conname = $1 AND c.conrelid = to_regclass($2)",
              [constraint, to_string(relation)],
@@ -1057,7 +1246,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def execute_raw(connection, query, params) do
     cond do
       match?({:pool, _}, connection) ->
-        case execute(connection, query, params, prepared: false) do
+        case execute_statement(connection, query, params, prepared: false) do
           {:ok, result} -> {:ok, result}
           {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
         end
@@ -1066,7 +1255,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         execute_ecto_query(connection, query, params)
 
       valid_postgrex_connection?(connection) ->
-        case execute(connection, query, params, []) do
+        case execute_statement(connection, query, params, []) do
           {:ok, result} -> {:ok, result}
           {:error, reason} -> {:error, Selecto.Error.from_reason(reason)}
         end
@@ -1121,7 +1310,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
       :schema_introspection,
       :materialized_view_refresh,
       :materialized_view_refresh_concurrently,
-      :projection_sum
+      :projection_sum,
+      :execute_timeout
     ]
   end
 
@@ -1560,8 +1750,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp execute_ecto_query(repo, query, params) do
-    case apply(ecto_sql_module(), :query, [repo, normalize_query(query), params]) do
+  defp execute_ecto_query(repo, query, params, opts \\ []) do
+    case apply(ecto_sql_module(), :query, [repo, normalize_query(query), params, opts]) do
       {:ok, result} -> {:ok, normalize_result(result)}
       {:error, reason} -> {:error, reason}
     end
@@ -1636,7 +1826,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         query_fun.(query, params, prepared: false)
 
       _ ->
-        execute(connection, query, params, prepared: false)
+        execute_statement(connection, query, params, prepared: false)
     end
   end
 
@@ -2203,13 +2393,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp execute_with_pool_pid(pool_pid, query, params, cache_key, opts) do
-    timeout = Keyword.get(opts, :timeout, 15_000)
+    query_opts = [timeout: Keyword.get(opts, :timeout, 15_000)] ++ Keyword.take(opts, [:deadline])
 
     try do
       if cache_key do
-        execute_with_prepared_cache(pool_pid, query, params, cache_key, timeout)
+        execute_with_prepared_cache(pool_pid, query, params, cache_key, query_opts)
       else
-        Postgrex.query(pool_pid, query, params, timeout: timeout)
+        Postgrex.query(pool_pid, query, params, query_opts)
       end
     rescue
       e ->
@@ -2223,10 +2413,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp execute_with_prepared_cache(pool_pid, query, params, cache_key, timeout) do
+  defp execute_with_prepared_cache(pool_pid, query, params, cache_key, query_opts) do
     case Selecto.ConnectionPool.prepared_statement_cached?(pool_pid, cache_key) do
       false ->
-        result = Postgrex.query(pool_pid, query, params, timeout: timeout)
+        result = Postgrex.query(pool_pid, query, params, query_opts)
 
         if match?({:ok, _}, result) do
           Selecto.ConnectionPool.mark_prepared_statement(pool_pid, cache_key)
@@ -2235,7 +2425,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         result
 
       true ->
-        Postgrex.query(pool_pid, query, params, timeout: timeout)
+        Postgrex.query(pool_pid, query, params, query_opts)
     end
   end
 

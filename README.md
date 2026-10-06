@@ -139,6 +139,12 @@ portable certification profile is claimed.
 - Placeholder style is `$N`.
 - Identifier quoting uses double quotes.
 - Pool-backed execution delegates to `Selecto.ConnectionPool`.
+- The adapter declares `supports?(:execute_timeout)`: `Selecto.execute/2` runs
+  the query in the calling process, and Postgrex gets the shorter of
+  Selecto's remaining `:timeout` and the timeout that applied before
+  (Postgrex's 15 seconds, or an Ecto repository's configured `:timeout`).
+  Statements on a connection the caller already holds checked out run in a
+  separate process abandoned at the timeout. See `execute/4`.
 
 ## Governed writes
 

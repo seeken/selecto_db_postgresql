@@ -19,6 +19,17 @@ Unreleased
   benchmark queries and making absent-row normalization explicit. Valid query
   results and affected-row counts retain their existing behavior; malformed
   driver row counts fail before they enter portable result metadata.
+- The adapter declares `supports?(:execute_timeout)`, so `Selecto.execute/2`
+  runs the query in the calling process instead of copying the result out of
+  a task. `execute/4` with an integer `:timeout` gives Postgrex the shorter of
+  that time and the timeout that applied before (Postgrex's 15 seconds, or an
+  Ecto repository's configured `:timeout`) plus a matching `:deadline`, so no
+  limit is lengthened. A connection the caller already holds checked out (a
+  `%DBConnection{}`, or an Ecto repository inside a transaction or checkout)
+  ignores per-call timeouts, so such a statement runs in a separate process
+  abandoned at the timeout, as Selecto's task was; so does a pool reference
+  owned by another adapter. Without `:timeout`, and on every write path,
+  execution is unchanged.
 
 - `execute_write/3` and `execute_prepared_write/3` refuse a write without the
   `Selecto.Write.Authorization` the governed entry point (`SelectoUpdato`)
