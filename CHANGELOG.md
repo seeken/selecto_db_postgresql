@@ -4,6 +4,10 @@ CHANGES
 Unreleased
 ----------
 
+- Lock Postgrex to 0.22.4, including the streaming comment and notification
+  reconnect security fixes (CVE-2026-66838 and CVE-2026-58225). The existing
+  channel-name fix and immutable Core dependency remain in place.
+
 - Render canonical computed-value casts and JSON text extraction in the
   PostgreSQL dialect, preserving SQL nulls, native cast targets and ordered
   parameter markers. The optional callback accepts only the closed fragment
