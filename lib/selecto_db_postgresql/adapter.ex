@@ -2248,12 +2248,26 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp normalize_result(%{rows: rows, columns: columns} = result) do
+    rows =
+      case rows do
+        missing when missing in [nil, false] -> []
+        rows when is_list(rows) -> rows
+      end
+
     %{
-      rows: rows || [],
-      columns: Enum.map(columns || [], &to_string/1),
-      num_rows: Map.get(result, :num_rows, length(rows || []))
+      rows: rows,
+      columns: normalize_columns(columns),
+      num_rows: normalize_row_count(Map.get(result, :num_rows, length(rows)))
     }
   end
+
+  @spec normalize_columns(list() | nil | false) :: [String.t()]
+  defp normalize_columns(columns), do: Enum.map(columns || [], &to_string/1)
+
+  defp normalize_row_count(count) when is_integer(count) and count >= 0, do: count
+
+  defp normalize_row_count(_count),
+    do: raise(ArgumentError, "PostgreSQL result row count must be a nonnegative integer")
 
   defp normalize_error_category(code) when code in [:unique_violation, "23505"],
     do: :unique_violation

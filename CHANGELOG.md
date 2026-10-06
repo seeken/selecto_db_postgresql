@@ -4,6 +4,18 @@ CHANGES
 Unreleased
 ----------
 
+- Render canonical computed-value casts and JSON text extraction in the
+  PostgreSQL dialect, preserving SQL nulls, native cast targets and ordered
+  parameter markers. The optional callback accepts only the closed fragment
+  shape and supports publication before the corresponding Core upgrade.
+- Hex assembly uses an explicit metadata-only mode with the documented Core
+  version requirement, while standalone source verification keeps its immutable
+  Core Git pin.
+- Restore the existing Dialyzer gate by using the baseline Core order tuple in
+  benchmark queries and making absent-row normalization explicit. Valid query
+  results and affected-row counts retain their existing behavior; malformed
+  driver row counts fail before they enter portable result metadata.
+
 - `execute_write/3` and `execute_prepared_write/3` refuse a write without the
   `Selecto.Write.Authorization` the governed entry point (`SelectoUpdato`)
   issued for exactly that command, batch or graph, with `:ungoverned_write`
