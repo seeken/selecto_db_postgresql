@@ -154,8 +154,6 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
     end
   end
 
-  # Selecto.configure/3 unwraps a pool reference, so the adapter is called
-  # directly with the `{:pool, reference}` connection it accepts.
   test "a managed pool gets the same cap and abandons the statement", %{items: items, slow: slow} do
     pool_name = :"selecto_exec_timeout_pool_#{System.unique_integer([:positive])}"
 
@@ -187,6 +185,10 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
              Adapter.execute(pool, "SELECT * FROM #{slow}", [], timeout: 100)
 
     assert System.monotonic_time(:millisecond) - started < 900
+
+    assert {:ok, {rows, _columns, _aliases}} = execute(pool, items, Adapter)
+    assert length(rows) == 2000
+    assert_abandoned(fn -> execute(pool, slow, Adapter, timeout: 100) end)
   end
 
   test "an Ecto repository gets the shorter of the timeout and its configured timeout",
