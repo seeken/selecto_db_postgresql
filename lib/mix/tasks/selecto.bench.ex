@@ -306,7 +306,7 @@ defmodule Mix.Tasks.Selecto.Bench do
     selecto
     |> Selecto.select(["name", "email"])
     |> Selecto.filter([{"active", true}, {"name", {:case_insensitive_like, "A%"}}])
-    |> Selecto.order_by([{"name", :asc}])
+    |> Selecto.order_by([{:asc, "name"}])
   end
 
   defp joined_selecto_query(selecto) do
@@ -314,7 +314,7 @@ defmodule Mix.Tasks.Selecto.Bench do
     |> Selecto.select(["name", {:func, "count", ["posts.id"]}, {:func, "sum", ["posts.views"]}])
     |> Selecto.filter([{"active", true}, {"posts.published", true}])
     |> Selecto.group_by(["name"])
-    |> Selecto.order_by([{"name", :asc}])
+    |> Selecto.order_by([{:asc, "name"}])
     |> Selecto.limit(10)
   end
 

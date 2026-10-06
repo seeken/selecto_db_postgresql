@@ -43,6 +43,36 @@ defmodule SelectoDBPostgreSQL.AdapterTest do
     assert SelectoDBPostgreSQL.Adapter.normalize_type("custom_domain") == "custom_domain"
   end
 
+  test "execution results satisfy the portable row contract for absent and present rows" do
+    assert {:ok, %{rows: [], columns: [], num_rows: 0}} =
+             SelectoDBPostgreSQL.Adapter.normalize_execution_result(%{rows: nil, columns: nil})
+
+    assert {:ok, %{rows: [[1]], columns: ["id"], num_rows: 1}} =
+             SelectoDBPostgreSQL.Adapter.normalize_execution_result(%{
+               rows: [[1]],
+               columns: [:id]
+             })
+
+    assert {:ok, %{rows: [], num_rows: 3}} =
+             SelectoDBPostgreSQL.Adapter.normalize_execution_result(%{
+               rows: nil,
+               columns: nil,
+               num_rows: 3
+             })
+  end
+
+  test "malformed driver row counts fail instead of entering portable result metadata" do
+    for count <- [nil, -1, "3"] do
+      assert_raise ArgumentError, ~r/row count must be a nonnegative integer/, fn ->
+        SelectoDBPostgreSQL.Adapter.normalize_execution_result(%{
+          rows: [],
+          columns: [],
+          num_rows: count
+        })
+      end
+    end
+  end
+
   test "core coercion consumes adapter-normalized native type evidence" do
     assert Selecto.Output.TypeCoercion.coerce_value(
              "42",

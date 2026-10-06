@@ -23,6 +23,96 @@ defmodule SelectoDBPostgreSQL.Dialect do
     Operation
   }
 
+  @computed_cast_types %{
+    "string" => "TEXT",
+    "integer" => "BIGINT",
+    "decimal" => "NUMERIC",
+    "boolean" => "BOOLEAN",
+    "date" => "DATE",
+    "utc_datetime" => "TIMESTAMPTZ"
+  }
+
+  # Older Core pins do not declare this optional callback. A module-tagged map
+  # with the exact fragment shape lets this companion ship before newer Core.
+  if {:render_computed_value, 2} in Selecto.DB.Dialect.behaviour_info(:callbacks) do
+    @impl true
+  end
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :cast,
+          expression: expression,
+          type: type,
+          path: []
+        } = fragment,
+        _selecto
+      )
+      when map_size(fragment) == 5 do
+    with {:ok, target} <- Map.fetch(@computed_cast_types, type),
+         true <- computed_expression?(expression) do
+      {:ok, ["CAST(", expression, " AS ", target, ")"]}
+    else
+      _ -> invalid_computed_value(:cast)
+    end
+  end
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :json_text,
+          expression: expression,
+          type: nil,
+          path: [_ | _] = path
+        } = fragment,
+        _selecto
+      )
+      when map_size(fragment) == 5 do
+    if computed_expression?(expression) and Enum.all?(path, &computed_path_marker?/1) do
+      {:ok,
+       [
+         "JSONB_EXTRACT_PATH_TEXT(CAST(",
+         expression,
+         " AS JSONB), ",
+         Enum.intersperse(path, ", "),
+         ")"
+       ]}
+    else
+      invalid_computed_value(:json_text)
+    end
+  end
+
+  def render_computed_value(_fragment, _selecto), do: invalid_computed_value(:unknown)
+
+  defp computed_expression?(expression),
+    do: computed_sql?(expression) and computed_sql_present?(expression)
+
+  defp computed_sql?(value) when is_binary(value), do: true
+  defp computed_sql?(value) when is_integer(value), do: value in 0..255
+  defp computed_sql?({:param, _value}), do: true
+  defp computed_sql?(value) when is_list(value), do: Enum.all?(value, &computed_sql?/1)
+  defp computed_sql?(_value), do: false
+
+  defp computed_sql_present?(value) when is_binary(value), do: byte_size(value) > 0
+
+  defp computed_sql_present?(value) when is_list(value),
+    do: Enum.any?(value, &computed_sql_present?/1)
+
+  defp computed_sql_present?(_value), do: true
+
+  defp computed_path_marker?({:param, segment}) when is_binary(segment),
+    do: Regex.match?(~r/\A[A-Za-z0-9_]+\z/, segment)
+
+  defp computed_path_marker?(_marker), do: false
+
+  defp invalid_computed_value(operation) do
+    {:error,
+     Selecto.Error.validation_error("Invalid PostgreSQL computed-value fragment", %{
+       operation: operation,
+       unsupported_feature: :computed_value
+     })}
+  end
+
   @impl true
   def render_interval(%Selecto.Dialect.Interval{amount: amount, unit: unit}, _selecto) do
     {:ok, ["interval '", Integer.to_string(amount), " ", Atom.to_string(unit), "'"]}

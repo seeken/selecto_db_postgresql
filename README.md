@@ -32,6 +32,17 @@ are complementary to the PostgreSQL matrix; their exact state spaces and
 guarantees are documented in
 [`docs/formal_verification.md`](docs/formal_verification.md).
 
+Standalone source verification retains the immutable Core Git reference in
+`mix.exs` and `mix.lock`. Assemble Hex package metadata separately with:
+
+```sh
+SELECTO_ECOSYSTEM_USE_LOCAL=0 SELECTO_HEX_PACKAGE_BUILD=1 mix hex.build
+```
+
+This assembly-only mode records the documented Core Hex version requirement,
+since Hex packages cannot depend on Git sources. It does not change the source
+verification pin or publish either package to a registry.
+
 ## Usage
 
 Pass the adapter explicitly when configuring Selecto:
@@ -108,6 +119,20 @@ SELECTO_ECOSYSTEM_USE_LOCAL=1 mise exec -- mix test \
 
 Passing those fixtures is `:controlled_live_fixture` evidence for the enumerated
 synthetic cases. It is not proof about arbitrary functions or inputs.
+
+## Computed-value compatibility
+
+The optional dialect callback `render_computed_value/2` renders the canonical
+cast types and bound JSON text paths delegated by newer Core. It preserves
+PostgreSQL cast targets, parameter ordering and SQL null behavior and rejects
+unknown operations, targets and malformed fragment shapes.
+
+Install the adapter implementation containing this callback before upgrading
+Core to the adapter-owned computed-value compiler. Older Core pins continue to
+compile with this adapter and keep their existing behavior. Older adapter commits
+without the callback remain usable for ordinary queries, but newer Core refuses
+computed casts and JSON text extraction through them. No additional adapter or
+portable certification profile is claimed.
 
 ## Notes
 
