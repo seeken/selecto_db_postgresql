@@ -6,69 +6,110 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   ELIXIR_VERSION: "1.20.0"
-  OTP_VERSION: "29.0"
+  OTP_VERSION: "29.0.2"
   SELECTO_ECOSYSTEM_USE_LOCAL: "1"
   SELECTO_ECOSYSTEM_SELECTO_PATH: "selecto"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   quality:
     name: Test and quality
-    runs-on: ubuntu-latest
-
+    runs-on: [self-hosted, beep-vm]
+    timeout-minutes: 45
     steps:
       - name: Checkout PostgreSQL adapter
-        uses: actions/checkout@v4
-
-      - name: Checkout coordinated Selecto
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: seeken/selecto
-          ref: a596b3421898899d4cd6552550e7e5d4df8f05b7
-          path: selecto
+          persist-credentials: false
 
       - name: Set up Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
+          version-type: strict
 
-      - name: Cache dependencies and PLT
-        uses: actions/cache@v4
+      - name: Initialize bounded evidence and read-only source access
+        id: core
+        run: |
+          mkdir -p ci-reports
+          rm -f ci-reports/*.json
+          ci/run initialize ci-reports
+
+      - name: Check source and evidence boundaries
+        run: |
+          python3 -m unittest discover -s ci -p 'test_*.py'
+          elixir ci/source_refs_test.exs
+          sh -n ci/run ci/configure-git ci/checkout-core
+
+      - name: Checkout declared immutable Core
+        run: ci/run checkout ci-reports
+
+      - name: Cache dependency sources and PLT
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
+          # Never restore compiled sibling beams from the old a596 checkout.
           path: |
             deps
-            _build
             priv/plts
-          key: ${{ runner.os }}-postgresql-adapter-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.exs', 'mix.lock', 'selecto/mix.exs', 'selecto/mix.lock') }}
+          key: ${{ runner.os }}-postgresql-adapter-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ steps.core.outputs.ref }}-${{ hashFiles('mix.exs', 'mix.lock', 'selecto/mix.exs', 'selecto/mix.lock') }}
 
       - name: Install locked dependencies
-        run: mix deps.get --locked
-
+        run: ci/run dependencies ci-reports
       - name: Run precommit gates
-        run: mix precommit
-
+        run: ci/run precommit ci-reports
       - name: Generate strict documentation
-        run: mix docs --warnings-as-errors
-
+        run: ci/run docs ci-reports
       - name: Run Dialyzer
-        run: mix dialyzer
-
+        run: ci/run dialyzer ci-reports
       - name: Verify Hex package contents
-        run: SELECTO_ECOSYSTEM_USE_LOCAL=0 SELECTO_HEX_PACKAGE_BUILD=1 mix hex.build
+        run: ci/run package ci-reports
+      - name: Record actual runtime and loaded source revisions
+        run: ci/run diagnostics ci-reports
+
+      - name: Upload bounded quality evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: postgresql-quality-${{ github.run_attempt }}
+          path: ci-reports
+          if-no-files-found: error
 
   postgres-live:
     name: PostgreSQL ${{ matrix.postgres-version }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beep-vm]
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        postgres-version: ["13", "14", "15", "16", "17", "18"]
-
+        include:
+          - postgres-version: "13"
+            postgres-image: "docker.io/library/postgres:13@sha256:4689940c683801b4ab839ab3b0a0a3555a5fe425371422310944e89eca7d8068"
+          - postgres-version: "14"
+            postgres-image: "docker.io/library/postgres:14@sha256:ceef4a62198b562d6fe3e51be67362f72a0abf0aaa255f54f0c0e55be9768ed2"
+          - postgres-version: "15"
+            postgres-image: "docker.io/library/postgres:15@sha256:7e2070cf6ad06fb3cbbd141b1bafbb7fd5bb63e2b6001e6daf34448eb555e4b3"
+          - postgres-version: "16"
+            postgres-image: "docker.io/library/postgres:16@sha256:65b16a8b326e0cfbdf33fa7e783f2a0cb352a61448616ccccfd616ef42aa0f65"
+          - postgres-version: "17"
+            postgres-image: "docker.io/library/postgres:17@sha256:ae69c452f483507a6b99fb654cf93aad7fe156ffd2c56247707eef4e36d3c12b"
+          - postgres-version: "18"
+            postgres-image: "docker.io/library/postgres:18@sha256:fc973eb97c9fd04bfa1840e0f510719a584ccb3be8debfe6a4144637a9dfe8cf"
     services:
       postgres:
-        image: postgres:${{ matrix.postgres-version }}
+        image: ${{ matrix.postgres-image }}
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -78,30 +119,45 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-
+    env:
+      SELECTO_POSTGRES_TEST_HOST: "127.0.0.1"
+      SELECTO_POSTGRES_TEST_PORT: "5432"
+      SELECTO_POSTGRES_TEST_USER: "postgres"
+      SELECTO_POSTGRES_TEST_PASSWORD: "postgres"
+      SELECTO_POSTGRES_TEST_DATABASE: "postgres"
     steps:
       - name: Checkout PostgreSQL adapter
-        uses: actions/checkout@v4
-
-      - name: Checkout coordinated Selecto
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: seeken/selecto
-          ref: a596b3421898899d4cd6552550e7e5d4df8f05b7
-          path: selecto
+          persist-credentials: false
 
       - name: Set up Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
+          version-type: strict
 
-      - name: Install locked dependencies
-        run: mix deps.get --locked
-
-      - name: Run live adapter suite
-        env:
-          SELECTO_POSTGRES_TEST_URL: postgres://postgres:postgres@localhost:5432/postgres
+      - name: Initialize bounded evidence and read-only source access
         run: |
-          mix test --include postgres
-          mix selecto_db_postgresql.verify_sql
+          mkdir -p ci-reports
+          rm -f ci-reports/*.json
+          ci/run initialize ci-reports
+      - name: Checkout declared immutable Core
+        run: ci/run checkout ci-reports
+      - name: Install locked dependencies
+        run: ci/run dependencies ci-reports
+      - name: Run complete live adapter suite
+        run: ci/run live ci-reports
+      - name: Run bounded live relational differentials
+        run: ci/run verify_sql ci-reports
+      - name: Record actual runtime, loaded sources and server
+        run: ci/run diagnostics ci-reports "${{ matrix.postgres-version }}"
+
+      - name: Upload bounded live evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: postgresql-${{ matrix.postgres-version }}-${{ github.run_attempt }}
+          path: ci-reports
+          if-no-files-found: error

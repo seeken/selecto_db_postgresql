@@ -9,3 +9,8 @@ selecto_db_postgresql-*.tar
 
 .expert/
 .DS_Store
+
+# Disposable CI sibling checkout and bounded reports; each source is attested.
+/selecto/
+/ci-reports/
+/ci/__pycache__/

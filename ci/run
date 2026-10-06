@@ -1,0 +1,68 @@
+#!/bin/sh
+set -eu
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+stage=${1:-}
+case "$stage" in initialize|checkout|dependencies|precommit|docs|dialyzer|package|live|verify_sql|diagnostics) ;; *)
+  echo 'Usage: ci/run STAGE OUTPUT [POSTGRES_MAJOR]' >&2; exit 64 ;;
+esac
+output=${2:?bounded report directory required}
+mkdir -p "$output"
+output=$(CDPATH= cd -- "$output" && pwd)
+raw=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/selecto-postgresql-ci.XXXXXX")
+auxiliary=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/selecto-postgresql-proof.XXXXXX")
+phase=command
+cd "$repo_dir"
+export SELECTO_ECOSYSTEM_USE_LOCAL=1 SELECTO_ECOSYSTEM_SELECTO_PATH=selecto
+unset SELECTO_POSTGRES_TEST_URL
+case "$stage" in docs|dialyzer|package) export MIX_ENV=dev ;; *) export MIX_ENV=test ;; esac
+rm -f "$output/$stage.json"
+cleanup() {
+  result=$?
+  trap - EXIT
+  if [ "$result" -ne 0 ]; then
+    rm -f "$output/$stage.json"
+    python3 ci/evidence.py failure "$stage" "$raw" "$output/$stage.json" "$result" "$phase" || :
+    echo "Mandatory PostgreSQL CI $stage failed; safe stage report retained." >&2
+  fi
+  rm -f "$raw" "$auxiliary"
+  exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+case "$stage" in
+  initialize)
+    {
+      command -v selecto-ci-checkout
+      ci/configure-git
+      elixir ci/core_ref.exs
+    } > "$raw" 2>&1 ;;
+  checkout) ci/checkout-core > "$raw" 2>&1 ;;
+  dependencies) mix deps.get --locked > "$raw" 2>&1 ;;
+  precommit) mix precommit > "$raw" 2>&1 ;;
+  docs) mix docs --warnings-as-errors > "$raw" 2>&1 ;;
+  dialyzer) mix dialyzer > "$raw" 2>&1 ;;
+  package)
+    # Remove only this project's owned assembly outputs in the disposable checkout.
+    for archive in selecto_db_postgresql-*.tar; do
+      [ ! -e "$archive" ] || rm -f -- "$archive"
+    done
+    SELECTO_ECOSYSTEM_USE_LOCAL=0 SELECTO_HEX_PACKAGE_BUILD=1 mix hex.build > "$raw" 2>&1
+    set -- selecto_db_postgresql-*.tar
+    if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then exit 1; fi
+    package="$1" ;;
+  live) mix test --include postgres > "$raw" 2>&1 ;;
+  verify_sql) mix selecto_db_postgresql.verify_sql --output "$auxiliary" > "$raw" 2>&1 ;;
+  diagnostics)
+    if [ -n "${3:-}" ]; then export CI_POSTGRES_MAJOR="$3"; else unset CI_POSTGRES_MAJOR; fi
+    export CI_DIAGNOSTICS_PATH="$output/diagnostics.json"
+    mix run --no-compile ci/diagnostics.exs > "$raw" 2>&1
+    echo 'Actual runtime, clean loaded sources and selected server identity verified.'
+    exit 0 ;;
+esac
+phase=evidence_validation
+case "$stage" in
+  verify_sql) python3 ci/evidence.py summary "$stage" "$raw" "$output/$stage.json" "$auxiliary" ;;
+  package) python3 ci/evidence.py summary "$stage" "$raw" "$output/$stage.json" "$package" ;;
+  *) python3 ci/evidence.py summary "$stage" "$raw" "$output/$stage.json" ;;
+esac

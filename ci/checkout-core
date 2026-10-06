@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_dir"
+ref=$(elixir ci/core_ref.exs)
+test ! -e selecto
+# The installed helper's optional REF is a branch/tag, not a commit SHA.
+# Clone the default branch, then fetch the validated immutable commit explicitly.
+selecto-ci-checkout seeken/selecto selecto
+git -C selecto fetch --quiet --no-tags --depth 1 origin "$ref"
+git -C selecto -c advice.detachedHead=false checkout --quiet --detach "$ref"
+test "$(git -C selecto rev-parse HEAD)" = "$ref"
+test -z "$(git -C selecto status --porcelain)"
+printf 'Coordinated Core source: %s\n' "$ref"
