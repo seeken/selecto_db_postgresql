@@ -1527,12 +1527,16 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @server_version_num_query "show server_version_num"
 
+  # Postgrex keeps the `server_version` the server reports when a connection
+  # starts (and again after a reconnect), so a live Postgrex connection's major
+  # version is read without a round trip. Each write checks capabilities
+  # (twice for a governed one) and configure resolves rollup_sort_fix from it,
+  # so querying `server_version_num` every time cost a round trip per check.
+  # Connections Postgrex does not manage (Ecto repositories, modules with
+  # `query/2`, generic pools) still run the query.
   @impl true
   def server_version_major(connection) do
-    case fetch_server_version_num(connection) do
-      {:ok, version_num} -> {:ok, div(version_num, 10_000)}
-      {:error, _reason} = error -> error
-    end
+    fetch_server_version_major(connection)
   end
 
   @impl true
@@ -2816,44 +2820,38 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp fetch_server_version_num({:pool, pool_ref}) do
-    try do
-      case Selecto.ConnectionPool.execute(pool_ref, @server_version_num_query, [],
-             prepared: false
-           ) do
-        {:ok, result} -> extract_server_version_num(result)
-        {:error, _reason} = error -> error
-      end
-    catch
-      :exit, _reason -> {:error, :pool_unavailable}
+  defp fetch_server_version_major({:pool, pool_ref}) do
+    case resolve_live_pool_pid(pool_ref) do
+      {:ok, pool_pid} -> postgrex_server_version_major(pool_pid)
+      {:error, _reason} -> query_pool_server_version_major(pool_ref)
     end
   end
 
-  defp fetch_server_version_num(connection) when is_atom(connection) do
+  defp fetch_server_version_major(connection) when is_atom(connection) do
     cond do
       function_exported?(connection, :query, 2) ->
         case apply(connection, :query, [@server_version_num_query, []]) do
-          {:ok, result} -> extract_server_version_num(result)
+          {:ok, result} -> extract_server_version_major(result)
           {:error, _reason} = error -> error
           _other -> {:error, :invalid_query_result}
         end
 
       is_pid(Process.whereis(connection)) ->
-        fetch_server_version_num_with_postgrex(connection)
+        postgrex_server_version_major(connection)
 
       true ->
         {:error, :unsupported_connection}
     end
   end
 
-  defp fetch_server_version_num(connection) when is_pid(connection) do
-    fetch_server_version_num_with_postgrex(connection)
+  defp fetch_server_version_major(connection) when is_pid(connection) do
+    postgrex_server_version_major(connection)
   end
 
-  defp fetch_server_version_num(connection) when is_list(connection) do
+  defp fetch_server_version_major(connection) when is_list(connection) do
     case Postgrex.start_link(Keyword.put_new(connection, :supervisor, false)) do
       {:ok, pid} ->
-        result = fetch_server_version_num_with_postgrex(pid)
+        result = postgrex_server_version_major(pid)
         GenServer.stop(pid)
         result
 
@@ -2862,25 +2860,85 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp fetch_server_version_num(%DBConnection{} = connection) do
-    fetch_server_version_num_with_postgrex(connection)
+  defp fetch_server_version_major(%DBConnection{} = connection) do
+    postgrex_server_version_major(connection)
   end
 
-  defp fetch_server_version_num(connection) when is_map(connection) do
+  defp fetch_server_version_major(connection) when is_map(connection) do
     connection
     |> Map.to_list()
-    |> fetch_server_version_num()
+    |> fetch_server_version_major()
   end
 
-  defp fetch_server_version_num(_connection), do: {:error, :unsupported_connection}
+  defp fetch_server_version_major(_connection), do: {:error, :unsupported_connection}
 
-  defp fetch_server_version_num_with_postgrex(connection) do
+  defp query_pool_server_version_major(pool_ref) do
+    try do
+      case Selecto.ConnectionPool.execute(pool_ref, @server_version_num_query, [],
+             prepared: false
+           ) do
+        {:ok, result} -> extract_server_version_major(result)
+        {:error, _reason} = error -> error
+      end
+    catch
+      :exit, _reason -> {:error, :pool_unavailable}
+    end
+  end
+
+  # A connection that cannot be checked out fails here as the query would, so
+  # it is not retried; only a missing or unrecognised `server_version` falls
+  # back to asking the server.
+  defp postgrex_server_version_major(connection) do
+    case cached_server_version_major(connection) do
+      {:ok, major} -> {:ok, major}
+      :unknown -> query_postgrex_server_version_major(connection)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp cached_server_version_major(connection) do
+    connection
+    |> Postgrex.parameters()
+    |> Map.get("server_version")
+    |> parse_server_version_major()
+  rescue
+    exception in Postgrex.Error ->
+      if exception.message == "parameters not available", do: :unknown, else: {:error, exception}
+
+    exception ->
+      {:error, exception}
+  catch
+    :exit, _reason -> {:error, :query_failed}
+  end
+
+  # `server_version` is `<major>.<minor>` from PostgreSQL 10 (`<major>devel`,
+  # `<major>beta1` and the like before release, often followed by a
+  # distribution suffix) and `9.<minor>.<patch>` before it, so its leading
+  # integer is `server_version_num` divided by 10,000.
+  @doc false
+  def parse_server_version_major(version) when is_binary(version) do
+    case Integer.parse(version) do
+      {major, _rest} when major > 0 -> {:ok, major}
+      _ -> :unknown
+    end
+  end
+
+  def parse_server_version_major(_version), do: :unknown
+
+  defp query_postgrex_server_version_major(connection) do
     case Postgrex.query(connection, @server_version_num_query, []) do
-      {:ok, result} -> extract_server_version_num(result)
+      {:ok, result} -> extract_server_version_major(result)
       {:error, _reason} = error -> error
     end
   rescue
     _ -> {:error, :query_failed}
+  end
+
+  defp extract_server_version_major(result) do
+    case extract_server_version_num(result) do
+      {:ok, version_num} -> {:ok, div(version_num, 10_000)}
+      {:error, _reason} = error -> error
+    end
   end
 
   defp extract_server_version_num(%{rows: [[value | _] | _]}) do
