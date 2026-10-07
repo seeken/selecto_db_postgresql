@@ -8,6 +8,23 @@ defmodule SelectoDBPostgreSQL.Adapter do
   (`:ungoverned_write`). `execute_write_unsafe/3` and
   `execute_prepared_write_unsafe/3` skip that check and exist for trusted
   tooling and adapter tests only.
+
+  ## Prepared statements
+
+  By default Postgrex prepares every statement unnamed, which costs two
+  round trips per statement (Parse/Describe, then Bind/Execute). Opting in
+  prepares each statement once per connection under a name, so later
+  executions take one round trip, as Ecto's default `prepare: :named` does:
+
+      config :selecto_db_postgresql, statement_cache: true   # 256 names
+      config :selecto_db_postgresql, statement_cache: 1024
+
+  A name is a hash slot of the SQL, so each connection holds at most that
+  many prepared statements however many query shapes are built; two shapes
+  sharing a slot replace each other. Named statements need a server session
+  per connection, so leave this off behind a transaction-mode pooler
+  (PgBouncer before 1.21, or without `max_prepared_statements`). Ecto
+  repository connections keep the repository's own `:prepare` setting.
   """
 
   @behaviour Selecto.DB.Adapter
@@ -1814,7 +1831,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp query_postgrex(connection, query, params, opts) do
-    case Postgrex.query(connection, normalize_query(query), params, opts) do
+    statement = normalize_query(query)
+
+    case Postgrex.query(connection, statement, params, statement_cache_opts(statement, opts)) do
       {:ok, result} -> {:ok, normalize_result(result)}
       {:error, reason} -> {:error, reason}
     end
@@ -1822,6 +1841,51 @@ defmodule SelectoDBPostgreSQL.Adapter do
     exception -> {:error, {:query_exception, exception.__struct__, Exception.message(exception)}}
   catch
     :exit, reason -> {:error, {:connection_exit, reason}}
+  end
+
+  @default_statement_cache_slots 256
+
+  @doc false
+  # Postgrex options for one statement under the `:statement_cache` setting.
+  #
+  # Off (the default), Postgrex prepares every statement unnamed, which costs
+  # two round trips: Parse/Describe, then Bind/Execute. On, the statement is
+  # prepared once per connection under a name and later executions send only
+  # Bind/Execute, one round trip, as Ecto's default `prepare: :named` does.
+  # The name is a hash slot of the SQL, so each connection holds at most
+  # `slots` prepared statements however many query shapes the application
+  # builds; two shapes sharing a slot replace each other (Postgrex compares
+  # the statement text). A statement with a `:comment`, its own
+  # `:cache_statement`, or `prepared: false` (introspection) stays unnamed.
+  #
+  #     config :selecto_db_postgresql, statement_cache: true   # 256 slots
+  #     config :selecto_db_postgresql, statement_cache: 1024
+  #
+  # Named statements need a session per connection: a transaction-mode
+  # connection pooler (PgBouncer before 1.21, or without
+  # max_prepared_statements) cannot use them.
+  def statement_cache_opts(statement, opts) do
+    case statement_cache_slots() do
+      0 ->
+        opts
+
+      slots ->
+        if Keyword.has_key?(opts, :comment) or Keyword.has_key?(opts, :cache_statement) or
+             Keyword.get(opts, :prepared) == false do
+          opts
+        else
+          name = "selecto_" <> Integer.to_string(:erlang.phash2(statement, slots))
+          Keyword.put(opts, :cache_statement, name)
+        end
+    end
+  end
+
+  defp statement_cache_slots do
+    case Application.get_env(:selecto_db_postgresql, :statement_cache, false) do
+      true -> @default_statement_cache_slots
+      slots when is_integer(slots) and slots > 0 -> slots
+      _off -> 0
+    end
   end
 
   defp introspection_query(connection, query, params) do
@@ -2403,7 +2467,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       if cache_key do
         execute_with_prepared_cache(pool_pid, query, params, cache_key, query_opts)
       else
-        Postgrex.query(pool_pid, query, params, query_opts)
+        Postgrex.query(pool_pid, query, params, statement_cache_opts(query, query_opts))
       end
     rescue
       e ->
@@ -2420,7 +2484,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_with_prepared_cache(pool_pid, query, params, cache_key, query_opts) do
     case Selecto.ConnectionPool.prepared_statement_cached?(pool_pid, cache_key) do
       false ->
-        result = Postgrex.query(pool_pid, query, params, query_opts)
+        result = Postgrex.query(pool_pid, query, params, statement_cache_opts(query, query_opts))
 
         if match?({:ok, _}, result) do
           Selecto.ConnectionPool.mark_prepared_statement(pool_pid, cache_key)
@@ -2429,7 +2493,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         result
 
       true ->
-        Postgrex.query(pool_pid, query, params, query_opts)
+        Postgrex.query(pool_pid, query, params, statement_cache_opts(query, query_opts))
     end
   end
 
