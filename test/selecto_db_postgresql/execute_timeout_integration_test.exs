@@ -292,7 +292,11 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
       trace_calls({Postgrex, :query, 4}, fn -> Adapter.execute(conn, "SELECT 1", [], []) end)
 
     assert {:ok, %{rows: [[1]]}} = result
-    assert [[^conn, "SELECT 1", [], []]] = calls
+    assert [[^conn, "SELECT 1", [], opts]] = calls
+    refute Keyword.has_key?(opts, :timeout)
+    refute Keyword.has_key?(opts, :deadline)
+    # The statement cache's name (on by default) is the only option added.
+    assert opts == Adapter.statement_cache_opts("SELECT 1", [])
   end
 
   defp start_repo(config) do

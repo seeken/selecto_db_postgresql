@@ -11,19 +11,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   ## Prepared statements
 
-  By default Postgrex prepares every statement unnamed, which costs two
-  round trips per statement (Parse/Describe, then Bind/Execute). Opting in
-  prepares each statement once per connection under a name, so later
-  executions take one round trip, as Ecto's default `prepare: :named` does:
+  By default the adapter prepares each statement once per connection under a
+  name, so later executions take one round trip (Bind/Execute), as Ecto's
+  default `prepare: :named` does. The default keeps 256 names per
+  connection; set another count, or turn it off:
 
-      config :selecto_db_postgresql, statement_cache: true   # 256 names
       config :selecto_db_postgresql, statement_cache: 1024
+      config :selecto_db_postgresql, statement_cache: false   # or 0
+
+  Off, Postgrex prepares every statement unnamed, which costs two round trips
+  per statement (Parse/Describe, then Bind/Execute).
 
   A name is a hash slot of the SQL, so each connection holds at most that
   many prepared statements however many query shapes are built; two shapes
   sharing a slot replace each other. Named statements need a server session
-  per connection, so leave this off behind a transaction-mode pooler
-  (PgBouncer before 1.21, or without `max_prepared_statements`). Ecto
+  per connection, so set `statement_cache: false` behind a transaction-mode
+  pooler (PgBouncer before 1.21, or without `max_prepared_statements`). Ecto
   repository connections keep the repository's own `:prepare` setting.
   """
 
@@ -1848,22 +1851,23 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @doc false
   # Postgrex options for one statement under the `:statement_cache` setting.
   #
-  # Off (the default), Postgrex prepares every statement unnamed, which costs
-  # two round trips: Parse/Describe, then Bind/Execute. On, the statement is
-  # prepared once per connection under a name and later executions send only
-  # Bind/Execute, one round trip, as Ecto's default `prepare: :named` does.
+  # On (the default, 256 slots), the statement is prepared once per
+  # connection under a name and later executions send only Bind/Execute, one
+  # round trip, as Ecto's default `prepare: :named` does. Off (`false` or
+  # `0`), Postgrex prepares every statement unnamed, which costs two round
+  # trips: Parse/Describe, then Bind/Execute.
   # The name is a hash slot of the SQL, so each connection holds at most
   # `slots` prepared statements however many query shapes the application
   # builds; two shapes sharing a slot replace each other (Postgrex compares
   # the statement text). A statement with a `:comment`, its own
   # `:cache_statement`, or `prepared: false` (introspection) stays unnamed.
   #
-  #     config :selecto_db_postgresql, statement_cache: true   # 256 slots
   #     config :selecto_db_postgresql, statement_cache: 1024
+  #     config :selecto_db_postgresql, statement_cache: false   # or 0
   #
   # Named statements need a session per connection: a transaction-mode
   # connection pooler (PgBouncer before 1.21, or without
-  # max_prepared_statements) cannot use them.
+  # max_prepared_statements) cannot use them, so turn it off there.
   def statement_cache_opts(statement, opts) do
     case statement_cache_slots() do
       0 ->
@@ -1881,7 +1885,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp statement_cache_slots do
-    case Application.get_env(:selecto_db_postgresql, :statement_cache, false) do
+    case Application.get_env(:selecto_db_postgresql, :statement_cache, true) do
       true -> @default_statement_cache_slots
       slots when is_integer(slots) and slots > 0 -> slots
       _off -> 0

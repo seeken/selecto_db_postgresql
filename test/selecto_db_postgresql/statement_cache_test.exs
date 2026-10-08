@@ -1,6 +1,6 @@
 defmodule SelectoDBPostgreSQL.StatementCacheTest do
   @moduledoc """
-  The opt-in `:statement_cache` setting: statements are prepared once per
+  The `:statement_cache` setting (on by default): statements are prepared once per
   connection under a hash-slot name, so a repeated statement costs one round
   trip (Bind/Execute) instead of two (Parse/Describe, then Bind/Execute).
 
@@ -26,11 +26,17 @@ defmodule SelectoDBPostgreSQL.StatementCacheTest do
   end
 
   describe "statement_cache_opts/2" do
-    test "leaves options alone when the cache is off (the default)" do
+    test "is on (256 slots) by default" do
       Application.delete_env(:selecto_db_postgresql, :statement_cache)
-      assert Adapter.statement_cache_opts("SELECT 1", timeout: 5) == [timeout: 5]
 
-      for off <- [false, nil, 0, -1, :yes] do
+      assert Adapter.statement_cache_opts("SELECT 1", timeout: 5) == [
+               cache_statement: "selecto_#{:erlang.phash2("SELECT 1", 256)}",
+               timeout: 5
+             ]
+    end
+
+    test "leaves options alone when the cache is off (false or 0)" do
+      for off <- [false, 0, nil, -1, :yes] do
         Application.put_env(:selecto_db_postgresql, :statement_cache, off)
         assert Adapter.statement_cache_opts("SELECT 1", []) == []
       end
@@ -88,8 +94,8 @@ defmodule SelectoDBPostgreSQL.StatementCacheTest do
       end
     end
 
-    test "on, a repeated statement takes one round trip", %{conn: conn} do
-      Application.put_env(:selecto_db_postgresql, :statement_cache, true)
+    test "by default (on), a repeated statement takes one round trip", %{conn: conn} do
+      Application.delete_env(:selecto_db_postgresql, :statement_cache)
 
       {first, frames} = socket_frames(fn -> Adapter.execute(conn, "SELECT $1::int", [7], []) end)
       assert {:ok, %{rows: [[7]], columns: ["int4"]}} = first

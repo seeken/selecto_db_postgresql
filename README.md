@@ -54,6 +54,27 @@ selecto =
   )
 ```
 
+## Prepared statements (on by default)
+
+The adapter prepares each statement once per Postgrex connection under a
+name, so later executions take one round trip (Bind/Execute) instead of two
+(Parse/Describe, then Bind/Execute), as Ecto's default `prepare: :named`
+does. A name is a hash slot of the SQL (256 slots by default), so each
+connection holds at most that many prepared statements however many query
+shapes are built. Set another slot count, or turn it off so Postgrex
+prepares every statement unnamed:
+
+```elixir
+config :selecto_db_postgresql, statement_cache: 1024
+config :selecto_db_postgresql, statement_cache: false   # or 0
+```
+
+Behind a transaction-mode connection pooler (PgBouncer before 1.21, or 1.21+
+without `max_prepared_statements`) named statements do not work, since they
+need a server session per connection: set `statement_cache: false`. Ecto
+repository connections keep the repository's own `:prepare` setting, and
+introspection and function verification stay unnamed.
+
 ## Connected database-function verification
 
 The adapter advertises Selecto's `:function_verification` capability. Given a

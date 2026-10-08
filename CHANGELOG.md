@@ -4,6 +4,16 @@ CHANGES
 Unreleased
 ----------
 
+- Changed (default): the statement cache is now on by default
+  (`config :selecto_db_postgresql, statement_cache: true`, 256 hash-slot
+  names per connection), so each statement is prepared once per Postgrex
+  connection and later executions take one round trip instead of two. Opt
+  out with `config :selecto_db_postgresql, statement_cache: false` (or `0`),
+  which prepares every statement unnamed as before. Set the opt-out behind a
+  transaction-mode pooler: PgBouncer before 1.21, or without
+  `max_prepared_statements`, cannot run named statements. Ecto repository
+  connections keep the repository's own `:prepare` setting.
+
 - Lock Postgrex to 0.22.4, including the streaming comment and notification
   reconnect security fixes (CVE-2026-66838 and CVE-2026-58225). The existing
   channel-name fix and immutable Core dependency remain in place.
