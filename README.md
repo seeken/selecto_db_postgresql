@@ -178,6 +178,29 @@ unchanged. `execute_write_unsafe/3` and `execute_prepared_write_unsafe/3` skip
 that check; they exist for trusted tooling and this package's own tests, never
 for application code.
 
+### Post-image check and its operational limits
+
+A write bound to a tenant or trusted scope (`metadata.post_image`, set by
+`SelectoUpdato`) is re-read by key after its statement, inside the same
+transaction, and rolled back unless every written row is still inside the
+scope. The check refuses (`query_rule_not_evaluable`) whatever it cannot see
+through:
+
+- **Any enabled deferrable trigger anywhere in the database refuses every
+  bound-scope write.** A deferred trigger fires at commit, after the check,
+  and can sit on any table a row trigger writes to. This is the accepted
+  cross-runtime choice and is deliberately not narrowed to the written
+  table: a database that needs deferrable constraint triggers cannot take
+  scoped writes through Selecto. Disable them (`ALTER TABLE ... DISABLE
+  TRIGGER`) or keep them in another database.
+- Statement-level triggers and rewrite rules for the event on the table or
+  any of its partitions, views, tables with inheritance (non-partition)
+  children, and keys that are not an immediate, valid, non-partial unique
+  index over NOT NULL columns.
+- A transaction that is not READ COMMITTED: the catalog checks run after the
+  DML and need a fresh statement snapshot to see a trigger committed while
+  the write waited on a row lock.
+
 ## Atomic write graphs and MERGE
 
 The adapter executes `Selecto.Write.Graph` inside one native transaction. It

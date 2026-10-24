@@ -4,6 +4,14 @@ CHANGES
 Unreleased
 ----------
 
+- TW-09 post-image: a bound-scope write in a transaction that is not READ
+  COMMITTED is refused (`query_rule_not_evaluable`); the after-DML catalog
+  check needs a fresh snapshot to see a trigger committed while the write
+  waited on a row lock (race test added).
+- Operational limitation (documented in the README): any enabled deferrable
+  trigger anywhere in the database refuses every bound-scope write. This is
+  the accepted cross-runtime choice and is not narrowed.
+
 - TW-09 post-image: guarded upserts are re-read like inserts. Refused as
   well (`query_rule_not_evaluable`): any enabled deferrable trigger in the
   database (it fires at commit, after the check), statement triggers and
