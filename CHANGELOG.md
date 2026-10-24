@@ -4,6 +4,11 @@ CHANGES
 Unreleased
 ----------
 
+- A bound-scope DELETE (graph delete-missing cleanups included) is also
+  refused, before and after its statement, while any enabled non-internal
+  deferrable trigger exists in the database, as for inserts, updates and
+  upserts (w3exrev17 HIGH 2).
+
 - Savepoint names carry a random nonce, so a host savepoint can never share
   one (w3exp5 item 20). README: row-level triggers that modify other rows are
   allowed and are the schema owner's responsibility; statement-level

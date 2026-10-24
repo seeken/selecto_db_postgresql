@@ -508,6 +508,29 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
     assert stored(c) == [[2, "T2", "S2", "b"]]
   end
 
+  test "a bound-scope delete is refused while any deferrable trigger exists", %{connection: c} do
+    # w3exrev17 HIGH 2: an AFTER DELETE DEFERRABLE INITIALLY DEFERRED row
+    # constraint trigger rewrote the other tenant's row at commit.
+    exec!(c, "INSERT INTO tw (id, org_key, site, name) VALUES (2, 'T2', 'S2', 'b')")
+
+    exec!(
+      c,
+      "CREATE FUNCTION tw_dpwn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE tw SET name = 'pwned' WHERE org_key = 'T2'; RETURN NULL; END $$"
+    )
+
+    exec!(
+      c,
+      "CREATE CONSTRAINT TRIGGER tw_dp AFTER DELETE ON tw DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION tw_dpwn()"
+    )
+
+    assert not_evaluable?(Adapter.execute_write_unsafe(c, delete(tenant("T1")), []))
+    assert stored(c) == [[1, "T1", "S1", "a"], [2, "T2", "S2", "b"]]
+
+    exec!(c, "DROP TRIGGER tw_dp ON tw")
+    assert {:ok, %{affected_rows: 1}} = Adapter.execute_write_unsafe(c, delete(tenant("T1")), [])
+    assert stored(c) == [[2, "T2", "S2", "b"]]
+  end
+
   test "a statement DELETE trigger created while the delete waits on a row lock is refused",
        %{connection: c, schema: schema} do
     exec!(c, "INSERT INTO tw (id, org_key, site, name) VALUES (2, 'T2', 'S2', 'b')")
