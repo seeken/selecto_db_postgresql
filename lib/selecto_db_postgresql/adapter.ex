@@ -34,6 +34,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @behaviour Selecto.DB.WriteAdapter
 
   alias SelectoDBPostgreSQL.PostImage
+
+  @read_committed "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
   alias SelectoDBPostgreSQL.FunctionVerification
   alias SelectoDBPostgreSQL.Identifier
   alias SelectoDBPostgreSQL.GraphCompiler
@@ -1237,7 +1239,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp execute_write_command(connection, %Command{} = command, opts) do
-    with :ok <- verify_native_constraints(connection, command, opts),
+    with :ok <- verify_read_committed(connection, command, opts),
+         :ok <- verify_native_constraints(connection, command, opts),
          {:ok, statement} <- WriteCompiler.compile(command, opts),
          {:ok, query_result} <- execute_guarded_statement(connection, command, statement, opts),
          {:ok, affected_rows} <- enforce_cardinality(command, query_result) do
@@ -1277,6 +1280,48 @@ defmodule SelectoDBPostgreSQL.Adapter do
         end
     end
   end
+
+  # Under REPEATABLE READ or SERIALIZABLE, catalog reads use the
+  # transaction snapshot: a trigger committed after it passes every check yet
+  # still fires (w3exrev16 item 16). A guarded write (bound tenant, trusted or
+  # host scope, admission guard or post-image) runs only under READ
+  # COMMITTED, checked inside its own transaction.
+  @guard_metadata [:post_image, :insert_admission, :query_enforcement, :tenant_fields]
+
+  defp verify_read_committed(connection, %Command{metadata: metadata}, opts)
+       when is_map(metadata) do
+    if Enum.any?(@guard_metadata, &(Map.get(metadata, &1) not in [nil, []])) do
+      case execute_statement(
+             connection,
+             "SELECT pg_catalog.current_setting('transaction_isolation')",
+             [],
+             Keyword.take(opts, [:timeout, :log])
+           ) do
+        {:ok, %{rows: [["read committed"]]}} ->
+          :ok
+
+        {:ok, %{rows: [[level]]}} ->
+          {:error,
+           Error.new(
+             :query_enforcement,
+             "PostgreSQL guarded writes require READ COMMITTED",
+             details: %{
+               code: :query_rule_not_evaluable,
+               reason: :transaction_isolation,
+               isolation: level,
+               adapter: :postgresql
+             }
+           )}
+
+        {:error, reason} ->
+          {:error, write_error(:execution_failed, reason)}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp verify_read_committed(_connection, _command, _opts), do: :ok
 
   defp verify_native_constraints(_connection, %Command{native_constraints: []}, _opts), do: :ok
 
@@ -2704,10 +2749,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp do_with_ecto_transaction(repo, opts, fun) do
     transaction_opts = Keyword.take(opts, [:timeout, :log])
+    # Only a transaction this call opens can be set READ COMMITTED; inside
+    # the host's own transaction the guarded-write check decides.
+    managed? =
+      not (module_exports?(repo, :in_transaction?, 0) and apply(repo, :in_transaction?, []))
 
     transaction_result =
       apply(repo, :transaction, [
-        fn -> ecto_transaction_result(repo, fun) end,
+        fn ->
+          with true <- managed?,
+               {:error, reason} <-
+                 safe_ecto_query(repo, @read_committed) do
+            apply(repo, :rollback, [write_error(:transaction_failed, reason)])
+          end
+
+          ecto_transaction_result(repo, fun)
+        end,
         transaction_opts
       ])
 
@@ -2725,6 +2782,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
        )}
   catch
     :exit, reason -> {:error, write_error(:transaction_failed, {:connection_exit, reason})}
+  end
+
+  defp safe_ecto_query(repo, sql) do
+    apply(ecto_sql_module(), :query, [repo, sql, []])
+  rescue
+    exception -> {:error, exception}
   end
 
   defp ecto_transaction_result(repo, fun) do
@@ -2797,6 +2860,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
     Postgrex.transaction(
       connection,
       fn transaction_connection ->
+        # A managed write transaction runs READ COMMITTED whatever the
+        # connection's default_transaction_isolation: the guarded-write
+        # catalog checks need a fresh snapshot per statement.
+        Postgrex.query!(transaction_connection, @read_committed, [])
+
         case fun.(transaction_connection) do
           {:ok, results} -> results
           {:error, error} -> Postgrex.rollback(transaction_connection, error)

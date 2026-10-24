@@ -4,10 +4,18 @@ CHANGES
 Unreleased
 ----------
 
-- TW-09 post-image: a bound-scope write in a transaction that is not READ
-  COMMITTED is refused (`query_rule_not_evaluable`); the after-DML catalog
-  check needs a fresh snapshot to see a trigger committed while the write
-  waited on a row lock (race test added).
+- Every guarded write (metadata `post_image`, `insert_admission`,
+  `query_enforcement` or `tenant_fields`) is refused unless the transaction
+  is READ COMMITTED (`query_rule_not_evaluable`, `reason:
+  :transaction_isolation`), checked inside the write's transaction before
+  the DML and again in the post-image re-read. Under REPEATABLE READ or
+  SERIALIZABLE catalog reads use the transaction snapshot, so a trigger
+  committed after it passed every check and still fired. Transactions the
+  adapter opens (Postgrex, or an Ecto Repo not already in a transaction) run
+  `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` as their first statement.
+  Tests: a host REPEATABLE READ transaction with a concurrently committed
+  deferrable trigger, a managed write on a REPEATABLE READ default
+  connection, and a row-lock race for the after-DML deferrable check.
 - Operational limitation (documented in the README): any enabled deferrable
   trigger anywhere in the database refuses every bound-scope write. This is
   the accepted cross-runtime choice and is not narrowed.
