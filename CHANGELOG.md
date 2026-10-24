@@ -4,6 +4,16 @@ CHANGES
 Unreleased
 ----------
 
+- Added (TW-09 post-image): a guarded INSERT/UPDATE (`metadata.post_image`)
+  returns its rows' keys and is re-read by them after the statement, inside
+  the transaction, by one tagged SELECT; unless every written row is still
+  inside the scope, the write rolls back with `query_rule_violation`.
+  Statement-level and deferrable triggers, rewrite rules, views and keys
+  that are not an enforced NOT NULL unique index are refused
+  (`query_rule_not_evaluable`). Row triggers (updated_at, audit) keep
+  working; triggers that change other rows are outside the guarantee.
+  Live tests.
+
 - Fixed: `column_catalog/2` resolves the relation exactly as the write
   quotes it (each dotted part quoted, through the search path, so a
   mixed-case, quoted, schema-qualified or temp-shadowed table reads its own

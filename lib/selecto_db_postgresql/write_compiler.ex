@@ -351,6 +351,19 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
 
   def compile_value({:literal, value}, _opts, offset), do: parameter(value, offset)
 
+  # A host-written text literal compared like the host's own query compares
+  # it: an untyped SQL string literal the column's type resolves ('010' on an
+  # integer column is 10), never a parameter typed by the column, which the
+  # driver could not encode. Used by the post-image re-read only.
+  def compile_value({:untyped_text, value}, _opts, _offset) when is_binary(value) do
+    if String.contains?(value, <<0>>) do
+      {:error, Error.new(:invalid_command, "text literals cannot contain NUL")}
+    else
+      escaped = value |> String.replace("\\", "\\\\") |> String.replace("'", "''")
+      {:ok, %{text: "E'" <> escaped <> "'", params: []}}
+    end
+  end
+
   def compile_value({:context, key}, opts, offset) do
     context = Keyword.get(opts, :context, %{})
 
