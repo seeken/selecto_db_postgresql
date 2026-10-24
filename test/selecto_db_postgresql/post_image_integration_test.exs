@@ -442,6 +442,132 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
     assert stored(c) == [[1, "T1", "S1", "u"]]
   end
 
+  defp delete(scope, relation \\ "tw", bound \\ true) do
+    {:ok, command} =
+      Command.new(%{
+        operation: :delete,
+        relation: relation,
+        predicate: scope,
+        expected_cardinality: :many,
+        metadata: if(bound, do: %{bound_scope: true}, else: %{})
+      })
+
+    command
+  end
+
+  defp pwn!(c, table \\ "tw") do
+    exec!(
+      c,
+      "CREATE OR REPLACE FUNCTION tw_pwn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE tw SET name = 'pwned' WHERE org_key = 'T2'; RETURN NULL; END $$"
+    )
+
+    exec!(
+      c,
+      "CREATE TRIGGER #{table}_pwn AFTER DELETE ON #{table} FOR EACH STATEMENT EXECUTE FUNCTION tw_pwn()"
+    )
+  end
+
+  test "a bound-scope delete is refused under statement-level DELETE triggers and rules",
+       %{connection: c} do
+    # w3exp5 item 17: the statement trigger rewrote the other tenant's row.
+    exec!(c, "INSERT INTO tw (id, org_key, site, name) VALUES (2, 'T2', 'S2', 'b')")
+    pwn!(c)
+    assert not_evaluable?(Adapter.execute_write_unsafe(c, delete(tenant("T1")), []))
+    assert stored(c) == [[1, "T1", "S1", "a"], [2, "T2", "S2", "b"]]
+    exec!(c, "ALTER TABLE tw DISABLE TRIGGER tw_pwn")
+
+    exec!(c, "CREATE TABLE tw_log (id int)")
+    exec!(c, "CREATE RULE tw_r AS ON DELETE TO tw DO ALSO INSERT INTO tw_log VALUES (OLD.id)")
+    assert not_evaluable?(Adapter.execute_write_unsafe(c, delete(tenant("T1")), []))
+    exec!(c, "DROP RULE tw_r ON tw")
+
+    # Across the partition and inheritance trees.
+    exec!(c, "CREATE TABLE pt (id int, org_key text) PARTITION BY RANGE (id)")
+    exec!(c, "CREATE TABLE pt_1 PARTITION OF pt FOR VALUES FROM (0) TO (1000)")
+    exec!(c, "INSERT INTO pt VALUES (1, 'T1')")
+    pwn!(c, "pt_1")
+    assert not_evaluable?(Adapter.execute_write_unsafe(c, delete(tenant("T1"), "pt"), []))
+
+    exec!(c, "CREATE TABLE ih (id int, org_key text)")
+    exec!(c, "CREATE TABLE ih_child () INHERITS (ih)")
+    exec!(c, "INSERT INTO ih VALUES (1, 'T1')")
+    pwn!(c, "ih_child")
+    assert not_evaluable?(Adapter.execute_write_unsafe(c, delete(tenant("T1"), "ih"), []))
+
+    # A view is refused; an unbound delete is not this check's concern.
+    exec!(c, "CREATE VIEW tw_v AS SELECT * FROM tw")
+    refute match?({:ok, _}, Adapter.execute_write_unsafe(c, delete(tenant("T1"), "tw_v"), []))
+    assert stored(c) == [[1, "T1", "S1", "a"], [2, "T2", "S2", "b"]]
+
+    assert {:ok, %{affected_rows: 1}} =
+             Adapter.execute_write_unsafe(c, delete(tenant("T1"), "tw", false), [])
+
+    exec!(c, "ALTER TABLE tw ENABLE TRIGGER tw_pwn")
+    exec!(c, "DROP TRIGGER tw_pwn ON tw")
+    assert {:ok, %{affected_rows: 0}} = Adapter.execute_write_unsafe(c, delete(tenant("T1")), [])
+    assert stored(c) == [[2, "T2", "S2", "b"]]
+  end
+
+  test "a statement DELETE trigger created while the delete waits on a row lock is refused",
+       %{connection: c, schema: schema} do
+    exec!(c, "INSERT INTO tw (id, org_key, site, name) VALUES (2, 'T2', 'S2', 'b')")
+
+    exec!(
+      c,
+      "CREATE FUNCTION tw_pwn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE tw SET name = 'pwned' WHERE org_key = 'T2'; RETURN NULL; END $$"
+    )
+
+    options = SelectoDBPostgreSQL.Verification.ConnectionOptions.options()
+    {:ok, b} = Postgrex.start_link(Keyword.put(options, :pool_size, 1))
+    {:ok, watcher} = Postgrex.start_link(Keyword.put(options, :pool_size, 1))
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        Postgrex.transaction(b, fn conn ->
+          Postgrex.query!(conn, "SET LOCAL search_path TO #{schema}", [])
+          Postgrex.query!(conn, "SELECT id FROM tw WHERE id = 1 FOR UPDATE", [])
+          send(parent, :locked)
+
+          receive do
+            :create ->
+              Postgrex.query(
+                conn,
+                "CREATE TRIGGER tw_pwn AFTER DELETE ON tw FOR EACH STATEMENT EXECUTE FUNCTION tw_pwn()",
+                []
+              )
+          end
+        end)
+      end)
+
+    assert_receive :locked, 5_000
+    writer = Task.async(fn -> Adapter.execute_write_unsafe(c, delete(tenant("T1")), []) end)
+
+    waiting = fn ->
+      %{rows: [[n]]} =
+        Postgrex.query!(
+          watcher,
+          "SELECT count(*) FROM pg_locks WHERE NOT granted AND locktype = 'transactionid'",
+          []
+        )
+
+      n
+    end
+
+    assert Enum.any?(1..100, fn _ -> waiting.() > 0 or (Process.sleep(50) && false) end)
+    send(holder.pid, :create)
+    _ = Task.await(holder, 15_000)
+    # Either the trigger creation deadlocks against the delete's ROW
+    # EXCLUSIVE lock, or it commits and the after-DML check refuses.
+    refute match?({:ok, _}, Task.await(writer, 15_000)) and
+             Enum.any?(stored(c), &(List.last(&1) == "pwned"))
+
+    {:ok, %{rows: rows}} = Adapter.execute(c, "SELECT name FROM tw WHERE id = 2", [], [])
+    assert rows == [["b"]]
+    GenServer.stop(b)
+    GenServer.stop(watcher)
+  end
+
   test "a table without a usable unique key is refused", %{connection: c} do
     exec!(c, "CREATE TABLE dk (id int NOT NULL, site text, name text)")
     exec!(c, "CREATE INDEX dk_id ON dk (id)")

@@ -4,6 +4,15 @@ CHANGES
 Unreleased
 ----------
 
+- A bound-scope DELETE (`metadata.bound_scope`, set by SelectoUpdato for an
+  engine tenant, trusted or host scope, required filter or query
+  enforcement) takes the ROW EXCLUSIVE lock, follows the READ COMMITTED
+  rule, and is refused (`query_rule_not_evaluable`) before and again after
+  its statement under an enabled statement-level DELETE trigger or DELETE
+  rule on the relation or across its partition and inheritance tree, or on
+  a view. Before, an AFTER DELETE FOR EACH STATEMENT trigger could rewrite
+  another tenant's row (w3exp5 item 17).
+
 - A write on a connection inside the caller's transaction (a checked-out
   Postgrex connection, or an Ecto Repo already in a transaction) runs under
   its own savepoint: a refusal after its DML (a post-image violation) rolls

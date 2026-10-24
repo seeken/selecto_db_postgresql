@@ -1262,7 +1262,18 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_guarded_statement(connection, command, statement, opts) do
     case PostImage.prepare(command) do
       {:plain, _command} ->
-        execute_statement(connection, statement.text, statement.params, opts)
+        if PostImage.bound_delete?(command) do
+          check = &execute_statement(connection, &1, &2, Keyword.take(opts, [:timeout, :log]))
+
+          with :ok <- PostImage.lock_delete(command, check),
+               {:ok, query_result} <-
+                 execute_statement(connection, statement.text, statement.params, opts),
+               :ok <- PostImage.check_delete(command, check) do
+            {:ok, query_result}
+          end
+        else
+          execute_statement(connection, statement.text, statement.params, opts)
+        end
 
       {:post_image, command} ->
         text = PostImage.returning(statement.text, command)
@@ -1286,7 +1297,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # still fires (w3exrev16 item 16). A guarded write (bound tenant, trusted or
   # host scope, admission guard or post-image) runs only under READ
   # COMMITTED, checked inside its own transaction.
-  @guard_metadata [:post_image, :insert_admission, :query_enforcement, :tenant_fields]
+  @guard_metadata [
+    :post_image,
+    :insert_admission,
+    :query_enforcement,
+    :tenant_fields,
+    :bound_scope
+  ]
 
   defp verify_read_committed(connection, %Command{metadata: metadata}, opts)
        when is_map(metadata) do

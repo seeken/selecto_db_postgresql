@@ -197,6 +197,10 @@ through:
   any of its partitions, views, tables with inheritance (non-partition)
   children, and keys that are not an immediate, valid, non-partial unique
   index over NOT NULL columns.
+- A bound-scope DELETE (`metadata.bound_scope`) locks its table ROW
+  EXCLUSIVE and is refused, before and again after its statement, under an
+  enabled statement-level DELETE trigger or a DELETE rule on the table or
+  anywhere in its partition or inheritance tree, and on a view.
 - **Every guarded write (bound tenant, trusted or host scope, admission
   guard or post-image) requires READ COMMITTED**, checked inside the write's
   transaction (`query_rule_not_evaluable`, `reason: :transaction_isolation`).
@@ -206,6 +210,9 @@ through:
   Repo) run `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` first, whatever
   the connection's `default_transaction_isolation`; a host transaction must
   be READ COMMITTED itself.
+
+Row-level triggers that modify *other* rows (another tenant's included) are
+outside the scope guarantee: the check proves the rows the statement wrote.
 
 ## Atomic write graphs and MERGE
 
