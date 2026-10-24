@@ -508,6 +508,51 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
     assert stored(c) == [[2, "T2", "S2", "b"]]
   end
 
+  test "a bound-scope update or insert without a post-image refuses statement triggers and rules",
+       %{connection: c} do
+    # w3exrev18 item 33a: graph descendants bound by an ancestor carry
+    # bound_scope but no post-image of their own.
+    exec!(c, "INSERT INTO tw (id, org_key, site, name) VALUES (2, 'T2', 'S2', 'b')")
+    pwn!(c)
+    exec!(c, "ALTER TABLE tw DISABLE TRIGGER tw_pwn")
+
+    bound = fn command -> %{command | metadata: %{bound_scope: true}} end
+    upd = bound.(%{update([{"name", "u"}], site("S1")) | metadata: %{}})
+
+    {:ok, ins} =
+      Command.new(%{
+        operation: :insert,
+        relation: "tw",
+        assignments:
+          Enum.map([{"id", 3}, {"org_key", "T1"}, {"site", "S1"}], fn {f, v} ->
+            %{field: f, value: {:literal, v}}
+          end),
+        metadata: %{bound_scope: true}
+      })
+
+    for {event, command} <- [{"UPDATE", upd}, {"INSERT", ins}] do
+      exec!(
+        c,
+        "CREATE TRIGGER tw_s AFTER #{event} ON tw FOR EACH STATEMENT EXECUTE FUNCTION tw_pwn()"
+      )
+
+      assert not_evaluable?(Adapter.execute_write_unsafe(c, command, [])), event
+      exec!(c, "DROP TRIGGER tw_s ON tw")
+
+      exec!(
+        c,
+        "CREATE RULE tw_r AS ON #{event} TO tw DO ALSO UPDATE tw SET name = 'pwned' WHERE org_key = 'T2'"
+      )
+
+      assert not_evaluable?(Adapter.execute_write_unsafe(c, command, [])), event
+      exec!(c, "DROP RULE tw_r ON tw")
+    end
+
+    assert stored(c) == [[1, "T1", "S1", "a"], [2, "T2", "S2", "b"]]
+    assert {:ok, %{affected_rows: 1}} = Adapter.execute_write_unsafe(c, upd, [])
+    assert {:ok, %{affected_rows: 1}} = Adapter.execute_write_unsafe(c, ins, [])
+  end
+
   test "a bound-scope delete is refused while any deferrable trigger exists", %{connection: c} do
     # w3exrev17 HIGH 2: an AFTER DELETE DEFERRABLE INITIALLY DEFERRED row
     # constraint trigger rewrote the other tenant's row at commit.

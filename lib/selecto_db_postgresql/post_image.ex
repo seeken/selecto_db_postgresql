@@ -238,11 +238,13 @@ defmodule SelectoDBPostgreSQL.PostImage do
   defp event_bits(:insert), do: 4
   defp event_bits(:update), do: 16
   defp event_bits(:upsert), do: 20
+  defp event_bits(:delete), do: 8
 
-  # pg_rewrite.ev_type: '2' UPDATE, '3' INSERT.
+  # pg_rewrite.ev_type: '2' UPDATE, '3' INSERT, '4' DELETE.
   defp rule_events(:insert), do: "'3'"
   defp rule_events(:update), do: "'2'"
   defp rule_events(:upsert), do: "'2', '3'"
+  defp rule_events(:delete), do: "'4'"
 
   @doc """
   A bound-scope DELETE (`metadata.bound_scope`, set by SelectoUpdato) leaves
@@ -257,7 +259,17 @@ defmodule SelectoDBPostgreSQL.PostImage do
   partitioned table, refuse the delete. Row-level triggers that
   modify other rows are outside the scope guarantee.
   """
+  #
+  # The same contract covers a bound-scope INSERT, UPDATE or UPSERT that
+  # carries no post-image of its own (a graph descendant bound by its root
+  # or an ancestor, w3exrev18 item 33a): statement-level triggers and rules
+  # for its event are refused.
   def bound_delete?(%Command{operation: :delete, metadata: %{bound_scope: true}}), do: true
+
+  def bound_delete?(%Command{operation: operation, metadata: %{bound_scope: true} = metadata})
+      when operation in [:insert, :update, :upsert],
+      do: not Map.has_key?(metadata, :post_image)
+
   def bound_delete?(_command), do: false
 
   def lock_delete(%Command{} = command, execute) do
@@ -281,9 +293,10 @@ defmodule SelectoDBPostgreSQL.PostImage do
       (SELECT count(*) FROM pg_catalog.pg_trigger t
        WHERE t.tgrelid IN (SELECT oid FROM tree)
          AND NOT t.tgisinternal AND t.tgenabled <> 'D'
-         AND (t.tgtype & 8) <> 0 AND (t.tgtype & 1) = 0)
+         AND (t.tgtype & #{event_bits(command.operation)}) <> 0 AND (t.tgtype & 1) = 0)
       + (SELECT count(*) FROM pg_catalog.pg_rewrite r
-         WHERE r.ev_class IN (SELECT oid FROM tree) AND r.ev_type = '4')
+         WHERE r.ev_class IN (SELECT oid FROM tree)
+           AND r.rulename <> '_RETURN' AND r.ev_type IN (#{rule_events(command.operation)}))
       -- A deferrable trigger fires at commit, after this check, and can sit
       -- on any table a row trigger writes to: any in the database refuses,
       -- as for inserts, updates and upserts (w3exrev17).
@@ -299,7 +312,7 @@ defmodule SelectoDBPostgreSQL.PostImage do
       {:ok, %{rows: [[_relation, _blocked]]}} ->
         refused(
           :query_rule_not_evaluable,
-          "a bound-scope delete cannot run under statement-level DELETE triggers or rules"
+          "a bound-scope write cannot run under statement-level triggers, rules or deferrable triggers"
         )
 
       _ ->
