@@ -424,6 +424,24 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
     GenServer.stop(rr)
   end
 
+  test "inside the caller's transaction a refused write undoes its own DML", %{connection: c} do
+    # w3exrev16 item 18: the caller ignores the refusal and commits.
+    assert {:ok, {refused, applied}} =
+             Postgrex.transaction(c, fn conn ->
+               refused =
+                 Adapter.execute_write_unsafe(conn, update([{"site", "S9"}], site("S1")), [])
+
+               applied =
+                 Adapter.execute_write_unsafe(conn, update([{"name", "u"}], site("S1")), [])
+
+               {refused, applied}
+             end)
+
+    assert violation?(refused)
+    assert {:ok, %{affected_rows: 1}} = applied
+    assert stored(c) == [[1, "T1", "S1", "u"]]
+  end
+
   test "a table without a usable unique key is refused", %{connection: c} do
     exec!(c, "CREATE TABLE dk (id int NOT NULL, site text, name text)")
     exec!(c, "CREATE INDEX dk_id ON dk (id)")

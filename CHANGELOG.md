@@ -4,6 +4,13 @@ CHANGES
 Unreleased
 ----------
 
+- A write on a connection inside the caller's transaction (a checked-out
+  Postgrex connection, or an Ecto Repo already in a transaction) runs under
+  its own savepoint: a refusal after its DML (a post-image violation) rolls
+  that DML back even when the caller ignores the error and commits. An idle
+  checked-out connection gets a managed transaction instead of running
+  statement by statement (w3exrev16 item 18).
+
 - Every guarded write (metadata `post_image`, `insert_admission`,
   `query_enforcement` or `tenant_fields`) is refused unless the transaction
   is READ COMMITTED (`query_rule_not_evaluable`, `reason:
