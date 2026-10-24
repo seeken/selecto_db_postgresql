@@ -33,6 +33,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @behaviour Selecto.DB.Adapter
   @behaviour Selecto.DB.WriteAdapter
 
+  alias SelectoDBPostgreSQL.PostImage
   alias SelectoDBPostgreSQL.FunctionVerification
   alias SelectoDBPostgreSQL.Identifier
   alias SelectoDBPostgreSQL.GraphCompiler
@@ -1238,8 +1239,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_write_command(connection, %Command{} = command, opts) do
     with :ok <- verify_native_constraints(connection, command, opts),
          {:ok, statement} <- WriteCompiler.compile(command, opts),
-         {:ok, query_result} <-
-           execute_statement(connection, statement.text, statement.params, opts),
+         {:ok, query_result} <- execute_guarded_statement(connection, command, statement, opts),
          {:ok, affected_rows} <- enforce_cardinality(command, query_result) do
       {:ok,
        %Result{
@@ -1251,6 +1251,30 @@ defmodule SelectoDBPostgreSQL.Adapter do
     else
       {:error, %Error{} = error} -> {:error, error}
       {:error, reason} -> {:error, write_error(:execution_failed, reason, command)}
+    end
+  end
+
+  # A guarded INSERT/UPDATE (TW-09 post-image) returns its rows' keys and is
+  # re-read by them after the statement (SelectoDBPostgreSQL.PostImage).
+  defp execute_guarded_statement(connection, command, statement, opts) do
+    case PostImage.prepare(command) do
+      {:plain, _command} ->
+        execute_statement(connection, statement.text, statement.params, opts)
+
+      {:post_image, command} ->
+        text = PostImage.returning(statement.text, command)
+
+        with {:ok, query_result} <- execute_statement(connection, text, statement.params, opts),
+             {query_result, keys} = PostImage.split_result(query_result, command),
+             :ok <-
+               PostImage.verify(
+                 command,
+                 keys,
+                 &WriteCompiler.compile_predicate(&1, opts, &2),
+                 &execute_statement(connection, &1, &2, Keyword.take(opts, [:timeout, :log]))
+               ) do
+          {:ok, query_result}
+        end
     end
   end
 

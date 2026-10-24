@@ -1,0 +1,280 @@
+defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
+  # TW-09 post-image (user decision 2026-10-24): a guarded INSERT/UPDATE's
+  # stored rows must stay inside the engine tenant and the trusted/host scope
+  # (`metadata.post_image`, set by SelectoUpdato), whatever the update
+  # assigns, BEFORE/AFTER row triggers rewrite or a generated column derives.
+  # The statement returns its rows' keys and one tagged SELECT re-reads them
+  # inside the transaction; statement-level and deferrable triggers, rules,
+  # views and tables without a usable key are refused. Ordinary triggers
+  # keep working. Query-member laterals keep their output names.
+  use ExUnit.Case, async: false
+
+  alias Selecto.Write.{Command, Error}
+  alias SelectoDBPostgreSQL.Adapter
+
+  @moduletag :postgres
+
+  setup do
+    {:ok, connection} =
+      Adapter.connect(SelectoDBPostgreSQL.Verification.ConnectionOptions.options())
+
+    Process.unlink(connection)
+    schema = "selecto_post_image_#{System.unique_integer([:positive])}"
+    exec!(connection, "CREATE SCHEMA #{schema}")
+    exec!(connection, "SET search_path TO #{schema}")
+
+    on_exit(fn ->
+      if Process.alive?(connection) do
+        Adapter.execute(connection, "DROP SCHEMA IF EXISTS #{schema} CASCADE", [], [])
+        GenServer.stop(connection)
+      end
+    end)
+
+    exec!(
+      connection,
+      "CREATE TABLE tw (id int PRIMARY KEY, org_key text, site text, name text, touched int DEFAULT 0)"
+    )
+
+    exec!(connection, "INSERT INTO tw (id, org_key, site, name) VALUES (1, 'T1', 'S1', 'a')")
+    %{connection: connection}
+  end
+
+  defp exec!(connection, sql), do: {:ok, _} = Adapter.execute(connection, sql, [], [])
+
+  defp update(assignments, scope, relation \\ "tw") do
+    {:ok, command} =
+      Command.new(%{
+        operation: :update,
+        relation: relation,
+        predicate: {:and, [{:eq, {:field, "id"}, {:literal, 1}}, scope]},
+        assignments: Enum.map(assignments, fn {f, v} -> %{field: f, value: {:literal, v}} end),
+        expected_cardinality: {:exactly, 1},
+        metadata: %{post_image: %{predicate: scope, key: ["id"]}}
+      })
+
+    command
+  end
+
+  defp insert(values, guard) do
+    {:ok, command} =
+      Command.new(%{
+        operation: :insert,
+        relation: "tw",
+        assignments: Enum.map(values, fn {f, v} -> %{field: f, value: {:literal, v}} end),
+        returning: [:id],
+        metadata: %{post_image: %{predicate: guard, key: ["id"]}}
+      })
+
+    command
+  end
+
+  defp site(value), do: {:eq, {:field, "site"}, {:literal, value}}
+  defp tenant(value), do: {:eq, {:field, "org_key"}, {:literal, value}}
+
+  defp stored(connection) do
+    {:ok, %{rows: rows}} =
+      Adapter.execute(connection, "SELECT id, org_key, site, name FROM tw ORDER BY id", [], [])
+
+    rows
+  end
+
+  defp violation?(result),
+    do: match?({:error, %Error{details: %{code: :query_rule_violation}}}, result)
+
+  defp not_evaluable?(result),
+    do: match?({:error, %Error{details: %{code: :query_rule_not_evaluable}}}, result)
+
+  test "an update that assigns the scoped column rolls back", %{connection: c} do
+    assert violation?(Adapter.execute_write_unsafe(c, update([{"site", "S9"}], site("S1")), []))
+    assert stored(c) == [[1, "T1", "S1", "a"]]
+  end
+
+  test "BEFORE and AFTER row triggers that leave the scope roll back", %{connection: c} do
+    exec!(
+      c,
+      "CREATE FUNCTION tw_low() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.org_key := lower(NEW.org_key); RETURN NEW; END $$"
+    )
+
+    exec!(
+      c,
+      "CREATE TRIGGER tw_b BEFORE INSERT OR UPDATE ON tw FOR EACH ROW EXECUTE FUNCTION tw_low()"
+    )
+
+    assert violation?(Adapter.execute_write_unsafe(c, update([{"name", "u"}], tenant("T1")), []))
+
+    assert violation?(
+             Adapter.execute_write_unsafe(
+               c,
+               insert([{"id", 2}, {"org_key", "T1"}, {"site", "S1"}], tenant("T1")),
+               []
+             )
+           )
+
+    exec!(c, "DROP TRIGGER tw_b ON tw")
+
+    exec!(
+      c,
+      "CREATE FUNCTION tw_alow() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.org_key <> lower(NEW.org_key) THEN UPDATE tw SET org_key = lower(org_key) WHERE id = NEW.id; END IF; RETURN NULL; END $$"
+    )
+
+    exec!(
+      c,
+      "CREATE TRIGGER tw_a AFTER INSERT OR UPDATE ON tw FOR EACH ROW EXECUTE FUNCTION tw_alow()"
+    )
+
+    assert violation?(Adapter.execute_write_unsafe(c, update([{"name", "u"}], tenant("T1")), []))
+    assert stored(c) == [[1, "T1", "S1", "a"]]
+  end
+
+  test "statement-level and deferrable triggers, rules and views are refused", %{connection: c} do
+    exec!(
+      c,
+      "CREATE FUNCTION tw_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$"
+    )
+
+    exec!(
+      c,
+      "CREATE TRIGGER tw_s AFTER UPDATE ON tw FOR EACH STATEMENT EXECUTE FUNCTION tw_noop()"
+    )
+
+    assert not_evaluable?(
+             Adapter.execute_write_unsafe(c, update([{"name", "u"}], site("S1")), [])
+           )
+
+    exec!(c, "DROP TRIGGER tw_s ON tw")
+
+    exec!(
+      c,
+      "CREATE CONSTRAINT TRIGGER tw_d AFTER UPDATE ON tw DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION tw_noop()"
+    )
+
+    assert not_evaluable?(
+             Adapter.execute_write_unsafe(c, update([{"name", "u"}], site("S1")), [])
+           )
+
+    exec!(c, "DROP TRIGGER tw_d ON tw")
+
+    exec!(c, "CREATE TABLE tw_log (id int)")
+    exec!(c, "CREATE RULE tw_r AS ON UPDATE TO tw DO ALSO INSERT INTO tw_log VALUES (NEW.id)")
+
+    assert not_evaluable?(
+             Adapter.execute_write_unsafe(c, update([{"name", "u"}], site("S1")), [])
+           )
+
+    exec!(c, "DROP RULE tw_r ON tw")
+
+    exec!(c, "CREATE VIEW tw_v AS SELECT * FROM tw")
+
+    refute match?(
+             {:ok, _},
+             Adapter.execute_write_unsafe(c, update([{"name", "u"}], site("S1"), "tw_v"), [])
+           )
+
+    assert stored(c) == [[1, "T1", "S1", "a"]]
+  end
+
+  test "a table without a usable unique key is refused", %{connection: c} do
+    exec!(c, "CREATE TABLE dk (id int NOT NULL, site text, name text)")
+    exec!(c, "CREATE INDEX dk_id ON dk (id)")
+    exec!(c, "INSERT INTO dk VALUES (1, 'S1', 'x'), (1, 'S2', 'y')")
+
+    {:ok, command} =
+      Command.new(%{
+        operation: :update,
+        relation: "dk",
+        predicate: {:and, [{:eq, {:field, "name"}, {:literal, "x"}}, site("S1")]},
+        assignments: [%{field: "name", value: {:literal, "u"}}],
+        expected_cardinality: {:exactly, 1},
+        metadata: %{post_image: %{predicate: site("S1"), key: ["id"]}}
+      })
+
+    assert not_evaluable?(Adapter.execute_write_unsafe(c, command, []))
+  end
+
+  test "a generated scope column is re-read", %{connection: c} do
+    exec!(
+      c,
+      "CREATE TABLE gc (id int PRIMARY KEY, site text, g text GENERATED ALWAYS AS (upper(site)) STORED)"
+    )
+
+    exec!(c, "INSERT INTO gc (id, site) VALUES (1, 's1')")
+    g = {:eq, {:field, "g"}, {:literal, "S1"}}
+    assert violation?(Adapter.execute_write_unsafe(c, update([{"site", "s9"}], g, "gc"), []))
+  end
+
+  test "ordinary triggers keep working; results keep their shape", %{connection: c} do
+    exec!(
+      c,
+      "CREATE FUNCTION tw_touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.touched := OLD.touched + 1; RETURN NEW; END $$"
+    )
+
+    exec!(c, "CREATE TRIGGER tw_t BEFORE UPDATE ON tw FOR EACH ROW EXECUTE FUNCTION tw_touch()")
+    exec!(c, "CREATE TABLE tw_audit (id int, name text)")
+
+    exec!(
+      c,
+      "CREATE FUNCTION tw_aud() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO tw_audit VALUES (NEW.id, NEW.name); RETURN NULL; END $$"
+    )
+
+    exec!(c, "CREATE TRIGGER tw_au AFTER INSERT ON tw FOR EACH ROW EXECUTE FUNCTION tw_aud()")
+
+    assert {:ok, %{affected_rows: 1, rows: []}} =
+             Adapter.execute_write_unsafe(c, update([{"name", "u"}], site("S1")), [])
+
+    assert {:ok, %{affected_rows: 1, rows: [%{"id" => 2}]}} =
+             Adapter.execute_write_unsafe(
+               c,
+               insert([{"id", 2}, {"org_key", "T1"}, {"site", "S1"}, {"name", "n"}], site("S1")),
+               []
+             )
+
+    assert stored(c) == [[1, "T1", "S1", "u"], [2, "T1", "S1", "n"]]
+    {:ok, %{rows: audit}} = Adapter.execute(c, "SELECT * FROM tw_audit", [], [])
+    assert audit == [[2, "n"]]
+  end
+
+  test "a query-member lateral keeps its output alias", %{connection: c} do
+    exec!(c, "CREATE TABLE mg_root (id int PRIMARY KEY, org_key text)")
+    exec!(c, "INSERT INTO mg_root VALUES (1, 't1')")
+    exec!(c, "CREATE TABLE mg_use (id int PRIMARY KEY, org_key text, amount int)")
+    exec!(c, "INSERT INTO mg_use VALUES (1,'t1',1),(2,'T1',10),(3,'t1 ',100)")
+
+    rel = fn table, cols ->
+      %{
+        source_table: table,
+        primary_key: :id,
+        fields: cols |> Map.keys() |> Enum.sort(),
+        redact_fields: [],
+        columns: Map.new(cols, fn {n, t} -> {n, %{type: t}} end),
+        associations: %{}
+      }
+    end
+
+    domain = %{
+      name: "MG",
+      source:
+        rel.("mg_root", %{id: :integer, org_key: :string}) |> Map.put(:tenant_field, :org_key),
+      schemas: %{use: rel.("mg_use", %{id: :integer, org_key: :string, amount: :integer})},
+      joins: %{},
+      query_members: %{
+        laterals: %{
+          lat: %{
+            source: "use",
+            query: %{"select" => [%{"as" => "s", "aggregate" => "sum", "field" => "amount"}]},
+            correlations: %{org_key: "org_key"},
+            join_type: "left"
+          }
+        }
+      }
+    }
+
+    query =
+      domain
+      |> Selecto.configure(c, adapter: Adapter, validate: false)
+      |> Selecto.with_tenant("t1")
+      |> Selecto.with_lateral(:lat)
+      |> Selecto.select(["id", "lat.s"])
+
+    assert {:ok, {[[1, 1]], _, _}} = Selecto.execute(query)
+  end
+end
