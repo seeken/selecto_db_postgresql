@@ -211,8 +211,12 @@ through:
   the connection's `default_transaction_isolation`; a host transaction must
   be READ COMMITTED itself.
 
-Row-level triggers that modify *other* rows (another tenant's included) are
-outside the scope guarantee: the check proves the rows the statement wrote.
+**Row-level triggers that modify other rows are allowed, and their effects
+on those rows are the schema owner's responsibility.** The check proves the
+rows the statement itself wrote; a row-level trigger that updates or deletes
+*other* rows, another tenant's included, runs and is not checked.
+Statement-level triggers, rewrite rules and deferrable triggers stay
+refused under a bound scope, for inserts, updates, upserts and deletes.
 
 ## Atomic write graphs and MERGE
 

@@ -4,6 +4,11 @@ CHANGES
 Unreleased
 ----------
 
+- Savepoint names carry a random nonce, so a host savepoint can never share
+  one (w3exp5 item 20). README: row-level triggers that modify other rows are
+  allowed and are the schema owner's responsibility; statement-level
+  triggers, rules and deferrable triggers stay refused, deletes included.
+
 - A bound-scope DELETE (`metadata.bound_scope`, set by SelectoUpdato for an
   engine tenant, trusted or host scope, required filter or query
   enforcement) takes the ROW EXCLUSIVE lock, follows the READ COMMITTED
