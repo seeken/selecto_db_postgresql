@@ -244,6 +244,63 @@ defmodule SelectoDBPostgreSQL.PostImage do
   defp rule_events(:update), do: "'2'"
   defp rule_events(:upsert), do: "'2', '3'"
 
+  @doc """
+  A bound-scope DELETE (`metadata.bound_scope`, set by SelectoUpdato) leaves
+  no row to re-read, but a statement-level DELETE trigger or a DELETE rule
+  acts on other rows (another tenant's) with the statement. Before the
+  statement the relation is locked ROW EXCLUSIVE (a concurrent CREATE
+  TRIGGER then waits, or deadlocks, rather than slipping in after the
+  check) and checked; after it, checked again. Enabled non-internal
+  statement-level DELETE triggers and DELETE rules on the relation or
+  anywhere in its partition or inheritance tree, and a relation that is not
+  a plain or partitioned table, refuse the delete. Row-level triggers that
+  modify other rows are outside the scope guarantee.
+  """
+  def bound_delete?(%Command{operation: :delete, metadata: %{bound_scope: true}}), do: true
+  def bound_delete?(_command), do: false
+
+  def lock_delete(%Command{} = command, execute) do
+    case execute.("LOCK TABLE #{quote_relation(command.relation)} IN ROW EXCLUSIVE MODE", []) do
+      {:ok, _} -> check_delete(command, execute)
+      _ -> refused(:query_rule_not_evaluable, "cannot lock the delete's relation")
+    end
+  end
+
+  def check_delete(%Command{} = command, execute) do
+    sql = """
+    WITH RECURSIVE tree(oid) AS (
+      SELECT pg_catalog.to_regclass($1::text)
+      UNION
+      SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN tree ON i.inhparent = tree.oid
+    )
+    SELECT
+      (SELECT count(*) FROM pg_catalog.pg_class c
+       WHERE c.oid = pg_catalog.to_regclass($1::text) AND c.relkind IN ('r', 'p'))
+        AS selecto_delete_relation,
+      (SELECT count(*) FROM pg_catalog.pg_trigger t
+       WHERE t.tgrelid IN (SELECT oid FROM tree)
+         AND NOT t.tgisinternal AND t.tgenabled <> 'D'
+         AND (t.tgtype & 8) <> 0 AND (t.tgtype & 1) = 0)
+      + (SELECT count(*) FROM pg_catalog.pg_rewrite r
+         WHERE r.ev_class IN (SELECT oid FROM tree) AND r.ev_type = '4')
+        AS selecto_delete_blocked
+    """
+
+    case execute.(sql, [quote_relation(command.relation)]) do
+      {:ok, %{rows: [[1, 0]]}} ->
+        :ok
+
+      {:ok, %{rows: [[_relation, _blocked]]}} ->
+        refused(
+          :query_rule_not_evaluable,
+          "a bound-scope delete cannot run under statement-level DELETE triggers or rules"
+        )
+
+      _ ->
+        refused(:query_rule_not_evaluable, "cannot check the delete's relation")
+    end
+  end
+
   defp refused(code, message),
     do:
       {:error,
