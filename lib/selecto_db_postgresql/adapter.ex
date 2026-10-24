@@ -1293,7 +1293,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     if Enum.any?(@guard_metadata, &(Map.get(metadata, &1) not in [nil, []])) do
       case execute_statement(
              connection,
-             "SELECT pg_catalog.current_setting('transaction_isolation')",
+             "SELECT pg_catalog.current_setting('transaction_isolation') AS selecto_isolation_level",
              [],
              Keyword.take(opts, [:timeout, :log])
            ) do
@@ -2720,11 +2720,60 @@ defmodule SelectoDBPostgreSQL.Adapter do
     with_native_postgres_transaction(connection, opts, fun)
   end
 
-  defp with_postgres_transaction(%DBConnection{} = connection, _opts, fun),
-    do: fun.(connection)
+  # A checked-out connection inside the caller's transaction: the write runs
+  # under its own savepoint, so a refusal after its DML (a post-image
+  # violation) undoes that DML even when the caller ignores the error and
+  # commits (w3exrev16 item 18). An idle checked-out connection gets a
+  # managed transaction.
+  defp with_postgres_transaction(%DBConnection{} = connection, opts, fun) do
+    if DBConnection.status(connection) == :transaction do
+      with_savepoint(&Postgrex.query(connection, &1, []), fn -> fun.(connection) end)
+    else
+      with_native_postgres_transaction(connection, opts, fun)
+    end
+  end
 
   defp with_postgres_transaction(connection, _opts, _fun) do
     {:error, write_error(:transaction_failed, {:invalid_connection, connection})}
+  end
+
+  defp with_savepoint(query, fun) do
+    name = "selecto_write_#{System.unique_integer([:positive])}"
+
+    case query.("SAVEPOINT #{name}") do
+      {:ok, _} ->
+        result =
+          try do
+            fun.()
+          rescue
+            exception ->
+              {:error, write_error(:transaction_failed, exception)}
+          end
+
+        case result do
+          {:ok, _} = ok ->
+            case query.("RELEASE SAVEPOINT #{name}") do
+              {:ok, _} -> ok
+              {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+            end
+
+          error ->
+            _ = query.("ROLLBACK TO SAVEPOINT #{name}")
+            _ = query.("RELEASE SAVEPOINT #{name}")
+            error
+        end
+
+      {:error, reason} ->
+        {:error, write_error(:transaction_failed, reason)}
+    end
+  end
+
+  defp with_native_postgres_transaction(%DBConnection{} = connection, opts, fun) do
+    case postgres_transaction(connection, opts, fun) do
+      {:ok, results} -> {:ok, results}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+    end
   end
 
   defp with_native_postgres_transaction(connection, opts, fun) do
@@ -2755,11 +2804,25 @@ defmodule SelectoDBPostgreSQL.Adapter do
       not (module_exports?(repo, :in_transaction?, 0) and apply(repo, :in_transaction?, []))
 
     transaction_result =
+      if managed?,
+        do: managed_ecto_transaction(repo, transaction_opts, fun),
+        else: with_savepoint(&safe_ecto_query(repo, &1), fn -> fun.(repo) end)
+
+    case transaction_result do
+      {:ok, results} -> {:ok, results}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+    end
+  rescue
+    exception ->
+      {:error, write_error(:transaction_failed, exception)}
+  end
+
+  defp managed_ecto_transaction(repo, transaction_opts, fun) do
+    transaction_result =
       apply(repo, :transaction, [
         fn ->
-          with true <- managed?,
-               {:error, reason} <-
-                 safe_ecto_query(repo, @read_committed) do
+          with {:error, reason} <- safe_ecto_query(repo, @read_committed) do
             apply(repo, :rollback, [write_error(:transaction_failed, reason)])
           end
 
@@ -2768,11 +2831,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         transaction_opts
       ])
 
-    case transaction_result do
-      {:ok, results} -> {:ok, results}
-      {:error, %Error{} = error} -> {:error, error}
-      {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
-    end
+    transaction_result
   rescue
     exception ->
       {:error,
