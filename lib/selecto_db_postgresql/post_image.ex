@@ -252,8 +252,9 @@ defmodule SelectoDBPostgreSQL.PostImage do
   TRIGGER then waits, or deadlocks, rather than slipping in after the
   check) and checked; after it, checked again. Enabled non-internal
   statement-level DELETE triggers and DELETE rules on the relation or
-  anywhere in its partition or inheritance tree, and a relation that is not
-  a plain or partitioned table, refuse the delete. Row-level triggers that
+  anywhere in its partition or inheritance tree, any enabled non-internal
+  deferrable trigger in the database, and a relation that is not a plain or
+  partitioned table, refuse the delete. Row-level triggers that
   modify other rows are outside the scope guarantee.
   """
   def bound_delete?(%Command{operation: :delete, metadata: %{bound_scope: true}}), do: true
@@ -283,6 +284,11 @@ defmodule SelectoDBPostgreSQL.PostImage do
          AND (t.tgtype & 8) <> 0 AND (t.tgtype & 1) = 0)
       + (SELECT count(*) FROM pg_catalog.pg_rewrite r
          WHERE r.ev_class IN (SELECT oid FROM tree) AND r.ev_type = '4')
+      -- A deferrable trigger fires at commit, after this check, and can sit
+      -- on any table a row trigger writes to: any in the database refuses,
+      -- as for inserts, updates and upserts (w3exrev17).
+      + (SELECT count(*) FROM pg_catalog.pg_trigger t
+         WHERE t.tgdeferrable AND NOT t.tgisinternal AND t.tgenabled <> 'D')
         AS selecto_delete_blocked
     """
 
