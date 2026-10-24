@@ -36,7 +36,7 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
     )
 
     exec!(connection, "INSERT INTO tw (id, org_key, site, name) VALUES (1, 'T1', 'S1', 'a')")
-    %{connection: connection}
+    %{connection: connection, schema: schema}
   end
 
   defp exec!(connection, sql), do: {:ok, _} = Adapter.execute(connection, sql, [], [])
@@ -270,6 +270,92 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
 
     {:ok, %{rows: rows}} = Adapter.execute(c, "SELECT id, org_key, code, name FROM tu", [], [])
     assert rows == [[1, "T1", "a", "y"]]
+  end
+
+  test "a deferrable trigger created while the write waits on a row lock is caught after the DML",
+       %{connection: c, schema: schema} do
+    # w3exrev16 item 14: session B holds the row, creates a deferrable
+    # trigger on the audit table the write's row trigger inserts into, and
+    # commits; the write then fires its row trigger (queueing the deferred
+    # event) and the database-wide check, which runs after the DML in the
+    # re-read, must see the new trigger.
+    exec!(c, "CREATE TABLE tw_audit (id int)")
+
+    exec!(
+      c,
+      "CREATE FUNCTION tw_aud() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO tw_audit VALUES (NEW.id); RETURN NULL; END $$"
+    )
+
+    exec!(c, "CREATE TRIGGER tw_au AFTER UPDATE ON tw FOR EACH ROW EXECUTE FUNCTION tw_aud()")
+
+    exec!(
+      c,
+      "CREATE FUNCTION tw_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$"
+    )
+
+    options = SelectoDBPostgreSQL.Verification.ConnectionOptions.options()
+    {:ok, b} = Postgrex.start_link(Keyword.put(options, :pool_size, 1))
+    {:ok, watcher} = Postgrex.start_link(Keyword.put(options, :pool_size, 1))
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        Postgrex.transaction(b, fn conn ->
+          Postgrex.query!(conn, "SET LOCAL search_path TO #{schema}", [])
+          Postgrex.query!(conn, "SELECT id FROM tw WHERE id = 1 FOR UPDATE", [])
+          send(parent, :locked)
+
+          receive do
+            :create ->
+              Postgrex.query!(
+                conn,
+                "CREATE CONSTRAINT TRIGGER tw_audit_d AFTER INSERT ON tw_audit DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION tw_noop()",
+                []
+              )
+          end
+        end)
+      end)
+
+    assert_receive :locked, 5_000
+
+    writer =
+      Task.async(fn ->
+        Adapter.execute_write_unsafe(c, update([{"name", "u"}], site("S1")), [])
+      end)
+
+    # Wait until the write is blocked on the row lock.
+    waiting = fn ->
+      %{rows: [[n]]} =
+        Postgrex.query!(
+          watcher,
+          "SELECT count(*) FROM pg_locks WHERE NOT granted AND locktype = 'transactionid'",
+          []
+        )
+
+      n
+    end
+
+    assert Enum.any?(1..100, fn _ -> waiting.() > 0 or (Process.sleep(50) && false) end)
+    send(holder.pid, :create)
+    assert {:ok, _} = Task.await(holder, 10_000)
+    assert not_evaluable?(Task.await(writer, 10_000))
+    assert stored(c) == [[1, "T1", "S1", "a"]]
+    {:ok, %{rows: audit}} = Adapter.execute(c, "SELECT * FROM tw_audit", [], [])
+    assert audit == []
+    GenServer.stop(b)
+    GenServer.stop(watcher)
+  end
+
+  test "a guarded write outside READ COMMITTED is refused", %{connection: c} do
+    # A REPEATABLE READ or SERIALIZABLE snapshot would hide a trigger
+    # committed after the transaction's first statement from the check.
+    {:ok, result} =
+      Postgrex.transaction(c, fn conn ->
+        Postgrex.query!(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", [])
+        Adapter.execute_write_unsafe(conn, update([{"name", "u"}], site("S1")), [])
+      end)
+
+    assert not_evaluable?(result)
   end
 
   test "a table without a usable unique key is refused", %{connection: c} do

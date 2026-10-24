@@ -147,8 +147,13 @@ defmodule SelectoDBPostgreSQL.PostImage do
           -- A deferrable constraint trigger fires at commit, after this
           -- check, and can sit on any table a row trigger writes to (an
           -- audit table) or on a leaf partition: any in the database refuses.
+          -- This runs after the DML (a trigger committed while the write
+          -- waited on a row lock is seen), which needs a fresh statement
+          -- snapshot: outside READ COMMITTED the check is refused.
           + (SELECT count(*) FROM pg_catalog.pg_trigger t
              WHERE t.tgdeferrable AND NOT t.tgisinternal AND t.tgenabled <> 'D')
+          + (CASE WHEN pg_catalog.current_setting('transaction_isolation') = 'read committed'
+                  THEN 0 ELSE 1 END)
           -- Inheritance (non-partition) children share the parent's key
           -- values, so the key does not name one row.
           + (SELECT count(*) FROM pg_catalog.pg_inherits i
