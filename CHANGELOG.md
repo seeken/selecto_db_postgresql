@@ -4,6 +4,14 @@ CHANGES
 Unreleased
 ----------
 
+- Fixed: `column_catalog/2` resolves the relation exactly as the write
+  quotes it (each dotted part quoted, through the search path, so a
+  mixed-case, quoted, schema-qualified or temp-shadowed table reads its own
+  columns), and resolves domains (including domains over domains) to their
+  base type and typmod through `pg_type.typbasetype`/`typtypmod`. A domain
+  chain deeper than 16 levels is reported unresolved with `trust:
+  :base_verified`. Live tests.
+
 - Added: `column_catalog/2` reports `format_type(atttypid, atttypmod)` and
   the column collation's `collisdeterministic` for each column of a table
   (search-path resolved; an enum reports base `enum`). SelectoUpdato's

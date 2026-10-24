@@ -478,34 +478,58 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_statement(connection, _query, _params, _opts),
     do: {:error, {:invalid_connection, connection}}
 
+  # Each column's type, with a domain (or a domain over a domain) resolved to
+  # its base type and the base typmod the domain declares, so a domain over
+  # varchar(2) reports `character varying(2)`. The walk stops at 16 levels;
+  # a type still a domain there is reported unresolved (typtype 'd').
   @column_catalog_sql """
-  SELECT a.attname::text AS selecto_catalog_column,
-         pg_catalog.format_type(a.atttypid, a.atttypmod) AS selecto_catalog_type,
+  WITH RECURSIVE walk (attnum, attname, typid, typmod, colloid, depth) AS (
+    SELECT a.attnum, a.attname::text, a.atttypid, a.atttypmod, a.attcollation, 0
+    FROM pg_catalog.pg_attribute a
+    WHERE a.attrelid = pg_catalog.to_regclass($1::text) AND a.attnum > 0 AND NOT a.attisdropped
+    UNION ALL
+    SELECT w.attnum, w.attname, t.typbasetype, t.typtypmod, w.colloid, w.depth + 1
+    FROM walk w JOIN pg_catalog.pg_type t ON t.oid = w.typid
+    WHERE t.typtype = 'd' AND w.depth < 16
+  )
+  SELECT DISTINCT ON (w.attnum)
+         w.attname AS selecto_catalog_column,
+         pg_catalog.format_type(w.typid, w.typmod) AS selecto_catalog_type,
          t.typtype::text AS selecto_catalog_typtype,
          COALESCE(c.collisdeterministic, true) AS selecto_catalog_deterministic
-  FROM pg_catalog.pg_attribute a
-  JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
-  LEFT JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation
-  WHERE a.attrelid = pg_catalog.to_regclass($1::text) AND a.attnum > 0 AND NOT a.attisdropped
+  FROM walk w
+  JOIN pg_catalog.pg_type t ON t.oid = w.typid
+  LEFT JOIN pg_catalog.pg_collation c ON c.oid = w.colloid
+  ORDER BY w.attnum, w.depth DESC
   """
 
   @impl Selecto.DB.WriteAdapter
-  # format_type(atttypid, atttypmod) with the column collation's
-  # collisdeterministic (query_enforced_scalar v2 verified metadata). The
-  # table resolves through the search path, as the write does. An enum
-  # reports its own type name; its base is `enum`. A domain keeps its own
-  # name, which classifies as identity (refused unless byte-identical). The
-  # selecto_catalog_* column names tag the read in driver traces.
+  # format_type of each column's resolved base type and typmod, with the
+  # column collation's collisdeterministic (query_enforced_scalar v2
+  # verified metadata). The relation resolves exactly as the write names it:
+  # each dotted part quoted, through the search path (a temp table shadows
+  # like it does for the INSERT). An enum reports base `enum`. A domain the
+  # walk could not resolve is reported `base_verified`, so only identity-safe
+  # decisions are made on it. The selecto_catalog_* column names tag the read
+  # in driver traces.
   def column_catalog(connection, table) when is_binary(table) do
-    case execute(connection, @column_catalog_sql, [table], []) do
+    relation =
+      table
+      |> String.split(".")
+      |> Enum.map_join(".", &quote_identifier/1)
+
+    case execute(connection, @column_catalog_sql, [relation], []) do
       {:ok, %{rows: rows}} ->
         {:ok,
          Map.new(rows, fn [name, type, typtype, deterministic] ->
-           {name,
-            %{
-              type: if(typtype == "e", do: "enum", else: type),
-              deterministic: deterministic == true
-            }}
+           info =
+             case typtype do
+               "e" -> %{type: "enum", deterministic: deterministic == true}
+               "d" -> %{type: type, deterministic: deterministic == true, trust: :base_verified}
+               _ -> %{type: type, deterministic: deterministic == true}
+             end
+
+           {name, info}
          end)}
 
       {:error, _reason} = error ->
