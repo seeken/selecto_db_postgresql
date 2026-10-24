@@ -197,9 +197,15 @@ through:
   any of its partitions, views, tables with inheritance (non-partition)
   children, and keys that are not an immediate, valid, non-partial unique
   index over NOT NULL columns.
-- A transaction that is not READ COMMITTED: the catalog checks run after the
-  DML and need a fresh statement snapshot to see a trigger committed while
-  the write waited on a row lock.
+- **Every guarded write (bound tenant, trusted or host scope, admission
+  guard or post-image) requires READ COMMITTED**, checked inside the write's
+  transaction (`query_rule_not_evaluable`, `reason: :transaction_isolation`).
+  Under REPEATABLE READ or SERIALIZABLE the catalog checks read the
+  transaction snapshot, so a trigger committed after it would pass them and
+  still fire. Transactions the adapter opens itself (Postgrex or an Ecto
+  Repo) run `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` first, whatever
+  the connection's `default_transaction_isolation`; a host transaction must
+  be READ COMMITTED itself.
 
 ## Atomic write graphs and MERGE
 

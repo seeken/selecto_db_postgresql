@@ -358,6 +358,72 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
     assert not_evaluable?(result)
   end
 
+  test "a host REPEATABLE READ transaction cannot see a trigger committed after its snapshot",
+       %{connection: c, schema: schema} do
+    # w3exrev16 item 16: the catalog checks read the transaction snapshot, so
+    # a deferrable trigger committed after it would pass and still fire at
+    # commit. Guarded writes are refused outside READ COMMITTED.
+    options = SelectoDBPostgreSQL.Verification.ConnectionOptions.options()
+    {:ok, b} = Postgrex.start_link(Keyword.put(options, :pool_size, 1))
+    Postgrex.query!(b, "SET search_path TO #{schema}", [])
+
+    {:ok, result} =
+      Postgrex.transaction(c, fn conn ->
+        Postgrex.query!(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", [])
+        Postgrex.query!(conn, "SELECT count(*) FROM tw", [])
+
+        Postgrex.query!(
+          b,
+          "CREATE FUNCTION tw_dlow() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.org_key <> lower(NEW.org_key) THEN UPDATE tw SET org_key = lower(org_key) WHERE id = NEW.id; END IF; RETURN NULL; END $$",
+          []
+        )
+
+        Postgrex.query!(
+          b,
+          "CREATE CONSTRAINT TRIGGER tw_dl AFTER UPDATE ON tw DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION tw_dlow()",
+          []
+        )
+
+        Adapter.execute_write_unsafe(conn, update([{"name", "u"}], tenant("T1")), [])
+      end)
+
+    assert {:error,
+            %Error{details: %{code: :query_rule_not_evaluable, reason: :transaction_isolation}}} =
+             result
+
+    assert stored(c) == [[1, "T1", "S1", "a"]]
+    GenServer.stop(b)
+  end
+
+  test "a managed write runs READ COMMITTED on a REPEATABLE READ default connection",
+       %{connection: c, schema: schema} do
+    exec!(
+      c,
+      "CREATE FUNCTION tw_iso() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.name := current_setting('transaction_isolation'); RETURN NEW; END $$"
+    )
+
+    exec!(c, "CREATE TRIGGER tw_i BEFORE UPDATE ON tw FOR EACH ROW EXECUTE FUNCTION tw_iso()")
+
+    options =
+      SelectoDBPostgreSQL.Verification.ConnectionOptions.options()
+      |> Keyword.put(:pool_size, 1)
+      |> Keyword.put(:parameters,
+        default_transaction_isolation: "repeatable read",
+        search_path: schema
+      )
+
+    {:ok, rr} = Postgrex.start_link(options)
+
+    assert %{rows: [["repeatable read"]]} =
+             Postgrex.query!(rr, "SHOW default_transaction_isolation", [])
+
+    assert {:ok, %{affected_rows: 1}} =
+             Adapter.execute_write_unsafe(rr, update([{"name", "u"}], site("S1")), [])
+
+    assert stored(c) == [[1, "T1", "S1", "read committed"]]
+    GenServer.stop(rr)
+  end
+
   test "a table without a usable unique key is refused", %{connection: c} do
     exec!(c, "CREATE TABLE dk (id int NOT NULL, site text, name text)")
     exec!(c, "CREATE INDEX dk_id ON dk (id)")
