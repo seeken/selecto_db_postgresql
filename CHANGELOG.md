@@ -4,6 +4,12 @@ CHANGES
 Unreleased
 ----------
 
+- TW-09 post-image: guarded upserts are re-read like inserts. Refused as
+  well (`query_rule_not_evaluable`): any enabled deferrable trigger in the
+  database (it fires at commit, after the check), statement triggers and
+  rules on any partition of the target, and a target with inheritance
+  children.
+
 - Added (TW-09 post-image): a guarded INSERT/UPDATE (`metadata.post_image`)
   returns its rows' keys and is re-read by them after the statement, inside
   the transaction, by one tagged SELECT; unless every written row is still

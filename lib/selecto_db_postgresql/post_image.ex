@@ -31,7 +31,7 @@ defmodule SelectoDBPostgreSQL.PostImage do
 
   @doc "The command to run: its RETURNING extended by the tagged key columns."
   def prepare(%Command{metadata: %{post_image: %{key: [_ | _]}}, operation: operation} = command)
-      when operation in [:insert, :update],
+      when operation in [:insert, :update, :upsert],
       do: {:post_image, command}
 
   def prepare(command), do: {:plain, command}
@@ -133,13 +133,26 @@ defmodule SelectoDBPostgreSQL.PostImage do
         (SELECT count(*) FROM #{relation} WHERE #{key_match} AND (#{scope.text})) AS selecto_post_image_matched,
         (SELECT count(*) FROM #{relation} WHERE #{key_match}) AS selecto_post_image_rows,
         (CASE WHEN c.relkind IN ('r', 'p') THEN 0 ELSE 1 END
+          -- Statement-level triggers and rewrite rules for the event on the
+          -- relation or any of its partitions.
           + (SELECT count(*) FROM pg_catalog.pg_trigger t
-             WHERE t.tgrelid = c.oid AND NOT t.tgisinternal AND t.tgenabled <> 'D'
-               AND (t.tgtype & #{event_bit(command.operation)}) <> 0
-               AND ((t.tgtype & 1) = 0 OR t.tgdeferrable))
+             WHERE (t.tgrelid = c.oid OR t.tgrelid IN (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
+               AND NOT t.tgisinternal AND t.tgenabled <> 'D'
+               AND (t.tgtype & #{event_bits(command.operation)}) <> 0
+               AND (t.tgtype & 1) = 0)
           + (SELECT count(*) FROM pg_catalog.pg_rewrite r
-             WHERE r.ev_class = c.oid AND r.rulename <> '_RETURN'
-               AND r.ev_type = '#{rule_event(command.operation)}')) AS selecto_post_image_blocked,
+             WHERE (r.ev_class = c.oid OR r.ev_class IN (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
+               AND r.rulename <> '_RETURN'
+               AND r.ev_type IN (#{rule_events(command.operation)}))
+          -- A deferrable constraint trigger fires at commit, after this
+          -- check, and can sit on any table a row trigger writes to (an
+          -- audit table) or on a leaf partition: any in the database refuses.
+          + (SELECT count(*) FROM pg_catalog.pg_trigger t
+             WHERE t.tgdeferrable AND NOT t.tgisinternal AND t.tgenabled <> 'D')
+          -- Inheritance (non-partition) children share the parent's key
+          -- values, so the key does not name one row.
+          + (SELECT count(*) FROM pg_catalog.pg_inherits i
+             WHERE i.inhparent = c.oid AND c.relkind = 'r')) AS selecto_post_image_blocked,
         EXISTS (
           SELECT 1 FROM pg_catalog.pg_index i
           WHERE i.indrelid = c.oid AND i.indisunique AND i.indimmediate AND i.indisvalid
@@ -216,11 +229,15 @@ defmodule SelectoDBPostgreSQL.PostImage do
      List.flatten(keys)}
   end
 
-  defp event_bit(:insert), do: 4
-  defp event_bit(:update), do: 16
+  # tgtype bits: INSERT 4, UPDATE 16 (an upsert can fire either).
+  defp event_bits(:insert), do: 4
+  defp event_bits(:update), do: 16
+  defp event_bits(:upsert), do: 20
 
-  defp rule_event(:insert), do: "3"
-  defp rule_event(:update), do: "2"
+  # pg_rewrite.ev_type: '2' UPDATE, '3' INSERT.
+  defp rule_events(:insert), do: "'3'"
+  defp rule_events(:update), do: "'2'"
+  defp rule_events(:upsert), do: "'2', '3'"
 
   defp refused(code, message),
     do:

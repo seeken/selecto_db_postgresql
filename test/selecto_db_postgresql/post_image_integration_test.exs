@@ -173,6 +173,105 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
     assert stored(c) == [[1, "T1", "S1", "a"]]
   end
 
+  test "a deferrable trigger anywhere, partition statement triggers and inheritance children are refused",
+       %{connection: c} do
+    exec!(
+      c,
+      "CREATE FUNCTION tw_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$"
+    )
+
+    # A deferred trigger on an audit table fires at commit, after the check.
+    exec!(c, "CREATE TABLE tw_audit (id int)")
+
+    exec!(
+      c,
+      "CREATE CONSTRAINT TRIGGER tw_audit_d AFTER INSERT ON tw_audit DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION tw_noop()"
+    )
+
+    assert not_evaluable?(
+             Adapter.execute_write_unsafe(c, update([{"name", "u"}], site("S1")), [])
+           )
+
+    exec!(c, "DROP TRIGGER tw_audit_d ON tw_audit")
+
+    # A statement trigger on a leaf partition.
+    exec!(c, "CREATE TABLE pt (id int PRIMARY KEY, site text, name text) PARTITION BY RANGE (id)")
+    exec!(c, "CREATE TABLE pt_1 PARTITION OF pt FOR VALUES FROM (0) TO (1000)")
+    exec!(c, "INSERT INTO pt VALUES (1, 'S1', 'a')")
+
+    exec!(
+      c,
+      "CREATE TRIGGER pt_s AFTER UPDATE ON pt_1 FOR EACH STATEMENT EXECUTE FUNCTION tw_noop()"
+    )
+
+    assert not_evaluable?(
+             Adapter.execute_write_unsafe(c, update([{"name", "u"}], site("S1"), "pt"), [])
+           )
+
+    exec!(c, "DROP TRIGGER pt_s ON pt_1")
+
+    assert {:ok, _} =
+             Adapter.execute_write_unsafe(c, update([{"name", "u"}], site("S1"), "pt"), [])
+
+    # An inheritance child can hold a decoy row with the parent's key.
+    exec!(c, "CREATE TABLE ih (id int PRIMARY KEY, site text, name text)")
+    exec!(c, "CREATE TABLE ih_child () INHERITS (ih)")
+    exec!(c, "INSERT INTO ih VALUES (1, 'S1', 'a')")
+
+    assert not_evaluable?(
+             Adapter.execute_write_unsafe(c, update([{"name", "u"}], site("S1"), "ih"), [])
+           )
+
+    assert stored(c) == [[1, "T1", "S1", "a"]]
+  end
+
+  test "a tenant upsert is re-read; a trigger moving it out of the tenant rolls back",
+       %{connection: c} do
+    exec!(
+      c,
+      "CREATE TABLE tu (id int PRIMARY KEY, org_key text NOT NULL, code text NOT NULL, name text, UNIQUE (org_key, code))"
+    )
+
+    exec!(c, "INSERT INTO tu VALUES (1, 'T1', 'a', 'x')")
+
+    upsert = fn id, name ->
+      %Command{
+        operation: :upsert,
+        relation: "tu",
+        assignments: [
+          %{field: "id", value: {:literal, id}},
+          %{field: "org_key", value: {:literal, "T1"}},
+          %{field: "code", value: {:literal, "a"}},
+          %{field: "name", value: {:literal, name}}
+        ],
+        predicate: nil,
+        returning: :none,
+        expected_cardinality: {:exactly, 1},
+        metadata: %{
+          conflict_target: ["org_key", "code"],
+          declared_conflict_targets: [["org_key", "code"]],
+          upsert_update_fields: ["name"],
+          tenant_fields: ["org_key"],
+          post_image: %{predicate: tenant("T1"), key: ["id"]}
+        }
+      }
+    end
+
+    assert {:ok, %{affected_rows: 1}} = Adapter.execute_write_unsafe(c, upsert.(2, "y"), [])
+
+    exec!(
+      c,
+      "CREATE FUNCTION tu_low() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.org_key := lower(NEW.org_key); RETURN NEW; END $$"
+    )
+
+    exec!(c, "CREATE TRIGGER tu_b BEFORE UPDATE ON tu FOR EACH ROW EXECUTE FUNCTION tu_low()")
+
+    assert violation?(Adapter.execute_write_unsafe(c, upsert.(2, "z"), []))
+
+    {:ok, %{rows: rows}} = Adapter.execute(c, "SELECT id, org_key, code, name FROM tu", [], [])
+    assert rows == [[1, "T1", "a", "y"]]
+  end
+
   test "a table without a usable unique key is refused", %{connection: c} do
     exec!(c, "CREATE TABLE dk (id int NOT NULL, site text, name text)")
     exec!(c, "CREATE INDEX dk_id ON dk (id)")
