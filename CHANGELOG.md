@@ -4,6 +4,12 @@ CHANGES
 Unreleased
 ----------
 
+- A bound-scope INSERT, UPDATE or UPSERT without a post-image of its own (a
+  graph descendant bound by an ancestor) runs the same contract as a
+  bound-scope DELETE for its event: ROW EXCLUSIVE lock, statement-level
+  triggers and rules across the partition and inheritance tree, deferrable
+  triggers, before and after the statement (w3exrev18 item 33a).
+
 - A bound-scope DELETE (graph delete-missing cleanups included) is also
   refused, before and after its statement, while any enabled non-internal
   deferrable trigger exists in the database, as for inserts, updates and

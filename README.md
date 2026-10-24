@@ -201,7 +201,10 @@ through:
   cleanups included) locks its table ROW EXCLUSIVE and is refused, before
   and again after its statement, under an enabled statement-level DELETE
   trigger or a DELETE rule on the table or anywhere in its partition or
-  inheritance tree, while any deferrable trigger exists, and on a view.
+  inheritance tree, while any deferrable trigger exists, and on a view. A
+  graph descendant bound by its root or an ancestor (an insert, update or
+  delete on a table without a tenant field) follows the same rule for its
+  event.
 - **Every guarded write (bound tenant, trusted or host scope, admission
   guard or post-image) requires READ COMMITTED**, checked inside the write's
   transaction (`query_rule_not_evaluable`, `reason: :transaction_isolation`).
