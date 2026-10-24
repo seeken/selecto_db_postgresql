@@ -4,6 +4,12 @@ CHANGES
 Unreleased
 ----------
 
+- Added: `column_catalog/2` reports `format_type(atttypid, atttypmod)` and
+  the column collation's `collisdeterministic` for each column of a table
+  (search-path resolved; an enum reports base `enum`). SelectoUpdato's
+  candidate check uses it as verified metadata (query_enforced_scalar v2).
+  Live test.
+
 - Changed (default): the statement cache is now on by default
   (`config :selecto_db_postgresql, statement_cache: true`, 256 hash-slot
   names per connection), so each statement is prepared once per Postgrex

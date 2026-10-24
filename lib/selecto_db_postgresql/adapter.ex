@@ -478,6 +478,41 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_statement(connection, _query, _params, _opts),
     do: {:error, {:invalid_connection, connection}}
 
+  @column_catalog_sql """
+  SELECT a.attname::text AS selecto_catalog_column,
+         pg_catalog.format_type(a.atttypid, a.atttypmod) AS selecto_catalog_type,
+         t.typtype::text AS selecto_catalog_typtype,
+         COALESCE(c.collisdeterministic, true) AS selecto_catalog_deterministic
+  FROM pg_catalog.pg_attribute a
+  JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+  LEFT JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation
+  WHERE a.attrelid = pg_catalog.to_regclass($1::text) AND a.attnum > 0 AND NOT a.attisdropped
+  """
+
+  @impl Selecto.DB.WriteAdapter
+  # format_type(atttypid, atttypmod) with the column collation's
+  # collisdeterministic (query_enforced_scalar v2 verified metadata). The
+  # table resolves through the search path, as the write does. An enum
+  # reports its own type name; its base is `enum`. A domain keeps its own
+  # name, which classifies as identity (refused unless byte-identical). The
+  # selecto_catalog_* column names tag the read in driver traces.
+  def column_catalog(connection, table) when is_binary(table) do
+    case execute(connection, @column_catalog_sql, [table], []) do
+      {:ok, %{rows: rows}} ->
+        {:ok,
+         Map.new(rows, fn [name, type, typtype, deterministic] ->
+           {name,
+            %{
+              type: if(typtype == "e", do: "enum", else: type),
+              deterministic: deterministic == true
+            }}
+         end)}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
   @impl Selecto.DB.WriteAdapter
   def write_capabilities(connection) do
     server_major =
