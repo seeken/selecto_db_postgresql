@@ -2755,7 +2755,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp with_savepoint(query, fun) do
-    name = "selecto_write_#{System.unique_integer([:positive])}"
+    name = "selecto_write_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
 
     case query.("SAVEPOINT #{name}") do
       {:ok, _} ->
