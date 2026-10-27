@@ -136,18 +136,13 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
     "standard_conforming_strings"
   ]
 
-  # R30, R35: the values every Selecto statement runs under (search_path is
-  # given per statement); a masked set_config(guc, evil, false) persisted by
+  # R30, R35 (amended): the settings every Selecto statement runs under,
+  # each at its pg_settings.reset_val (the server, database, role or startup
+  # value, which SET and set_config do not change); search_path is given
+  # per statement. A masked set_config(guc, evil, false) persisted by
   # earlier SQL therefore never decides how a Selecto statement parses or
   # renders a value.
-  @pinned [
-    {"TimeZone", "UTC"},
-    {"DateStyle", "ISO, MDY"},
-    {"IntervalStyle", "postgres"},
-    {"extra_float_digits", "3"},
-    {"bytea_output", "hex"},
-    {"standard_conforming_strings", "on"}
-  ]
+  @pinned ~w(TimeZone DateStyle IntervalStyle extra_float_digits bytea_output standard_conforming_strings)
 
   # Type names the generated SQL casts to or literals parse through.
   @generated_types ~w(text varchar bpchar char date time timetz timestamp timestamptz uuid
@@ -277,24 +272,32 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
 
   @doc """
   R30, R35: pins search_path to `path` and every other result-affecting
-  setting to Selecto's value for the rest of the current transaction
+  setting to its reset value for the rest of the current transaction
   (set_config(..., true)), in one statement; run only inside Selecto's own
   transaction or savepoint, after the snapshot it is compared with. Returns
   `{:ok, pinned}`, each setting's value as the server normalised it.
   """
   def pin(execute, path) do
-    names = ["search_path" | Enum.map(@pinned, &elem(&1, 0))]
+    names = ["search_path" | @pinned]
+
+    reset = fn name ->
+      "(SELECT s.reset_val FROM pg_catalog.pg_settings s " <>
+        "WHERE s.name OPERATOR(pg_catalog.=) '#{name}')"
+    end
 
     sql =
-      "SELECT " <>
-        Enum.map_join(Enum.with_index(names), ", ", fn {name, index} ->
-          "pg_catalog.set_config('#{name}', $#{index + 1}::pg_catalog.text, true) " <>
-            "AS selecto_guard_pin_#{index}"
+      "SELECT pg_catalog.set_config('search_path', $1::pg_catalog.text, true) " <>
+        "AS selecto_guard_pin_0, " <>
+        Enum.map_join(Enum.with_index(@pinned, 1), ", ", fn {name, index} ->
+          "pg_catalog.set_config('#{name}', #{reset.(name)}, true) AS selecto_guard_pin_#{index}"
         end)
 
-    case execute.(sql, [path | Enum.map(@pinned, &elem(&1, 1))]) do
+    # An unreadable reset value (NULL, or an error) fails closed.
+    case execute.(sql, [path]) do
       {:ok, %{rows: [values]}} when length(values) == length(names) ->
-        {:ok, Map.new(Enum.zip(names, values))}
+        if Enum.all?(values, &is_binary/1),
+          do: {:ok, Map.new(Enum.zip(names, values))},
+          else: unavailable()
 
       _other ->
         unavailable()

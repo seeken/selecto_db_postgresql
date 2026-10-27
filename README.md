@@ -339,10 +339,11 @@ another schema's relation, function or operator of the same name. So:
   collision that cannot be scoped (`WITH RECURSIVE`, a nested `WITH`)
   refuses (`reason: :cte_name_collision`).
 - **Each Selecto statement runs under pinned settings**: search_path
-  `pg_catalog, <the schemas of its relations>, pg_temp`, `TimeZone=UTC`,
-  `DateStyle='ISO, MDY'`, `IntervalStyle=postgres`,
-  `extra_float_digits=3`, `bytea_output=hex` and
-  `standard_conforming_strings=on`, set in one statement with
+  `pg_catalog, <the schemas of its relations>, pg_temp`, and `TimeZone`,
+  `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output` and
+  `standard_conforming_strings` each at its `pg_settings.reset_val` (the
+  server, database, role or startup value; an unreadable one refuses), set
+  in one statement with
   `set_config(..., true)` inside the read's savepoint or transaction, or the
   write's, and restored to the host's values afterwards in the same
   expression that checks every pin held. A session value a trigger or
