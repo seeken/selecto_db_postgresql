@@ -31,10 +31,33 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   # (R30): pg_catalog first, the schemas of its relations, pg_temp last.
 
   alias Selecto.Write.Error
+  alias SelectoDBPostgreSQL.RelationPath.Scanner
 
-  # A relation position: after FROM, JOIN or INTO (and an optional LATERAL
-  # or ONLY), a name that is not a function call or qualified.
-  @position ~r/(\b(?:from|join|into)\s+(?>(?:(?:lateral|only)\b\s*)?))("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)(?!\s*[.(])(?![A-Za-z0-9_$])/i
+  @path_key "selecto:reset_schemas"
+
+  # Under the reset path: its schemas; the operators of those schemas
+  # (outside pg_catalog) that take two pg_catalog types under a comparison
+  # or pattern name, which an exact type match would prefer to pg_catalog's
+  # (R46: generated comparisons must not depend on operator lookup); and
+  # the session's temp relations (R42 FINAL).
+  @schemas_sql "SELECT CAST(pg_catalog.current_schemas(false) AS pg_catalog.text[]) " <>
+                 "AS selecto_guard_reset_schemas, " <>
+                 "(SELECT pg_catalog.count(*) FROM pg_catalog.pg_operator o " <>
+                 "JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace " <>
+                 "JOIN pg_catalog.pg_type l ON l.oid OPERATOR(pg_catalog.=) o.oprleft " <>
+                 "JOIN pg_catalog.pg_type r ON r.oid OPERATOR(pg_catalog.=) o.oprright " <>
+                 "WHERE n.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false)) " <>
+                 "AND o.oprnamespace OPERATOR(pg_catalog.<>) CAST(11 AS pg_catalog.oid) " <>
+                 "AND l.typnamespace OPERATOR(pg_catalog.=) CAST(11 AS pg_catalog.oid) " <>
+                 "AND r.typnamespace OPERATOR(pg_catalog.=) CAST(11 AS pg_catalog.oid) " <>
+                 "AND o.oprname OPERATOR(pg_catalog.=) ANY (ARRAY['=', '<>', '<', '<=', '>', '>=', " <>
+                 "'~~', '!~~', '~~*', '!~~*', '~', '!~', '~*', '!~*', '@>', '<@', '&&', '?', '?|', '?&'])) " <>
+                 "AS selecto_guard_operator_shadows, " <>
+                 "(SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c " <>
+                 "WHERE c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) " <>
+                 "AS selecto_guard_temp_relations"
+
+  @temp_key "selecto:temp_relations"
 
   @host_sql "SELECT CAST(pg_catalog.current_schemas(true) AS pg_catalog.text[]) " <>
               "AS selecto_guard_host_schemas"
@@ -96,21 +119,49 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   """
   def resolve(execute, names, in_transaction? \\ true)
 
-  def resolve(_execute, [], _in_transaction?), do: {:ok, %{}}
-
   def resolve(execute, names, in_transaction?) do
     names = names |> Enum.map(&to_string/1) |> Enum.uniq()
     {qualified, plain} = Enum.split_with(names, &String.contains?(&1, "."))
     own = Map.new(qualified, &{&1, quote_relation(&1)})
 
-    if plain == [] do
-      {:ok, own}
-    else
-      case lookup(execute, plain, in_transaction?) do
-        {:ok, rows} -> decide(rows, own)
-        :error -> unavailable()
-      end
+    # The reset path's schemas are read even when every name is declared:
+    # the pin needs them (R43).
+    case lookup(execute, plain, in_transaction?) do
+      {:ok, _rows, _schemas, shadows, _temps} when shadows > 0 ->
+        refusal(
+          :operator_shadow,
+          "a schema of the reset search_path defines an operator over pg_catalog types " <>
+            "that would be chosen over pg_catalog's for a generated comparison",
+          []
+        )
+
+      {:ok, rows, schemas, _shadows, temps} ->
+        decide(rows, own |> Map.put(@path_key, schemas) |> Map.put(@temp_key, temps))
+
+      :error ->
+        unavailable()
     end
+  end
+
+  @doc false
+  # The key under which resolve/3 records the reset path's schemas (no SQL
+  # identifier can contain it unquoted, and generated SQL never quotes it).
+  def path_key, do: @path_key
+
+  @doc false
+  # R42 FINAL: a statement with no compile-time relation list (hand-built)
+  # runs only while the session holds no temp relation, unless it names
+  # pg_temp itself.
+  def hand_built_allowed?(relations, sql) do
+    Map.get(relations, @temp_key, 0) == 0 or
+      Enum.any?(Scanner.refs(sql), &(&1.qualified? and pg_temp_ref?(sql, &1)))
+  end
+
+  defp pg_temp_ref?(sql, ref) do
+    sql
+    |> binary_part(ref.start, ref.length)
+    |> String.downcase()
+    |> String.starts_with?(["pg_temp.", ~s("pg_temp".), "pg_temp_", ~s("pg_temp_)])
   end
 
   defp lookup(execute, plain, in_transaction?) do
@@ -127,8 +178,10 @@ defmodule SelectoDBPostgreSQL.RelationPath do
         result =
           with {:ok, %{rows: [[host]]}} when is_list(host) <- execute.(@host_sql, []),
                {:ok, %{rows: [[_reset]]}} <- execute.(@reset_sql, []),
+               {:ok, %{rows: [[schemas, shadows, temps]]}} when is_list(schemas) <-
+                 execute.(@schemas_sql, []),
                {:ok, %{rows: rows}} when is_list(rows) <- execute.(@resolve_sql, [plain, host]) do
-            {:ok, rows}
+            {:ok, rows, Enum.reject(schemas, &String.starts_with?(&1, "pg_temp")), shadows, temps}
           else
             _ -> :error
           end
@@ -179,17 +232,26 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   end
 
   @doc """
-  The search_path a statement over `relations` (a resolve/2 map) runs under:
-  pg_catalog, the relations' schemas (sorted), pg_temp.
+  The search_path a statement over `relations` (a resolve/3 map) runs under
+  (R43): pg_catalog, every schema of the reset search_path (as the server
+  parsed it), the declared schemas of the relations, pg_temp last. Never
+  only the statement's own relation schemas: an extension's types,
+  functions and operators (citext in `ext`) must resolve as the host's own
+  configuration resolves them.
   """
   def pinned_path(relations) when is_map(relations) do
-    schemas =
+    reset = Map.get(relations, @path_key, [])
+
+    declared =
       relations
+      |> Map.drop([@path_key, @temp_key])
       |> Map.values()
+      |> Enum.filter(&is_binary/1)
       |> Enum.sort()
       |> Enum.map(&schema_of/1)
-      # The session temp schema stays last, as pg_temp (temp relations are
-      # named by it explicitly).
+
+    schemas =
+      (reset ++ declared)
       |> Enum.reject(&(&1 in [nil, "pg_catalog"] or String.starts_with?(&1, "pg_temp")))
       |> Enum.uniq()
 
@@ -206,10 +268,10 @@ defmodule SelectoDBPostgreSQL.RelationPath do
     sql = IO.iodata_to_binary(sql)
     ctes = cte_names(sql)
 
-    @position
-    |> Regex.scan(sql, capture: :all_but_first)
-    |> Enum.map(fn [_keyword, name] -> unquote_name(name) end)
-    |> Enum.reject(&(String.downcase(&1) in ctes))
+    sql
+    |> Scanner.refs()
+    |> Enum.reject(&(&1.qualified? or String.downcase(&1.name) in ctes))
+    |> Enum.map(& &1.name)
     |> Enum.uniq()
   end
 
@@ -310,16 +372,18 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   end
 
   defp rewrite(sql, map, ctes) do
+    sql = IO.iodata_to_binary(sql)
     ctes = Enum.map(ctes, &String.downcase/1)
 
-    Regex.replace(@position, sql, fn whole, keyword, name ->
-      bare = unquote_name(name)
-
-      cond do
-        String.downcase(bare) in ctes -> whole
-        Map.has_key?(map, bare) -> keyword <> Map.fetch!(map, bare)
-        true -> whole
-      end
+    sql
+    |> Scanner.refs()
+    |> Enum.reject(&(&1.qualified? or String.downcase(&1.name) in ctes))
+    |> Enum.filter(&Map.has_key?(map, &1.name))
+    |> Enum.reverse()
+    |> Enum.reduce(sql, fn ref, acc ->
+      binary_part(acc, 0, ref.start) <>
+        Map.fetch!(map, ref.name) <>
+        binary_part(acc, ref.start + ref.length, byte_size(acc) - ref.start - ref.length)
     end)
   end
 

@@ -339,9 +339,11 @@ another schema's relation, function or operator of the same name. So:
   collision that cannot be scoped (`WITH RECURSIVE`, a nested `WITH`)
   refuses (`reason: :cte_name_collision`).
 - **Each Selecto statement runs under pinned settings**: search_path
-  `pg_catalog, <the schemas of its relations>, pg_temp`, and `TimeZone`,
-  `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output` and
-  `standard_conforming_strings` each at its `pg_settings.reset_val` (the
+  `pg_catalog, <every schema of the reset search_path>, <declared schemas>,
+  pg_temp`, and `TimeZone`,
+  `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`,
+  `standard_conforming_strings` and `timezone_abbreviations` each at its
+  `pg_settings.reset_val` (the
   server, database, role or startup value; an unreadable one refuses), set
   in one statement with
   `set_config(..., true)` inside the read's savepoint or transaction, or the
@@ -353,9 +355,9 @@ another schema's relation, function or operator of the same name. So:
   connection checkout until it ends. `lc_monetary` and
   `lc_numeric` are not pinned: generated SQL does not format money or
   locale numbers. Unqualified functions and operators
-  therefore resolve to pg_catalog's first, and temp objects last. Functions
-  or operators of an extension installed in a schema none of the domain's
-  relations live in must be schema-qualified in the domain.
+  therefore resolve to pg_catalog's first, then as the host's reset path
+  resolves them (an extension's types and operators included), and temp
+  objects last.
 - Every catalog read the adapter runs for its checks is pg_catalog-qualified.
 
 ## Atomic write graphs and MERGE

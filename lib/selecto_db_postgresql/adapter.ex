@@ -308,8 +308,27 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp qualify_read(connection, query, opts) do
     relations =
       case Keyword.get(opts, :selecto_qualified_relations) do
-        relations when is_map(relations) -> {:ok, relations}
-        _ -> resolve_relations(connection, RelationPath.names(query))
+        relations when is_map(relations) ->
+          {:ok, relations}
+
+        _ ->
+          # R42 FINAL: hand-built SQL refuses while any temp relation exists,
+          # unless it names pg_temp itself.
+          with {:ok, relations} <- resolve_all(connection, RelationPath.names(query)) do
+            if RelationPath.hand_built_allowed?(relations, IO.iodata_to_binary(query)),
+              do: {:ok, relations},
+              else:
+                {:error,
+                 Error.new(
+                   :query_enforcement,
+                   "PostgreSQL refuses a statement without a relation list while temporary relations exist",
+                   details: %{
+                     code: :query_rule_not_evaluable,
+                     reason: :temporary_relations,
+                     adapter: :postgresql
+                   }
+                 )}
+          end
       end
 
     with {:ok, relations} <- relations,
@@ -616,8 +635,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # R36: the relation lookup runs its own savepoint or transaction, so all
   # of its statements go to one connection checkout.
   defp resolve_relations(_connection, []), do: {:ok, %{}}
+  defp resolve_relations(connection, names), do: resolve_all(connection, names)
 
-  defp resolve_relations(connection, names) do
+  # Always runs the lookup (an empty name list included): the reset path,
+  # operator and temp-relation facts are needed whatever the names.
+
+  defp resolve_all(connection, names) do
     with_checkout(connection, fn guard, in_transaction? ->
       RelationPath.resolve(guard, names, in_transaction?)
     end)

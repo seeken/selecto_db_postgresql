@@ -131,7 +131,8 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
     "IntervalStyle",
     "extra_float_digits",
     "bytea_output",
-    "standard_conforming_strings"
+    "standard_conforming_strings",
+    "timezone_abbreviations"
   ]
 
   # R30, R35 (amended): the settings every Selecto statement runs under,
@@ -140,7 +141,7 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   # per statement. A masked set_config(guc, evil, false) persisted by
   # earlier SQL therefore never decides how a Selecto statement parses or
   # renders a value.
-  @pinned ~w(TimeZone DateStyle IntervalStyle extra_float_digits bytea_output standard_conforming_strings)
+  @pinned ~w(TimeZone DateStyle IntervalStyle extra_float_digits bytea_output standard_conforming_strings timezone_abbreviations)
 
   # Type names the generated SQL casts to or literals parse through.
   @generated_types ~w(text varchar bpchar char date time timetz timestamp timestamptz uuid
