@@ -191,13 +191,9 @@ form, independent of DateStyle, extra_float_digits or any other text-image
 setting. The check refuses (`query_rule_not_evaluable`) whatever it cannot
 see through:
 
-- **Any enabled deferrable trigger anywhere in the database refuses every
-  bound-scope write.** A deferred trigger fires at commit, after the check,
-  and can sit on any table a row trigger writes to. This is the accepted
-  cross-runtime choice and is deliberately not narrowed to the written
-  table: a database that needs deferrable constraint triggers cannot take
-  scoped writes through Selecto. Disable them (`ALTER TABLE ... DISABLE
-  TRIGGER`) or keep them in another database.
+- **Bound-scope writes refuse while a deferrable trigger that can run user
+  code exists anywhere in the database** (the same rule as every other write;
+  see "Deferrable triggers" below).
 - Statement-level triggers and rewrite rules for the event on the table or
   any of its partitions, views, tables with inheritance (non-partition)
   children, and keys that are not an immediate, valid, non-partial unique
@@ -209,7 +205,8 @@ see through:
   cleanups included) locks its table ROW EXCLUSIVE and is refused, before
   and again after its statement, under an enabled statement-level DELETE
   trigger or a DELETE rule on the table or anywhere in its partition or
-  inheritance tree, while any deferrable trigger exists, and on a view. A
+  inheritance tree, while a deferrable trigger that can run user code
+  exists, and on a view. A
   graph descendant bound by its root or an ancestor (an insert, update or
   delete on a table without a tenant field) follows the same rule for its
   event.
@@ -227,8 +224,8 @@ see through:
 on those rows are the schema owner's responsibility.** The check proves the
 rows the statement itself wrote; a row-level trigger that updates or deletes
 *other* rows, another tenant's included, runs and is not checked.
-Statement-level triggers, rewrite rules and deferrable triggers stay
-refused under a bound scope, for inserts, updates, upserts and deletes.
+Statement-level triggers and rewrite rules stay refused under a bound scope,
+for inserts, updates, upserts and deletes.
 
 ### Session state
 
@@ -238,9 +235,9 @@ the statements after it: `set_config('search_path' | 'TimeZone' | ...,
 the search path for the rest of the session (a temp relation survives
 COMMIT). Every write and every Selecto read therefore runs between two
 pg_catalog-qualified session snapshots (search_path, TimeZone, DateStyle,
-IntervalStyle, extra_float_digits, and the oid, xmin and name of every
-relation, rewrite rule and type in the session's temp schema), compared in
-the client:
+IntervalStyle, extra_float_digits, the oid, xmin and name of every
+relation, rewrite rule and type in the session's temp schema, and the
+deferrable triggers that can run user code), compared in the client:
 
 - **Writes, bound or not, in any mode.** The snapshot after a write
   statement is the FIRST statement after it, before the re-read or any
@@ -248,26 +245,21 @@ the client:
   the write's transaction, or its savepoint inside the host's transaction,
   back (which also reverts `set_config`) and refuses with
   `query_rule_violation`, `reason: :session_state_changed`.
-- **Reads.** Inside the host's transaction a read runs under its own
-  savepoint (a random name) and a change rolls back to it and refuses. In
-  autocommit a change restores the settings seen before and refuses. A
-  stream checks after every fetched batch, before handing its rows out, and
-  rolls its own transaction back on a change.
+- **Reads.** A read runs under its own savepoint (a random name) inside the
+  host's transaction, or inside its own transaction in autocommit; a change
+  rolls it back (which reverts local and session-level `set_config` and any
+  temp relation it created) and refuses. A stream checks after every fetched
+  batch, before handing its rows out, and rolls its own transaction back on
+  a change.
 - **Temp shadows.** A statement whose names a temp relation would capture (a
-  temp relation named like an identifier of the statement while a
-  same-named relation exists in a schema of the search path), or a temp type
+  temp relation named like a relation the statement reads, after FROM, JOIN,
+  INTO, UPDATE or TABLE, while a same-named relation exists in a schema of
+  the search path; a temp table named like a column refuses nothing), or a
+  temp type
   named like one of its identifiers or a type the generated SQL casts to, is
   refused (`query_rule_not_evaluable`, `reason: :temporary_shadow`), for
   reads, streams and writes. A domain over a temp table that shadows nothing,
   and unrelated temp tables, keep working.
-
-- **Deferred triggers.** A deferred constraint trigger fires at COMMIT,
-  after every snapshot. In a transaction the adapter owns, the write runs
-  `SET CONSTRAINTS ALL IMMEDIATE` before its final session check, so they
-  fire (and are checked) first. Inside the host's transaction they would
-  fire at the host's COMMIT, so a write there is refused
-  (`reason: :deferred_triggers`) while any enabled non-internal deferrable
-  trigger exists in the database.
 
 **Behaviour change.** A row trigger that runs `CREATE TEMP TABLE IF NOT
 EXISTS ...` (a scratch table) changes the session's temp namespace on the
@@ -280,6 +272,64 @@ no session marker or GUC of its own that a trigger could forge. Beyond
 search_path and temp shadowing, a row trigger's other side effects (other
 settings, role changes, writes to unrelated tables, DDL) are host-owned
 schema behaviour and the schema owner's responsibility.
+
+### Deferrable triggers
+
+A deferrable trigger fires at COMMIT, after every check a write makes, so
+**no PostgreSQL write runs while a deferrable trigger that can run user code
+exists anywhere in the database**, in a transaction the adapter owns or the
+host's (`query_rule_not_evaluable`, `reason: :deferred_triggers`). It is
+checked before the write's first DML and again in the first statement after
+each DML (a trigger created while the write waited on a lock is seen).
+`SET CONSTRAINTS` is never used. Only two kinds of deferrable trigger are
+exempt, because PostgreSQL's own code runs them:
+
+- foreign-key triggers whose function is a pg_catalog `RI_FKey_*` function
+  (deferred foreign keys keep working);
+- unique and exclusion rechecks (`unique_key_recheck`) on an index without
+  expressions or a predicate whose operator classes, their families'
+  operators and support functions, the exclusion operators and their
+  functions, and the collations all belong to pg_catalog.
+
+A `DEFERRABLE` constraint trigger, or a `DEFERRABLE EXCLUDE` or `UNIQUE`
+whose operator class or collation is user-defined, refuses every write.
+Disable such triggers (`ALTER TABLE ... DISABLE TRIGGER`) or keep them in
+another database.
+
+### Schema-qualified relations and the pinned search_path
+
+A search_path switch that persists on the connection (an earlier
+session-level `set_config(..., false)`, or a deferred trigger racing a host
+REPEATABLE READ transaction) must not redirect a later Selecto statement to
+another schema's relation, function or operator of the same name. So:
+
+- **Every relation of a generated read or write is schema-qualified.** A
+  domain that names a relation as `"schema.relation"` keeps it. Any other
+  name is resolved against the connection's **reset** search_path
+  (`pg_settings.reset_val`: the server, database, role or startup value,
+  which `SET` and `set_config` do not change), with `"$user"` as the session
+  user and `pg_temp` skipped; a name the reset path does not reach but the
+  session's own temp schema holds is the host's temp table and is named by
+  that schema explicitly. The current search_path is never consulted:
+  **a host that `SET`s search_path to reach another schema must declare that
+  schema on the domain** (or set it at connection startup, for example
+  `parameters: [search_path: "app"]`). A name that does not resolve, or a
+  lookup that cannot run, refuses (`reason: :relation_unresolved`); no
+  unqualified statement runs.
+- A CTE or query member named like a real relation is scoped: in a leading
+  non-recursive `WITH`, its own body and the bodies before it read the real
+  (qualified) relation, the later bodies and the main query the CTE. A
+  collision that cannot be scoped (`WITH RECURSIVE`, a nested `WITH`)
+  refuses (`reason: :cte_name_collision`).
+- **Each Selecto statement runs under a pinned search_path**:
+  `pg_catalog, <the schemas of its relations>, pg_temp`, set with
+  `set_config(..., true)` inside the read's savepoint or transaction, or the
+  write's, and restored to the host's value afterwards in the same
+  expression that checks the pin held. Unqualified functions and operators
+  therefore resolve to pg_catalog's first, and temp objects last. Functions
+  or operators of an extension installed in a schema none of the domain's
+  relations live in must be schema-qualified in the domain.
+- Every catalog read the adapter runs for its checks is pg_catalog-qualified.
 
 ## Atomic write graphs and MERGE
 

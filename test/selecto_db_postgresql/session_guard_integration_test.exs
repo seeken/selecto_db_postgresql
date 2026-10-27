@@ -15,18 +15,25 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
   @moduletag :postgres
 
   setup do
-    {:ok, connection} =
-      Adapter.connect(
-        Keyword.put(SelectoDBPostgreSQL.Verification.ConnectionOptions.options(), :pool_size, 1)
-      )
-
-    Process.unlink(connection)
     suffix = System.unique_integer([:positive])
     schema = "selecto_session_#{suffix}"
     evil = "selecto_session_evil_#{suffix}"
-    exec!(connection, "CREATE SCHEMA #{schema}")
-    exec!(connection, "CREATE SCHEMA #{evil}")
-    exec!(connection, "SET search_path TO #{schema}")
+    options = SelectoDBPostgreSQL.Verification.ConnectionOptions.options()
+    {:ok, setup} = Adapter.connect(Keyword.put(options, :pool_size, 1))
+    exec!(setup, "CREATE SCHEMA #{schema}")
+    exec!(setup, "CREATE SCHEMA #{evil}")
+    GenServer.stop(setup)
+
+    # The host's schema is its connection's startup search_path (the reset
+    # value Selecto resolves relations against, R29), not a session SET.
+    {:ok, connection} =
+      Adapter.connect(
+        options
+        |> Keyword.put(:pool_size, 1)
+        |> Keyword.put(:parameters, search_path: schema)
+      )
+
+    Process.unlink(connection)
 
     on_exit(fn ->
       if Process.alive?(connection) do
@@ -290,10 +297,10 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
       assert read_code(first) == :session_state_changed
       assert read_code(next) == [[1, "mine"]]
 
-      # In autocommit a transaction-local change ends with the statement; a
-      # session-level one is restored to the settings the read saw before.
-      expected = if scope == "false", do: :session_state_changed, else: [[1, "mine"]]
-      assert read_code(read(c, "items_v")) == expected
+      # In autocommit the read runs in its own transaction under the pinned
+      # search_path (R30): any switch, local or session-level, is seen and
+      # rolled back with it.
+      assert read_code(read(c, "items_v")) == :session_state_changed
       assert rows!(c, "SELECT pg_catalog.current_setting('search_path')") == [[schema]]
       assert read_code(read(c)) == [[1, "mine"]]
     end
@@ -310,9 +317,10 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
     assert rows!(c, "SELECT pg_catalog.current_setting('search_path')") == [[schema]]
   end
 
-  # R8: a deferred constraint trigger fires at COMMIT, after the post-DML
-  # snapshot; its session-level set_config would outlive the write.
-  test "a deferred trigger's session change is seen before the write commits",
+  # R8, R23: a deferred constraint trigger fires at COMMIT, after the
+  # post-DML snapshot; no write runs while a user deferrable trigger exists,
+  # in autocommit or in a host transaction.
+  test "no write runs while a user deferrable trigger exists",
        %{connection: c, evil: evil, schema: schema} do
     exec!(
       c,
@@ -326,7 +334,14 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
         "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION other_deferred()"
     )
 
-    assert changed?(Adapter.execute_write_unsafe(c, update("other", [{"note", "y"}]), []))
+    assert {:error, %Error{details: %{reason: :deferred_triggers}}} =
+             Adapter.execute_write_unsafe(c, update("other", [{"note", "y"}]), [])
+
+    # Unrelated relations too: the trigger could be on any table the write
+    # reaches.
+    assert {:error, %Error{details: %{reason: :deferred_triggers}}} =
+             Adapter.execute_write_unsafe(c, update("items", [{"note", "m"}], tenant("t1")), [])
+
     assert rows!(c, "SELECT pg_catalog.current_setting('search_path')") == [[schema]]
     assert rows!(c, "SELECT note FROM other") == [["x"]]
     assert read_code(read(c)) == [[1, "mine"]]
@@ -341,5 +356,166 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
     assert {:error, %Error{details: %{reason: :deferred_triggers}}} = outcome
     assert rows!(c, "SELECT note FROM other") == [["x"]]
     exec!(c, "DROP TRIGGER other_deferred_tr ON other")
+  end
+
+  # R29: relations resolve against the reset search_path, never the current
+  # one, so a session-level switch that persisted before Selecto's call
+  # (an earlier set_config(..., false), a deferred trigger's racing switch)
+  # redirects neither a read nor a write to the decoy.
+  test "a persisted session search_path switch redirects no read or write",
+       %{connection: c, evil: evil, schema: schema} do
+    exec!(c, "SELECT pg_catalog.set_config('search_path', '#{evil}, #{schema}', false)")
+    assert rows!(c, "SELECT note FROM items ORDER BY id") == [["decoy"], ["decoy"]]
+
+    assert read_code(read(c)) == [[1, "mine"]]
+
+    assert {:ok, %{affected_rows: 1}} =
+             Adapter.execute_write_unsafe(c, update("items", [{"note", "m2"}], tenant("t1")), [])
+
+    assert rows!(c, "SELECT note FROM #{schema}.items WHERE id = 1") == [["m2"]]
+    assert rows!(c, "SELECT note FROM #{evil}.items ORDER BY id") == [["decoy"], ["decoy"]]
+    # The host's own (switched) value is handed back unchanged.
+    assert rows!(c, "SELECT pg_catalog.current_setting('search_path')") == [
+             ["#{evil}, #{schema}"]
+           ]
+  end
+
+  # R30: a persisted switch would also capture unqualified operators: an
+  # exact-match =(varchar, text) in the decoy schema beats pg_catalog's
+  # text = text for a varchar column. Selecto pins search_path to
+  # pg_catalog, the domain's schemas and pg_temp around its statements.
+  test "a persisted switch to a schema with a decoy operator does not capture the read",
+       %{connection: c, evil: evil, schema: schema} do
+    exec!(c, "CREATE TABLE vitems (id int PRIMARY KEY, org_key varchar NOT NULL, note text)")
+
+    exec!(
+      c,
+      "INSERT INTO vitems VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET-t2')"
+    )
+
+    exec!(
+      c,
+      "CREATE FUNCTION #{evil}.always(varchar, text) RETURNS boolean LANGUAGE sql " <>
+        "IMMUTABLE AS 'SELECT true'"
+    )
+
+    exec!(
+      c,
+      "CREATE OPERATOR #{evil}.= (LEFTARG = varchar, RIGHTARG = text, FUNCTION = #{evil}.always)"
+    )
+
+    exec!(c, "SELECT pg_catalog.set_config('search_path', '#{evil}, #{schema}', false)")
+
+    assert rows!(c, "SELECT id FROM vitems WHERE org_key = CAST('t1' AS text) ORDER BY id") ==
+             [[1], [2]]
+
+    assert read_code(read(c, "vitems")) == [[1, "mine"]]
+
+    {:ok, rows} =
+      domain("vitems")
+      |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+      |> Selecto.with_tenant("t1")
+      |> Selecto.select(["id", "note"])
+      |> Selecto.execute_stream()
+
+    assert [{[1, "mine"], ["id", "note"]}] = Enum.map(Enum.to_list(rows), &elem(&1, 0))
+
+    assert rows!(c, "SELECT pg_catalog.current_setting('search_path')") == [
+             ["#{evil}, #{schema}"]
+           ]
+  end
+
+  # R29: a lookup that cannot run refuses; no unqualified statement runs.
+  test "a relation the reset search_path does not reach is refused", %{connection: c} do
+    assert read_code(read(c, "no_such_relation")) == :relation_unresolved
+  end
+
+  # R32: an internal recheck trigger of a DEFERRABLE EXCLUDE or UNIQUE whose
+  # operator class calls user code runs it at COMMIT; it counts. Deferred
+  # foreign keys and all-pg_catalog rechecks do not.
+  test "a deferrable recheck that can run user code refuses writes; catalog rechecks and FKs do not",
+       %{connection: c, schema: schema} do
+    exec!(c, "CREATE TABLE dparent (id int PRIMARY KEY)")
+    exec!(c, "INSERT INTO dparent VALUES (1)")
+
+    exec!(
+      c,
+      "CREATE TABLE dchild (id int PRIMARY KEY, org_key text NOT NULL, note text UNIQUE " <>
+        "DEFERRABLE INITIALLY DEFERRED, parent_id int REFERENCES dparent (id) " <>
+        "DEFERRABLE INITIALLY DEFERRED)"
+    )
+
+    exec!(c, "INSERT INTO dchild VALUES (1, 't1', 'a', 1)")
+
+    assert {:ok, %{affected_rows: 1}} =
+             Adapter.execute_write_unsafe(c, update("dchild", [{"note", "b"}], tenant("t1")), [])
+
+    exec!(
+      c,
+      "CREATE FUNCTION #{schema}.ev_cmp(a text, b text) RETURNS int LANGUAGE plpgsql IMMUTABLE " <>
+        "AS $$ BEGIN RETURN pg_catalog.bttextcmp(a, b); END $$"
+    )
+
+    for {name, op} <- [lt: "<", le: "<=", eq: "=", ge: ">=", gt: ">"] do
+      exec!(
+        c,
+        "CREATE FUNCTION #{schema}.ev_#{name}(a text, b text) RETURNS boolean LANGUAGE sql " <>
+          "IMMUTABLE AS 'SELECT pg_catalog.bttextcmp(a, b) #{op} 0'"
+      )
+    end
+
+    exec!(
+      c,
+      "CREATE OPERATOR #{schema}.<<< (LEFTARG = text, RIGHTARG = text, FUNCTION = #{schema}.ev_lt)"
+    )
+
+    exec!(
+      c,
+      "CREATE OPERATOR #{schema}.<<= (LEFTARG = text, RIGHTARG = text, FUNCTION = #{schema}.ev_le)"
+    )
+
+    exec!(
+      c,
+      "CREATE OPERATOR #{schema}.=== (LEFTARG = text, RIGHTARG = text, FUNCTION = #{schema}.ev_eq, " <>
+        "COMMUTATOR = ===)"
+    )
+
+    exec!(
+      c,
+      "CREATE OPERATOR #{schema}.>>= (LEFTARG = text, RIGHTARG = text, FUNCTION = #{schema}.ev_ge)"
+    )
+
+    exec!(
+      c,
+      "CREATE OPERATOR #{schema}.>>> (LEFTARG = text, RIGHTARG = text, FUNCTION = #{schema}.ev_gt)"
+    )
+
+    exec!(
+      c,
+      "CREATE OPERATOR CLASS #{schema}.evil_ops FOR TYPE text USING btree AS OPERATOR 1 <<<, " <>
+        "OPERATOR 2 <<=, OPERATOR 3 ===, OPERATOR 4 >>=, OPERATOR 5 >>>, FUNCTION 1 #{schema}.ev_cmp(text, text)"
+    )
+
+    exec!(
+      c,
+      "CREATE TABLE x_ex (id int PRIMARY KEY, k text, " <>
+        "EXCLUDE USING btree (k #{schema}.evil_ops WITH ===) DEFERRABLE INITIALLY DEFERRED)"
+    )
+
+    # Only internal triggers exist: the R23 user-trigger count is zero.
+    assert rows!(
+             c,
+             "SELECT count(*) FROM pg_trigger WHERE tgdeferrable AND NOT tgisinternal"
+           ) == [[0]]
+
+    assert {:error, %Error{details: %{reason: :deferred_triggers}}} =
+             Adapter.execute_write_unsafe(c, update("dchild", [{"note", "c"}], tenant("t1")), [])
+
+    assert rows!(c, "SELECT note FROM dchild") == [["b"]]
+
+    exec!(c, "DROP TABLE x_ex")
+
+    assert {:ok, %{affected_rows: 1}} =
+             Adapter.execute_write_unsafe(c, update("dchild", [{"note", "c"}], tenant("t1")), [])
   end
 end

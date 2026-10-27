@@ -110,7 +110,9 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
       trace_calls({Postgrex, :query, 4}, fn -> execute(conn, items, TaskPathAdapter) end)
 
     assert {:ok, _result} = result
-    assert calls == []
+    # Only the read's relation lookup (prepare_read/2, R23b) runs in the
+    # calling process; the statement itself runs in Selecto's task.
+    assert statement_calls(calls, items) == []
   end
 
   test "a shorter Selecto timeout is passed through instead of the cap",

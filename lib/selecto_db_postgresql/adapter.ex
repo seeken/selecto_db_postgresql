@@ -34,6 +34,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @behaviour Selecto.DB.WriteAdapter
 
   alias SelectoDBPostgreSQL.PostImage
+  alias SelectoDBPostgreSQL.RelationPath
   alias SelectoDBPostgreSQL.SessionGuard
 
   @read_committed "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
@@ -290,12 +291,52 @@ defmodule SelectoDBPostgreSQL.Adapter do
   """
   @impl true
   def execute(connection, query, params, opts) do
-    if Selecto.Executor.selecto_read?() do
-      guarded_read(connection, query, params, opts)
+    if Selecto.Executor.selecto_read?(opts) do
+      with {:ok, query} <- qualify_read(query, opts) do
+        guarded_read(connection, query, params, opts)
+      end
     else
       execute_plain(connection, query, params, opts)
     end
   end
+
+  # Ruling R23b (item 58): a Selecto read names every domain relation by
+  # the schema prepare_read/2 resolved for it (SelectoDBPostgreSQL.RelationPath).
+  defp qualify_read(query, opts) do
+    case Keyword.get(opts, :selecto_qualified_relations) do
+      relations when is_map(relations) ->
+        case RelationPath.qualify(query, relations) do
+          {:ok, query} -> {:ok, query}
+          {:error, error} -> {:error, read_refusal(error)}
+        end
+
+      _ ->
+        {:ok, query}
+    end
+  end
+
+  @doc false
+  # Before a read compiles (Selecto.Executor.prepare_read/1): the
+  # schema-qualified names of the domain's relations (R23b), resolved against
+  # the connection's reset search_path, never one a statement switched.
+  def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain) do
+    case Selecto.Executor.domain_relations(selecto) do
+      [] ->
+        {:ok, selecto}
+
+      names ->
+        case RelationPath.resolve(&guard_statement(connection, &1, &2), names) do
+          {:ok, relations} ->
+            set = Map.put(Map.get(selecto, :set) || %{}, :qualified_relations, relations)
+            {:ok, %{selecto | set: set}}
+
+          {:error, %Error{} = error} ->
+            {:error, read_refusal(error)}
+        end
+    end
+  end
+
+  def prepare_read(selecto, _connection), do: {:ok, selecto}
 
   defp execute_plain(connection, query, params, opts) do
     case Keyword.get(opts, :timeout) do
@@ -307,7 +348,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  # A Selecto read (marked by Selecto's executor, Selecto.Executor.selecto_read?/0)
+  # A Selecto read (marked by Selecto's executor, Selecto.Executor.selecto_read?/1)
   # runs on one connection between two session snapshots
   # (SelectoDBPostgreSQL.SessionGuard, items 56, 56b, 56c, 61): first the
   # shadow check of its text, then the statement, then the snapshot again.
@@ -325,7 +366,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
         &guard_statement(connection, &1, &2),
         in_transaction?,
         query,
-        params
+        params,
+        read_path(opts)
       )
     end
 
@@ -372,7 +414,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
           &execute_module_connection(connection, &1, &2, opts),
           false,
           query,
-          params
+          params,
+          read_path(opts)
         )
     end
   end
@@ -400,7 +443,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
           &guard_statement(checked_out, &1, &2),
           in_transaction?,
           query,
-          params
+          params,
+          read_path(opts)
         )
       end,
       Keyword.take(opts, [:timeout, :deadline, :queue_target, :queue_interval])
@@ -433,7 +477,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
           &execute_ecto_query(repo, &1, &2, Keyword.take(opts, [:timeout])),
           in_transaction?,
           query,
-          params
+          params,
+          read_path(opts)
         )
       end,
       # A checked-out connection runs under its checkout's deadline.
@@ -445,25 +490,35 @@ defmodule SelectoDBPostgreSQL.Adapter do
     :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
-  defp run_guarded_read(execute, guard, true, query, params) do
-    name = "selecto_read_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
+  # R30: between its session check and the statement, a read pins
+  # search_path to pg_catalog, the schemas of its relations and pg_temp
+  # (set_config(..., true)), and restores the host's value after it in the
+  # same expression that checks the pin held. Both run inside the read's own
+  # savepoint (host transaction) or its own transaction (autocommit), so a
+  # failure or a refusal rolls back every setting the statement changed.
+  defp run_guarded_read(execute, guard, in_transaction?, query, params, path) do
+    {open, close, undo} =
+      if in_transaction? do
+        name = "selecto_read_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
 
-    undo = fn ->
-      Enum.each(["ROLLBACK TO SAVEPOINT ", "RELEASE SAVEPOINT "], &guard.(&1 <> name, []))
-    end
+        {"SAVEPOINT " <> name, ["RELEASE SAVEPOINT " <> name],
+         ["ROLLBACK TO SAVEPOINT " <> name, "RELEASE SAVEPOINT " <> name]}
+      else
+        {"BEGIN", ["COMMIT"], ["ROLLBACK"]}
+      end
 
-    case guard.("SAVEPOINT " <> name, []) do
+    case guard.(open, []) do
       {:ok, _} ->
         with {:ok, before} <- read_check(guard, query),
+             {:ok, pinned} <- read_step(SessionGuard.pin(guard, path)),
              {:ok, result} <- execute.(query, params),
-             :ok <- read_compare(guard, before) do
-          case guard.("RELEASE SAVEPOINT " <> name, []) do
-            {:ok, _} -> {:ok, result}
-            {:error, _} = error -> error
-          end
+             :ok <- read_step(SessionGuard.unpin(guard, pinned, SessionGuard.search_path(before))),
+             :ok <- read_compare(guard, before),
+             :ok <- run_all(guard, close) do
+          {:ok, result}
         else
           error ->
-            undo.()
+            _ = run_all(guard, undo)
             error
         end
 
@@ -472,23 +527,28 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp run_guarded_read(execute, guard, false, query, params) do
-    with {:ok, before} <- read_check(guard, query),
-         {:ok, result} <- execute.(query, params) do
-      case read_compare(guard, before) do
-        :ok ->
-          {:ok, result}
-
-        error ->
-          SessionGuard.restore(guard, before)
-          error
+  defp run_all(guard, statements) do
+    Enum.reduce_while(statements, :ok, fn sql, :ok ->
+      case guard.(sql, []) do
+        {:ok, _} -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
       end
-    end
+    end)
   end
 
+  defp read_step(:ok), do: :ok
+  defp read_step({:ok, _} = ok), do: ok
+  defp read_step({:error, %Error{} = error}), do: {:error, read_refusal(error)}
+
+  # The search_path a read pins (R30), from the relations prepare_read/2
+  # resolved for it.
+  defp read_path(opts),
+    do: RelationPath.pinned_path(Keyword.get(opts, :selecto_qualified_relations))
+
   # The session checks, savepoints and catalog reads Selecto runs around a
-  # statement: unnamed prepared statements, kept apart from the statement
-  # cache and from the query/4 calls that carry the domain's own SQL.
+  # statement go through the same traced driver call as the statement
+  # itself; their result columns carry the `selecto_guard_` tag (R22), so a
+  # certification harness can recognise exactly these receipts.
   defp guard_statement({:pool, pool_ref}, sql, params) do
     case resolve_live_pool_pid(pool_ref) do
       {:ok, pool_pid} -> guard_statement(pool_pid, sql, params)
@@ -500,22 +560,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
        when is_atom(connection) and not is_nil(connection) do
     if ecto_repo?(connection),
       do: execute_ecto_query(connection, sql, params),
-      else: prepare_execute_guard(connection, sql, params)
+      else: query_postgrex(connection, sql, params, [])
   end
 
-  defp guard_statement(connection, sql, params),
-    do: prepare_execute_guard(connection, sql, params)
-
-  defp prepare_execute_guard(connection, sql, params) do
-    case Postgrex.prepare_execute(connection, "", sql, params) do
-      {:ok, _query, result} -> {:ok, normalize_result(result)}
-      {:error, reason} -> {:error, reason}
-    end
-  rescue
-    exception -> {:error, {:query_exception, exception.__struct__, Exception.message(exception)}}
-  catch
-    :exit, reason -> {:error, {:connection_exit, reason}}
-  end
+  defp guard_statement(connection, sql, params), do: query_postgrex(connection, sql, params, [])
 
   defp read_check(execute, query) do
     case SessionGuard.check(execute, normalize_query(query)) do
@@ -1278,7 +1326,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp candidate_identifier?(_identifier), do: false
 
   defp execute_candidate_query(connection, query, params, opts) do
-    case execute_statement(connection, query, params, Keyword.take(opts, [:timeout, :log])) do
+    with {:ok, query} <- qualify_sql(connection, query, opts),
+         {:ok, result} <-
+           execute_statement(connection, query, params, Keyword.take(opts, [:timeout, :log])) do
+      {:ok, result}
+    end
+    |> case do
       {:ok, result} -> {:ok, result}
       {:error, reason} -> {:error, write_error(:candidate_state_load_failed, reason)}
     end
@@ -1433,10 +1486,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
       guard = &guard_statement(connection, &1, &2)
 
       with {:ok, statement} <- GraphCompiler.compile_merge(node, opts),
+           {:ok, text} <- qualify_sql(connection, statement.text, opts),
+           statement = %{statement | text: text},
            {:ok, session} <- write_session(guard, statement.text, opts),
            {:ok, query_result} <-
              execute_statement(connection, statement.text, statement.params, opts),
-           :ok <- SessionGuard.compare(guard, session),
+           :ok <- SessionGuard.compare(guard, session, write_compare(opts)),
            {:ok, {results, affected_rows}} <- GraphCompiler.merge_results(node, query_result) do
         {:ok, results, affected_rows, :merge}
       else
@@ -1491,9 +1546,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp execute_write_command(connection, %Command{} = command, opts) do
+    declared = command.relation
+
     with :ok <- ensure_baseline(connection, opts),
+         {:ok, command} <- qualify_command(connection, command, opts),
          :ok <- verify_read_committed(connection, command, opts),
-         :ok <- verify_native_constraints(connection, command, opts),
+         :ok <- verify_native_constraints(connection, command, declared, opts),
          {:ok, statement} <- WriteCompiler.compile(command, opts),
          {:ok, query_result} <- execute_guarded_statement(connection, command, statement, opts),
          {:ok, affected_rows} <- enforce_cardinality(command, query_result) do
@@ -1530,14 +1588,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
             with {:ok, target} <- PostImage.lock_delete(command, check, guard),
                  {:ok, query_result} <-
                    execute_statement(connection, statement.text, statement.params, opts),
-                 :ok <- SessionGuard.compare(guard, session),
+                 :ok <- SessionGuard.compare(guard, session, write_compare(opts)),
                  :ok <- PostImage.check_delete(command, target, check) do
               {:ok, query_result}
             end
           else
             with {:ok, query_result} <-
                    execute_statement(connection, statement.text, statement.params, opts),
-                 :ok <- SessionGuard.compare(guard, session) do
+                 :ok <- SessionGuard.compare(guard, session, write_compare(opts)) do
               {:ok, query_result}
             end
           end
@@ -1547,7 +1605,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
           with {:ok, target} <- PostImage.resolve(command, guard, guard),
                {:ok, query_result} <- execute_statement(connection, text, statement.params, opts),
-               :ok <- SessionGuard.compare(guard, session),
+               :ok <- SessionGuard.compare(guard, session, write_compare(opts)),
                {query_result, keys} = PostImage.split_result(query_result, command),
                :ok <-
                  PostImage.verify(
@@ -1568,7 +1626,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # the write, such as a candidate load, may not have changed the session
   # either).
   defp write_session(check, text, opts) do
-    with {:ok, current} <- SessionGuard.check(check, text) do
+    with {:ok, current} <- SessionGuard.check(check, text),
+         :ok <- SessionGuard.deferrable_free(current, writes: true) do
       session_baseline(opts, current)
     end
   end
@@ -1588,11 +1647,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
             Process.put({__MODULE__, :session, key}, current)
             {:ok, current}
 
-          %{snapshot: snapshot} = baseline when snapshot == current.snapshot ->
-            {:ok, baseline}
-
-          _changed ->
-            SessionGuard.changed()
+          baseline ->
+            if SessionGuard.same?(current, baseline, search_path: pinned_value(opts)),
+              do: {:ok, baseline},
+              else: SessionGuard.changed()
         end
     end
   end
@@ -1601,8 +1659,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # compares the session with its baseline again before it ends, so no
   # statement of the write leaves the session changed for later SQL.
   defp with_write_transaction(connection, opts, fun) do
-    host? = host_transaction?(connection)
-
     with_postgres_transaction(connection, opts, fn transactional_connection ->
       key = make_ref()
 
@@ -1611,80 +1667,144 @@ defmodule SelectoDBPostgreSQL.Adapter do
       try do
         with {:ok, result} <-
                fun.(transactional_connection, Keyword.put(opts, :selecto_session_key, key)),
-             :ok <- deferred_events(check, host?),
              :ok <- final_session_check(check, key) do
           {:ok, result}
         end
       after
         Process.delete({__MODULE__, :session, key})
+        Process.delete({__MODULE__, :pin, key})
+        Process.delete({__MODULE__, :pin_relations, key})
       end
     end)
   end
 
-  # A deferred constraint trigger fires at COMMIT, after every snapshot of
-  # the write, and could leave a session-level set_config behind (R8). In a
-  # transaction the adapter owns, SET CONSTRAINTS ALL IMMEDIATE fires them
-  # now, before the final session check. Inside the host's transaction they
-  # would fire at the host's COMMIT, so a write there is refused while any
-  # enabled non-internal deferrable trigger exists.
-  defp deferred_events(check, false) do
-    case check.("SET CONSTRAINTS ALL IMMEDIATE", []) do
-      {:ok, _} -> :ok
-      {:error, %Error{}} = error -> error
-      {:error, reason} -> {:error, write_error(:execution_failed, reason)}
+  # Ruling R23b: the written relation and every relation its foreign-key
+  # guards read are named by the schema RelationPath resolves (the reset
+  # search_path first), never one a trigger's set_config switched.
+  defp qualify_command(connection, %Command{} = command, opts) do
+    guards = List.wrap(Map.get(command.metadata || %{}, :foreign_key_guards, []))
+
+    names =
+      [command.relation | Enum.map(guards, &(Map.get(&1, :relation) || Map.get(&1, "relation")))]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(&to_string/1)
+
+    with {:ok, relations} <- RelationPath.resolve(&guard_statement(connection, &1, &2), names),
+         :ok <- pin_write(connection, opts, relations) do
+      qualified = fn relation -> qualified_name(relations, relation) end
+
+      guards =
+        Enum.map(guards, fn
+          %{relation: relation} = guard -> %{guard | relation: qualified.(relation)}
+          guard -> guard
+        end)
+
+      metadata =
+        if Map.has_key?(command.metadata || %{}, :foreign_key_guards),
+          do: Map.put(command.metadata, :foreign_key_guards, guards),
+          else: command.metadata
+
+      {:ok, %{command | relation: qualified.(command.relation), metadata: metadata}}
     end
   end
 
-  defp deferred_events(check, true) do
-    case check.(
-           "SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t " <>
-             "WHERE t.tgdeferrable AND NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'",
-           []
-         ) do
-      {:ok, %{rows: [[0]]}} ->
+  # A statement the adapter builds itself (candidate loads, MERGE) names its
+  # relations by their resolved schemas too (R23b).
+  defp qualify_sql(connection, sql, opts) do
+    sql = IO.iodata_to_binary(sql)
+
+    with {:ok, relations} <-
+           RelationPath.resolve(&guard_statement(connection, &1, &2), RelationPath.names(sql)),
+         :ok <- pin_write(connection, opts, relations) do
+      RelationPath.qualify(sql, relations)
+    end
+  end
+
+  # R30: inside a write's transaction, once its baseline is taken, the
+  # session's search_path is pinned to pg_catalog, the schemas of every
+  # relation the write has resolved so far, and pg_temp (set_config(...,
+  # true)); every later check of the write expects the pin, and the final
+  # check restores the host's value in the expression that verifies it.
+  defp pin_write(_connection, _opts, relations) when map_size(relations) == 0, do: :ok
+
+  defp pin_write(connection, opts, relations) do
+    case Keyword.get(opts, :selecto_session_key) do
+      nil ->
         :ok
 
-      {:ok, _deferrable} ->
-        {:error,
-         Error.new(
-           :query_enforcement,
-           "PostgreSQL deferred triggers would fire at the host's COMMIT, after the session check",
-           details: %{
-             code: :query_rule_not_evaluable,
-             reason: :deferred_triggers,
-             adapter: :postgresql
-           }
-         )}
+      key ->
+        baseline? = Process.get({__MODULE__, :session, key}) != nil
 
-      {:error, reason} ->
-        {:error, write_error(:execution_failed, reason)}
+        with :ok <- if(baseline?, do: :ok, else: ensure_baseline(connection, opts)) do
+          seen = Map.merge(Process.get({__MODULE__, :pin_relations, key}, %{}), relations)
+          path = RelationPath.pinned_path(seen)
+
+          case Process.get({__MODULE__, :pin, key}) do
+            {^path, _pinned} ->
+              :ok
+
+            _other ->
+              case SessionGuard.pin(&guard_statement(connection, &1, &2), path) do
+                {:ok, pinned} ->
+                  Process.put({__MODULE__, :pin_relations, key}, seen)
+                  Process.put({__MODULE__, :pin, key}, {path, pinned})
+                  :ok
+
+                {:error, _} = error ->
+                  error
+              end
+          end
+        end
     end
   end
 
-  defp host_transaction?(%DBConnection{} = connection),
-    do: DBConnection.status(connection) == :transaction
-
-  defp host_transaction?(connection) when is_atom(connection) and not is_nil(connection) do
-    ecto_repo?(connection) and module_exports?(connection, :in_transaction?, 0) and
-      apply(connection, :in_transaction?, [])
+  defp pinned_value(opts) do
+    case Process.get({__MODULE__, :pin, Keyword.get(opts, :selecto_session_key)}) do
+      {_path, pinned} -> pinned
+      nil -> nil
+    end
   end
 
-  defp host_transaction?(_connection), do: false
+  defp write_compare(opts), do: [writes: true, search_path: pinned_value(opts)]
+
+  # "schema.relation" for the compilers' dot-split quoting.
+  defp qualified_name(relations, relation) do
+    case Map.get(relations, to_string(relation)) do
+      nil ->
+        relation
+
+      quoted ->
+        quoted
+        |> String.split(~r/"\."/, parts: 2)
+        |> Enum.map_join(".", &(&1 |> String.trim("\"") |> String.replace("\"\"", "\"")))
+    end
+  end
 
   # The write's session baseline is taken before any other SQL of the
   # command (R1): verify_read_committed and the native-constraint attestation
   # follow it, so no catalog read or user code runs unobserved.
   defp ensure_baseline(connection, opts) do
     with {:ok, current} <- SessionGuard.snapshot(&guard_statement(connection, &1, &2)),
+         :ok <- SessionGuard.deferrable_free(current, writes: true),
          {:ok, _baseline} <- session_baseline(opts, current) do
       :ok
     end
   end
 
   defp final_session_check(check, key) do
+    opts = [selecto_session_key: key]
+
     case Process.get({__MODULE__, :session, key}) do
-      nil -> :ok
-      baseline -> SessionGuard.compare(check, baseline)
+      nil ->
+        :ok
+
+      baseline ->
+        with :ok <- SessionGuard.compare(check, baseline, write_compare(opts)) do
+          case pinned_value(opts) do
+            nil -> :ok
+            pinned -> SessionGuard.unpin(check, pinned, SessionGuard.search_path(baseline))
+          end
+        end
     end
   end
 
@@ -1736,23 +1856,27 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp verify_read_committed(_connection, _command, _opts), do: :ok
 
-  defp verify_native_constraints(_connection, %Command{native_constraints: []}, _opts), do: :ok
+  defp verify_native_constraints(_connection, %Command{native_constraints: []}, _declared, _opts),
+    do: :ok
 
+  # `declared` is the relation as the command named it (errors report it);
+  # the attestation reads the qualified one.
   defp verify_native_constraints(
          connection,
          %Command{native_constraints: constraints, relation: relation},
+         declared,
          opts
        )
        when is_list(constraints) do
     Enum.reduce_while(constraints, :ok, fn native, :ok ->
-      case verify_native_constraint(connection, relation, native, opts) do
+      case verify_native_constraint(connection, relation, declared, native, opts) do
         :ok -> {:cont, :ok}
         {:error, _} = error -> {:halt, error}
       end
     end)
   end
 
-  defp verify_native_constraint(connection, relation, native, opts) do
+  defp verify_native_constraint(connection, relation, declared, native, opts) do
     with %{adapter: "postgresql", constraint: constraint, category: category} <- native,
          expected_type when is_binary(expected_type) <- native_constraint_type(category),
          {:ok, %{rows: [[^expected_type]]}} <-
@@ -1770,7 +1894,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
            :native_constraint_unavailable,
            "PostgreSQL cannot attest the declared native constraint for this relation",
            details: %{
-             relation: to_string(relation),
+             relation: to_string(declared),
              native_constraint: safe_native_constraint(native)
            }
          )}
@@ -2065,14 +2189,15 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @impl true
   def stream(connection, query, params, opts) do
-    # A Selecto read's stream checks the session (Selecto.Executor.selecto_read?/0,
+    # A Selecto read's stream checks the session (Selecto.Executor.selecto_read?/1,
     # captured here: the stream's producer runs in its own process).
-    opts =
-      if Selecto.Executor.selecto_read?(),
-        do: Keyword.put(opts, :selecto_session_guard, true),
-        else: opts
-
-    open_stream(connection, query, params, opts)
+    if Selecto.Executor.selecto_read?(opts) do
+      with {:ok, query} <- qualify_read(query, opts) do
+        open_stream(connection, query, params, Keyword.put(opts, :selecto_session_guard, true))
+      end
+    else
+      open_stream(connection, query, params, opts)
+    end
   end
 
   defp open_stream({:pool, pool_ref}, query, params, opts) do
@@ -3405,26 +3530,44 @@ defmodule SelectoDBPostgreSQL.Adapter do
           fn tx_conn ->
             check = &guard_statement(tx_conn, &1, &2)
 
-            before =
+            refuse = fn
+              {:error, %Error{} = error} -> Postgrex.rollback(tx_conn, read_refusal(error))
+              {:error, reason} -> Postgrex.rollback(tx_conn, reason)
+            end
+
+            # R30: the cursor runs under the pinned search_path; every batch
+            # is compared with the pin expected in place.
+            {before, pinned} =
               if guarded? do
-                case SessionGuard.check(check, query) do
-                  {:ok, before} -> before
-                  {:error, error} -> Postgrex.rollback(tx_conn, read_refusal(error))
+                with {:ok, before} <- SessionGuard.check(check, query),
+                     {:ok, pinned} <- SessionGuard.pin(check, read_path(opts)) do
+                  {before, pinned}
+                else
+                  error -> refuse.(error)
                 end
+              else
+                {nil, nil}
               end
 
             tx_conn
             |> Postgrex.stream(query, params, max_rows: max_rows)
             |> Enum.each(fn %Postgrex.Result{rows: rows, columns: columns} ->
               if guarded? do
-                case SessionGuard.compare(check, before) do
+                case SessionGuard.compare(check, before, search_path: pinned) do
                   :ok -> :ok
-                  {:error, error} -> Postgrex.rollback(tx_conn, read_refusal(error))
+                  error -> refuse.(error)
                 end
               end
 
               send_chunk.(rows, columns)
             end)
+
+            if guarded? do
+              case SessionGuard.unpin(check, pinned, SessionGuard.search_path(before)) do
+                :ok -> :ok
+                error -> refuse.(error)
+              end
+            end
           end,
           timeout: stream_timeout
         )
