@@ -307,8 +307,8 @@ another schema's relation, function or operator of the same name. So:
   domain that names a relation as `"schema.relation"` keeps it. Any other
   name is resolved against the connection's **reset** search_path
   (`pg_settings.reset_val`: the server, database, role or startup value,
-  which `SET` and `set_config` do not change), with `"$user"` as the session
-  user and `pg_temp` skipped; a name the reset path does not reach but the
+  which `SET` and `set_config` do not change), with `"$user"` as `current_user`
+  (as PostgreSQL expands it) and `pg_temp` skipped; a name the reset path does not reach but the
   session's own temp schema holds is the host's temp table and is named by
   that schema explicitly. The current search_path is never consulted:
   **a host that `SET`s search_path to reach another schema must declare that
@@ -321,11 +321,20 @@ another schema's relation, function or operator of the same name. So:
   (qualified) relation, the later bodies and the main query the CTE. A
   collision that cannot be scoped (`WITH RECURSIVE`, a nested `WITH`)
   refuses (`reason: :cte_name_collision`).
-- **Each Selecto statement runs under a pinned search_path**:
-  `pg_catalog, <the schemas of its relations>, pg_temp`, set with
+- **Each Selecto statement runs under pinned settings**: search_path
+  `pg_catalog, <the schemas of its relations>, pg_temp`, `TimeZone=UTC`,
+  `DateStyle='ISO, MDY'`, `IntervalStyle=postgres`,
+  `extra_float_digits=3`, `bytea_output=hex` and
+  `standard_conforming_strings=on`, set in one statement with
   `set_config(..., true)` inside the read's savepoint or transaction, or the
-  write's, and restored to the host's value afterwards in the same
-  expression that checks the pin held. Unqualified functions and operators
+  write's, and restored to the host's values afterwards in the same
+  expression that checks every pin held. A session value a trigger or
+  earlier SQL persisted (even one masked by a local value of the same
+  setting) therefore never decides how a Selecto statement resolves names
+  or parses and renders values. A stream holds its pins on its own
+  connection checkout until it ends. `lc_monetary` and
+  `lc_numeric` are not pinned: generated SQL does not format money or
+  locale numbers. Unqualified functions and operators
   therefore resolve to pg_catalog's first, and temp objects last. Functions
   or operators of an extension installed in a schema none of the domain's
   relations live in must be schema-qualified in the domain.

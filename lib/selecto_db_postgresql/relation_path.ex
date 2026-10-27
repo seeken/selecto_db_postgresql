@@ -12,8 +12,8 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   # keeps it. Any other name is resolved against the connection's RESET
   # search_path only (pg_settings.reset_val: the server, database, role or
   # startup value, which SET and set_config(..., false) do not change), with
-  # "$user" as the session user, schemas that do not exist and pg_temp
-  # skipped. A name the reset path does not reach but the session's own
+  # "$user" as current_user (as PostgreSQL expands it), schemas that do
+  # not exist and pg_temp skipped. A name the reset path does not reach but the session's own
   # temp schema holds is the host's temp relation (item 19: the shadow check
   # refuses a temp relation that has a namesake) and is named
   # "pg_temp_N"."name" explicitly. Never the current search_path: a host
@@ -34,7 +34,7 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   WITH selecto_path AS (
     SELECT u.ord,
            CASE WHEN pg_catalog.btrim(u.part) OPERATOR(pg_catalog.=) ANY (ARRAY['"$user"', '$user'])
-                THEN CAST(SESSION_USER AS pg_catalog.text)
+                THEN CAST(CURRENT_USER AS pg_catalog.text)
                 ELSE pg_catalog.btrim(pg_catalog.btrim(u.part), '"') END AS nsp
     FROM pg_catalog.pg_settings s,
          pg_catalog.unnest(pg_catalog.string_to_array(s.reset_val, ',')) WITH ORDINALITY AS u(part, ord)
@@ -125,6 +125,19 @@ defmodule SelectoDBPostgreSQL.RelationPath do
     |> Enum.map(fn [_keyword, name] -> unquote_name(name) end)
     |> Enum.reject(&(String.downcase(&1) in ctes))
     |> Enum.uniq()
+  end
+
+  @doc """
+  `:ok` when every relation position (FROM, JOIN, INTO) of `sql` is
+  schema-qualified, a function call, a derived table or one of the
+  statement's CTE names; otherwise a typed refusal. Checked on the exact
+  text a Selecto statement executes (R29).
+  """
+  def qualified(sql) do
+    case names(sql) do
+      [] -> :ok
+      missing -> unresolved(missing)
+    end
   end
 
   defp schema_of(quoted) do
