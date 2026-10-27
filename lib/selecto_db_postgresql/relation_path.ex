@@ -2,26 +2,28 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   @moduledoc false
 
   # Schema-qualified relations and a pinned search_path for generated reads
-  # and writes (item 58, rulings R23b, R29, R30). A search_path switch that
-  # persists on the connection (a deferred trigger's set_config(..., false)
-  # racing a host REPEATABLE READ transaction, or any earlier session-level
-  # set_config) must not redirect a later Selecto statement to another
-  # schema's relation, function or operator of the same name.
+  # and writes (item 58, rulings R23b, R29, R30, R36, R38). A search_path
+  # switch that persists on the connection (a deferred trigger's
+  # set_config(..., false) racing a host REPEATABLE READ transaction, or any
+  # earlier session-level set_config) must not redirect a later Selecto
+  # statement to another schema's relation, function or operator.
   #
-  # A relation name a domain declares with its schema ("schema.relation")
-  # keeps it. Any other name is resolved against the connection's RESET
-  # search_path only (pg_settings.reset_val: the server, database, role or
-  # startup value, which SET and set_config(..., false) do not change), with
-  # "$user" as current_user (as PostgreSQL expands it), schemas that do
-  # not exist and pg_temp skipped. A name the reset path does not reach but the session's own
-  # temp schema holds is the host's temp relation (item 19: the shadow check
-  # refuses a temp relation that has a namesake) and is named
-  # "pg_temp_N"."name" explicitly. Never the current search_path: a host
-  # that SETs search_path to reach another schema declares that schema on
-  # the domain. A name neither reaches, or a lookup that cannot run (no connection,
-  # an aborted transaction), refuses: no unqualified statement runs (fail
-  # closed). Every function and operator of the lookup is pg_catalog
-  # qualified, and its columns carry the `selecto_guard_` tag.
+  # A relation a domain or command declares with its schema
+  # ("schema.relation", "pg_temp.relation" for a host temp table) keeps it.
+  # Any other name is resolved against the connection's RESET search_path,
+  # which PostgreSQL itself parses (R36): inside a savepoint or transaction
+  # of its own that is rolled back afterwards, the lookup applies
+  # pg_settings.reset_val with set_config(..., true) and reads
+  # current_schemas(false), so quoting, case folding, "$user" and missing
+  # schemas follow the server; pg_temp never takes part. The name is also
+  # looked up under the host's CURRENT path (current_schemas(true), the temp
+  # schema included where PostgreSQL searches it): a name the two resolve
+  # differently refuses (`relation_ambiguous`, R38), a name only the
+  # session's temp schema holds refuses unless declared, and a name neither
+  # reaches, or a lookup that cannot run, refuses (`relation_unresolved`):
+  # no unqualified statement runs. Every function and operator of the
+  # lookup is pg_catalog qualified, and its columns carry the
+  # `selecto_guard_` tag.
   #
   # `pinned_path/1` is the search_path every Selecto statement runs under
   # (R30): pg_catalog first, the schemas of its relations, pg_temp last.
@@ -32,43 +34,69 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   # or ONLY), a name that is not a function call or qualified.
   @position ~r/(\b(?:from|join|into)\s+(?>(?:(?:lateral|only)\b\s*)?))("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)(?!\s*[.(])(?![A-Za-z0-9_$])/i
 
+  @host_sql "SELECT CAST(pg_catalog.current_schemas(true) AS pg_catalog.text[]) " <>
+              "AS selecto_guard_host_schemas"
+
+  @reset_sql "SELECT pg_catalog.set_config('search_path', (SELECT s.reset_val " <>
+               "FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'search_path'), true) " <>
+               "AS selecto_guard_reset_path"
+
+  # Per name: the schema and relation the reset path (now in effect,
+  # current_schemas(false), the temp schema excluded) resolves it to, and
+  # the ones the host's path ($2) resolves it to.
   @resolve_sql """
-  WITH selecto_path AS (
-    SELECT u.ord,
-           CASE WHEN pg_catalog.btrim(u.part) OPERATOR(pg_catalog.=) ANY (ARRAY['"$user"', '$user'])
-                THEN CAST(CURRENT_USER AS pg_catalog.text)
-                ELSE pg_catalog.btrim(pg_catalog.btrim(u.part), '"') END AS nsp
-    FROM pg_catalog.pg_settings s,
-         pg_catalog.unnest(pg_catalog.string_to_array(s.reset_val, ',')) WITH ORDINALITY AS u(part, ord)
-    WHERE s.name OPERATOR(pg_catalog.=) 'search_path'
-      AND pg_catalog.btrim(u.part) OPERATOR(pg_catalog.<>) 'pg_temp'
-    UNION ALL
-    SELECT 1000000, CAST(n.nspname AS pg_catalog.text)
-    FROM pg_catalog.pg_namespace n
-    WHERE n.oid OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()
+  WITH selecto_reset AS (
+    SELECT u.nsp, u.ord
+    FROM pg_catalog.unnest(pg_catalog.current_schemas(false)) WITH ORDINALITY AS u(nsp, ord)
+    JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) u.nsp
+    WHERE n.oid OPERATOR(pg_catalog.<>) pg_catalog.pg_my_temp_schema()
+  ),
+  selecto_host AS (
+    SELECT u.nsp, u.ord
+    FROM pg_catalog.unnest($2::pg_catalog.text[]) WITH ORDINALITY AS u(nsp, ord)
+  ),
+  selecto_match AS (
+    SELECT r.name, n.nspname, c.relname,
+           n.oid OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema() AS is_temp,
+           (CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) r.name) AS exact
+    FROM pg_catalog.unnest($1::pg_catalog.text[]) AS r(name)
+    JOIN pg_catalog.pg_class c
+      ON CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) r.name
+         OR CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) pg_catalog.lower(r.name)
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+    WHERE c.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r', 'p', 'v', 'm', 'f']::pg_catalog."char"[])
   )
-  SELECT DISTINCT ON (r.name)
-         r.name AS selecto_guard_relation_input,
-         CAST(n.nspname AS pg_catalog.text) AS selecto_guard_relation_schema,
-         CAST(c.relname AS pg_catalog.text) AS selecto_guard_relation_name
+  SELECT r.name AS selecto_guard_relation_input,
+         (SELECT CAST(m.nspname AS pg_catalog.text) FROM selecto_match m
+          JOIN selecto_reset p ON p.nsp OPERATOR(pg_catalog.=) m.nspname
+          WHERE m.name OPERATOR(pg_catalog.=) r.name ORDER BY p.ord, m.exact DESC LIMIT 1)
+           AS selecto_guard_relation_schema,
+         (SELECT CAST(m.relname AS pg_catalog.text) FROM selecto_match m
+          JOIN selecto_reset p ON p.nsp OPERATOR(pg_catalog.=) m.nspname
+          WHERE m.name OPERATOR(pg_catalog.=) r.name ORDER BY p.ord, m.exact DESC LIMIT 1)
+           AS selecto_guard_relation_name,
+         (SELECT CAST(m.nspname AS pg_catalog.text) FROM selecto_match m
+          JOIN selecto_host h ON h.nsp OPERATOR(pg_catalog.=) m.nspname
+          WHERE m.name OPERATOR(pg_catalog.=) r.name ORDER BY h.ord, m.exact DESC LIMIT 1)
+           AS selecto_guard_relation_host_schema,
+         COALESCE((SELECT m.is_temp FROM selecto_match m
+          JOIN selecto_host h ON h.nsp OPERATOR(pg_catalog.=) m.nspname
+          WHERE m.name OPERATOR(pg_catalog.=) r.name ORDER BY h.ord, m.exact DESC LIMIT 1), false)
+           AS selecto_guard_relation_host_temp
   FROM pg_catalog.unnest($1::pg_catalog.text[]) AS r(name)
-  JOIN pg_catalog.pg_class c
-    ON CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) r.name
-       OR CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) pg_catalog.lower(r.name)
-  JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
-  JOIN selecto_path p ON p.nsp OPERATOR(pg_catalog.=) CAST(n.nspname AS pg_catalog.text)
-  WHERE c.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r', 'p', 'v', 'm', 'f']::pg_catalog."char"[])
-  ORDER BY r.name, p.ord, (CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) r.name) DESC
   """
 
   @doc """
   `{:ok, %{name => ~s("schema"."relation")}}` for every name (declared
-  qualified names map to their own quoted form), or a typed refusal when a
-  name does not resolve or the lookup cannot run.
+  qualified names map to their own quoted form), or a typed refusal. Runs
+  its statements through `execute` inside a savepoint (`in_transaction?`)
+  or a transaction of its own, rolled back afterwards.
   """
-  def resolve(_execute, []), do: {:ok, %{}}
+  def resolve(execute, names, in_transaction? \\ true)
 
-  def resolve(execute, names) do
+  def resolve(_execute, [], _in_transaction?), do: {:ok, %{}}
+
+  def resolve(execute, names, in_transaction?) do
     names = names |> Enum.map(&to_string/1) |> Enum.uniq()
     {qualified, plain} = Enum.split_with(names, &String.contains?(&1, "."))
     own = Map.new(qualified, &{&1, quote_relation(&1)})
@@ -76,22 +104,74 @@ defmodule SelectoDBPostgreSQL.RelationPath do
     if plain == [] do
       {:ok, own}
     else
-      case execute.(@resolve_sql, [plain]) do
-        {:ok, %{rows: rows}} when is_list(rows) ->
-          resolved =
-            Enum.reduce(rows, own, fn [name, schema, relation], acc ->
-              Map.put(acc, name, quote_identifier(schema) <> "." <> quote_identifier(relation))
-            end)
-
-          case Enum.reject(plain, &Map.has_key?(resolved, &1)) do
-            [] -> {:ok, resolved}
-            missing -> unresolved(missing)
-          end
-
-        _other ->
-          unavailable()
+      case lookup(execute, plain, in_transaction?) do
+        {:ok, rows} -> decide(rows, own)
+        :error -> unavailable()
       end
     end
+  end
+
+  defp lookup(execute, plain, in_transaction?) do
+    name = "selecto_path_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    {open, close} =
+      if in_transaction?,
+        do:
+          {"SAVEPOINT " <> name, ["ROLLBACK TO SAVEPOINT " <> name, "RELEASE SAVEPOINT " <> name]},
+        else: {"BEGIN", ["ROLLBACK"]}
+
+    case execute.(open, []) do
+      {:ok, _} ->
+        result =
+          with {:ok, %{rows: [[host]]}} when is_list(host) <- execute.(@host_sql, []),
+               {:ok, %{rows: [[_reset]]}} <- execute.(@reset_sql, []),
+               {:ok, %{rows: rows}} when is_list(rows) <- execute.(@resolve_sql, [plain, host]) do
+            {:ok, rows}
+          else
+            _ -> :error
+          end
+
+        Enum.each(close, &execute.(&1, []))
+        result
+
+      _ ->
+        :error
+    end
+  end
+
+  defp decide(rows, own) do
+    Enum.reduce_while(rows, {:ok, own}, fn
+      [name, schema, relation, host, host_temp], {:ok, acc} ->
+        cond do
+          is_nil(schema) and host_temp ->
+            {:halt,
+             refusal(
+               :relation_unresolved,
+               "a domain relation resolves only to a temporary table; declare it as pg_temp.<name>",
+               [name]
+             )}
+
+          is_nil(schema) and is_nil(host) ->
+            {:halt, unresolved([name])}
+
+          is_nil(schema) or (host != nil and host != schema) or host_temp ->
+            {:halt,
+             refusal(
+               :relation_ambiguous,
+               "PostgreSQL resolves a domain relation differently under the session's search_path " <>
+                 "than under its reset search_path; declare the schema on the domain",
+               [name]
+             )}
+
+          true ->
+            {:cont,
+             {:ok,
+              Map.put(acc, name, quote_identifier(schema) <> "." <> quote_identifier(relation))}}
+        end
+
+      _row, _acc ->
+        {:halt, unavailable()}
+    end)
   end
 
   @doc """
@@ -151,15 +231,21 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   defp unresolved(missing),
     do:
+      refusal(
+        :relation_unresolved,
+        "could not resolve a relation's schema from the reset search_path; " <>
+          "declare the schema on the domain",
+        missing
+      )
+
+  defp refusal(reason, message, relations),
+    do:
       {:error,
-       Error.new(
-         :query_enforcement,
-         "PostgreSQL could not resolve a relation's schema from the reset search_path; " <>
-           "declare the schema on the domain",
+       Error.new(:query_enforcement, "PostgreSQL " <> message,
          details: %{
            code: :query_rule_not_evaluable,
-           reason: :relation_unresolved,
-           relations: missing,
+           reason: reason,
+           relations: relations,
            adapter: :postgresql
          }
        )}

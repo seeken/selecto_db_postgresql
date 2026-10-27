@@ -7,6 +7,8 @@ defmodule SelectoDBPostgreSQL.CoDomainTest do
       name: "Clients",
       source: %{
         source_table: "selecto_lookup_clients",
+        # A host temp table is declared (R38).
+        source_schema: "pg_temp",
         primary_key: :id,
         fields: [:id, :name, :city, :tenant_id, :active],
         columns: %{

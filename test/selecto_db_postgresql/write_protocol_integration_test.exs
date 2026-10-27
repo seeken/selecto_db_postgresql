@@ -120,7 +120,7 @@ defmodule SelectoDBPostgreSQL.WriteProtocolIntegrationTest do
         %Node{
           id: node_id,
           path: [node_index],
-          relation: :selecto_protocol_atomicity,
+          relation: "pg_temp.selecto_protocol_atomicity",
           strategy: :ordered,
           rows: [%Row{id: "row-#{node_index}", path: [node_index], command: command}]
         }
@@ -136,7 +136,7 @@ defmodule SelectoDBPostgreSQL.WriteProtocolIntegrationTest do
 
       attrs = %{
         operation: :update,
-        relation: :selecto_protocol_atomicity,
+        relation: "pg_temp.selecto_protocol_atomicity",
         assignments: [
           %{
             field: :state,

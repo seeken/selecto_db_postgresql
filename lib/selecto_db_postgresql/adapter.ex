@@ -292,7 +292,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @impl true
   def execute(connection, query, params, opts) do
     if Selecto.Executor.selecto_read?(opts) do
-      with {:ok, query} <- qualify_read(query, opts) do
+      with {:ok, query, opts} <- qualify_read(connection, query, opts) do
         guarded_read(connection, query, params, opts)
       end
     else
@@ -302,16 +302,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   # Ruling R23b (item 58): a Selecto read names every domain relation by
   # the schema prepare_read/2 resolved for it (SelectoDBPostgreSQL.RelationPath).
-  defp qualify_read(query, opts) do
-    case Keyword.get(opts, :selecto_qualified_relations) do
-      relations when is_map(relations) ->
-        case RelationPath.qualify(query, relations) do
-          {:ok, query} -> {:ok, query}
-          {:error, error} -> {:error, read_refusal(error)}
-        end
+  # A read that reaches the adapter without them (R39: no domain, or an
+  # entry point that skipped prepare_read) resolves the relations its own
+  # text names, with the same rules.
+  defp qualify_read(connection, query, opts) do
+    relations =
+      case Keyword.get(opts, :selecto_qualified_relations) do
+        relations when is_map(relations) -> {:ok, relations}
+        _ -> resolve_relations(connection, RelationPath.names(query))
+      end
 
-      _ ->
-        {:ok, query}
+    with {:ok, relations} <- relations,
+         {:ok, query} <- RelationPath.qualify(query, relations) do
+      {:ok, query, Keyword.put(opts, :selecto_qualified_relations, relations)}
+    else
+      {:error, %Error{} = error} -> {:error, read_refusal(error)}
+      {:error, _} = error -> error
     end
   end
 
@@ -320,12 +326,18 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # schema-qualified names of the domain's relations (R23b), resolved against
   # the connection's reset search_path, never one a statement switched.
   def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain) do
+    declared = declared_schemas(selecto)
+
     case Selecto.Executor.domain_relations(selecto) do
       [] ->
         {:ok, selecto}
 
       names ->
-        case RelationPath.resolve(&guard_statement(connection, &1, &2), names) do
+        # A relation the domain declares with `source_schema` (R39) is named
+        # by that schema; "schema.relation" names keep theirs.
+        names = Enum.map(names, &if(schema = declared[&1], do: schema <> "." <> &1, else: &1))
+
+        case with_declared(resolve_relations(connection, names), declared) do
           {:ok, relations} ->
             set = Map.put(Map.get(selecto, :set) || %{}, :qualified_relations, relations)
             {:ok, %{selecto | set: set}}
@@ -337,6 +349,61 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   def prepare_read(selecto, _connection), do: {:ok, selecto}
+
+  # `source_schema` declared next to a `source_table`, per table, across the
+  # read's domains; a table declared with two schemas refuses.
+  defp declared_schemas(selecto) do
+    [selecto | Selecto.Executor.set_operands(selecto)]
+    |> Enum.map(&Map.get(&1, :domain))
+    |> Enum.reduce(%{}, &collect_declared/2)
+  end
+
+  defp collect_declared(map, acc) when is_map(map) and not is_struct(map) do
+    table = Map.get(map, :source_table) || Map.get(map, "source_table")
+    schema = Map.get(map, :source_schema) || Map.get(map, "source_schema")
+
+    acc =
+      if table && is_binary(schema) && schema != "" do
+        Map.update(acc, to_string(table), schema, fn
+          ^schema -> schema
+          _other -> :conflict
+        end)
+      else
+        acc
+      end
+
+    Enum.reduce(Map.values(map), acc, &collect_declared/2)
+  end
+
+  defp collect_declared(list, acc) when is_list(list),
+    do: Enum.reduce(list, acc, &collect_declared/2)
+
+  defp collect_declared(_value, acc), do: acc
+
+  # The resolved map keyed by each declared table's own name too, so the
+  # compiled SQL's bare name is qualified with the declared schema.
+  defp with_declared({:ok, relations}, declared) do
+    Enum.reduce_while(declared, {:ok, relations}, fn
+      {table, :conflict}, _acc ->
+        {:halt,
+         {:error,
+          Error.new(
+            :query_enforcement,
+            "PostgreSQL domain declares one relation with two schemas",
+            details: %{
+              code: :query_rule_not_evaluable,
+              reason: :relation_ambiguous,
+              relations: [table],
+              adapter: :postgresql
+            }
+          )}}
+
+      {table, schema}, {:ok, acc} ->
+        {:cont, {:ok, Map.put(acc, table, Map.fetch!(acc, schema <> "." <> table))}}
+    end)
+  end
+
+  defp with_declared(error, _declared), do: error
 
   defp execute_plain(connection, query, params, opts) do
     case Keyword.get(opts, :timeout) do
@@ -545,6 +612,69 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # resolved for it.
   defp read_path(opts),
     do: RelationPath.pinned_path(Keyword.get(opts, :selecto_qualified_relations))
+
+  # R36: the relation lookup runs its own savepoint or transaction, so all
+  # of its statements go to one connection checkout.
+  defp resolve_relations(_connection, []), do: {:ok, %{}}
+
+  defp resolve_relations(connection, names) do
+    with_checkout(connection, fn guard, in_transaction? ->
+      RelationPath.resolve(guard, names, in_transaction?)
+    end)
+  end
+
+  defp with_checkout(%DBConnection{} = connection, fun),
+    do:
+      fun.(&guard_statement(connection, &1, &2), DBConnection.status(connection) == :transaction)
+
+  defp with_checkout({:pool, pool_ref}, fun) do
+    case resolve_live_pool_pid(pool_ref) do
+      {:ok, pool_pid} -> with_checkout(pool_pid, fun)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp with_checkout(connection, fun) when is_pid(connection), do: checkout_run(connection, fun)
+
+  defp with_checkout(connection, fun) when is_atom(connection) and not is_nil(connection) do
+    cond do
+      ecto_repo?(connection) ->
+        apply(connection, :checkout, [
+          fn ->
+            in_transaction? =
+              module_exports?(connection, :in_transaction?, 0) and
+                apply(connection, :in_transaction?, [])
+
+            fun.(&execute_ecto_query(connection, &1, &2), in_transaction?)
+          end
+        ])
+
+      named_postgrex_connection?(connection) ->
+        checkout_run(connection, fun)
+
+      true ->
+        fun.(&execute_module_connection(connection, &1, &2, []), false)
+    end
+  rescue
+    exception -> {:error, safe_exception(exception)}
+  catch
+    :exit, reason -> {:error, {:connection_exit, reason}}
+  end
+
+  defp with_checkout(connection, fun), do: fun.(&guard_statement(connection, &1, &2), false)
+
+  defp checkout_run(connection, fun) do
+    DBConnection.run(connection, fn checked_out ->
+      fun.(
+        &query_postgrex(checked_out, &1, &2, []),
+        DBConnection.status(checked_out) == :transaction
+      )
+    end)
+  rescue
+    exception -> {:error, safe_exception(exception)}
+  catch
+    :exit, reason -> {:error, {:connection_exit, reason}}
+  end
 
   # The session checks, savepoints and catalog reads Selecto runs around a
   # statement go through the same traced driver call as the statement
@@ -1690,7 +1820,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       |> Enum.reject(&is_nil/1)
       |> Enum.map(&to_string/1)
 
-    with {:ok, relations} <- RelationPath.resolve(&guard_statement(connection, &1, &2), names),
+    with {:ok, relations} <- resolve_relations(connection, names),
          :ok <- pin_write(connection, opts, relations) do
       qualified = fn relation -> qualified_name(relations, relation) end
 
@@ -1715,7 +1845,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     sql = IO.iodata_to_binary(sql)
 
     with {:ok, relations} <-
-           RelationPath.resolve(&guard_statement(connection, &1, &2), RelationPath.names(sql)),
+           resolve_relations(connection, RelationPath.names(sql)),
          :ok <- pin_write(connection, opts, relations) do
       RelationPath.qualify(sql, relations)
     end
@@ -2202,7 +2332,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     # A Selecto read's stream checks the session (Selecto.Executor.selecto_read?/1,
     # captured here: the stream's producer runs in its own process).
     if Selecto.Executor.selecto_read?(opts) do
-      with {:ok, query} <- qualify_read(query, opts) do
+      with {:ok, query, opts} <- qualify_read(connection, query, opts) do
         open_stream(connection, query, params, Keyword.put(opts, :selecto_session_guard, true))
       end
     else

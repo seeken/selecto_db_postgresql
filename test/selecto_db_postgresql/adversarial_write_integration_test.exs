@@ -99,7 +99,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
         task_update(1, 80)
         |> Map.update!(:metadata, fn metadata ->
           Map.update!(metadata, :foreign_key_guards, fn [guard] ->
-            [%{guard | relation: "adv_untenanted"}]
+            [%{guard | relation: "pg_temp.adv_untenanted"}]
           end)
         end)
 
@@ -115,7 +115,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
       {:ok, command} =
         Command.new(%{
           operation: :upsert,
-          relation: "adv_products",
+          relation: "pg_temp.adv_products",
           assignments: [
             %{field: :id, value: {:literal, 2}},
             %{field: :tenant_id, value: {:literal, 7}},
@@ -219,7 +219,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
     {:ok, command} =
       Command.new(%{
         operation: :insert,
-        relation: "adv_tasks",
+        relation: "pg_temp.adv_tasks",
         assignments: [
           %{field: "id", value: {:literal, id}},
           %{field: "title", value: {:literal, "new"}},
@@ -236,7 +236,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
     {:ok, command} =
       Command.new(%{
         operation: :update,
-        relation: "adv_tasks",
+        relation: "pg_temp.adv_tasks",
         assignments: [%{field: "project_id", value: {:literal, project_id}}],
         predicate:
           {:and,
@@ -253,7 +253,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
   defp project_guard do
     %{
       field: "project_id",
-      relation: "adv_projects",
+      relation: "pg_temp.adv_projects",
       target_field: "id",
       tenant_field: "tenant_id",
       tenant_value: 7
@@ -264,7 +264,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteIntegrationTest do
     {:ok, command} =
       Command.new(%{
         operation: :upsert,
-        relation: "adv_products",
+        relation: "pg_temp.adv_products",
         assignments: [
           %{field: :id, value: {:literal, 3}},
           %{field: :tenant_id, value: {:literal, 7}},

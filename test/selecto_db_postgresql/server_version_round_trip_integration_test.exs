@@ -154,7 +154,7 @@ defmodule SelectoDBPostgreSQL.ServerVersionRoundTripIntegrationTest do
     {:ok, command} =
       Command.new(%{
         operation: :insert,
-        relation: String.to_atom(table),
+        relation: "pg_temp." <> table,
         assignments: [
           %{field: :id, value: {:literal, id}},
           %{field: :name, value: {:literal, "item #{id}"}}

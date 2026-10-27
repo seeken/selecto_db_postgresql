@@ -189,7 +189,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     command =
       command!(%{
         operation: :insert,
-        relation: :selecto_graph_items,
+        relation: "pg_temp.selecto_graph_items",
         assignments: [
           %{field: :tenant_id, value: {:literal, 7}},
           %{field: :order_id, value: {:literal, order_id}},
@@ -229,7 +229,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     command =
       command!(%{
         operation: :insert,
-        relation: :selecto_graph_items,
+        relation: "pg_temp.selecto_graph_items",
         assignments: [
           %{field: :tenant_id, value: {:literal, 7}},
           %{field: :order_id, value: {:literal, order_id}},
@@ -249,7 +249,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     assert {:error,
             %Error{
               type: :native_constraint_unavailable,
-              details: %{relation: "selecto_graph_items"}
+              details: %{relation: "pg_temp.selecto_graph_items"}
             }} = Adapter.execute_write_unsafe(connection, command)
 
     assert {:ok, %{rows: []}} =
@@ -314,7 +314,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
 
     request = %RecordRequest{
       operation: :update,
-      relation: :selecto_graph_orders,
+      relation: "pg_temp.selecto_graph_orders",
       predicate: parent.predicate,
       fields: ["id", "reference", "tenant_id"]
     }
@@ -344,7 +344,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
 
     request = %RecordRequest{
       operation: :upsert,
-      relation: :selecto_graph_orders,
+      relation: "pg_temp.selecto_graph_orders",
       predicate: {:eq, {:field, :reference}, {:literal, "UPSERT-PREPARED"}},
       fields: ["id", "reference", "tenant_id"]
     }
@@ -352,7 +352,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     command =
       command!(%{
         operation: :upsert,
-        relation: :selecto_graph_orders,
+        relation: "pg_temp.selecto_graph_orders",
         assignments: [
           %{field: :tenant_id, value: {:literal, 7}},
           %{field: :reference, value: {:literal, "UPSERT-PREPARED"}}
@@ -443,7 +443,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
   defp parent_update!(order_id, reference) do
     command!(%{
       operation: :update,
-      relation: :selecto_graph_orders,
+      relation: "pg_temp.selecto_graph_orders",
       assignments: [%{field: :reference, value: {:literal, reference}}],
       predicate:
         {:and,
@@ -464,7 +464,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
       path: [:items],
       parent_command: parent,
       parent_key: :id,
-      child_relation: :selecto_graph_items,
+      child_relation: "pg_temp.selecto_graph_items",
       child_key: :order_id,
       identity_fields: ["id"],
       fields: ["id", "sku", "quantity"],
@@ -476,7 +476,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     root =
       command!(%{
         operation: :insert,
-        relation: :selecto_graph_orders,
+        relation: "pg_temp.selecto_graph_orders",
         assignments: [
           %{field: :tenant_id, value: {:literal, 7}},
           %{field: :reference, value: {:literal, "SO-100"}}
@@ -490,7 +490,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
         command =
           command!(%{
             operation: :insert,
-            relation: :selecto_graph_items,
+            relation: "pg_temp.selecto_graph_items",
             assignments: [
               %{field: :tenant_id, value: {:literal, 7}},
               %{field: :sku, value: {:literal, sku}},
@@ -513,7 +513,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
       %Node{
         id: "items",
         path: [:items],
-        relation: :selecto_graph_items,
+        relation: "pg_temp.selecto_graph_items",
         strategy: :ordered,
         identity_fields: [:id],
         rows: child_rows
@@ -525,7 +525,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     root =
       command!(%{
         operation: :update,
-        relation: :selecto_graph_orders,
+        relation: "pg_temp.selecto_graph_orders",
         assignments: [%{field: :reference, value: {:literal, "SO-100-R"}}],
         predicate:
           {:and,
@@ -540,7 +540,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     existing =
       command!(%{
         operation: :update,
-        relation: :selecto_graph_items,
+        relation: "pg_temp.selecto_graph_items",
         assignments: [
           %{field: :sku, value: {:literal, "A-updated"}},
           %{field: :quantity, value: {:literal, 4}}
@@ -558,7 +558,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     new =
       command!(%{
         operation: :insert,
-        relation: :selecto_graph_items,
+        relation: "pg_temp.selecto_graph_items",
         assignments: [
           %{field: :tenant_id, value: {:literal, 7}},
           %{field: :sku, value: {:literal, "C"}},
@@ -580,7 +580,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
       %Node{
         id: "items",
         path: [:items],
-        relation: :selecto_graph_items,
+        relation: "pg_temp.selecto_graph_items",
         strategy: :sync,
         identity_fields: [:id],
         field_types: %{
@@ -616,7 +616,7 @@ defmodule SelectoDBPostgreSQL.WriteGraphIntegrationTest do
     %Node{
       id: "root",
       path: [],
-      relation: :selecto_graph_orders,
+      relation: "pg_temp.selecto_graph_orders",
       strategy: :ordered,
       rows: [%Row{id: "root", path: [], command: command}]
     }

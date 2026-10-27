@@ -47,7 +47,7 @@ defmodule SelectoDBPostgreSQL.WriteRollbackIntegrationTest do
     {:ok, command} =
       Command.new(%{
         operation: :update,
-        relation: :selecto_write_rollback,
+        relation: "pg_temp.selecto_write_rollback",
         assignments: [%{field: :state, value: {:literal, "archived"}}],
         predicate:
           {:and,
@@ -168,7 +168,7 @@ defmodule SelectoDBPostgreSQL.WriteRollbackIntegrationTest do
     {:ok, command} =
       Command.new(%{
         operation: :update,
-        relation: :selecto_write_rollback,
+        relation: "pg_temp.selecto_write_rollback",
         assignments: [%{field: :state, value: {:literal, state}}],
         predicate: {:eq, {:field, :id}, {:literal, 1}},
         expected_cardinality: {:exactly, 1},

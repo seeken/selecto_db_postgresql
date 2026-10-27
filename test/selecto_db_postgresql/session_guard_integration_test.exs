@@ -238,11 +238,17 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
 
   test "a temp relation or type shadowing a domain name refuses reads, streams and writes",
        %{connection: c} do
+    # A temp relation shadowing a domain relation resolves it differently
+    # under the session's path (R38: relation_ambiguous); a shadow the
+    # lookup cannot see (a temp type) is the shadow check's (item 56).
     exec!(c, "CREATE TEMP VIEW items AS SELECT id, 't1'::text AS org_key, note FROM items")
-    assert read_code(read(c)) == :temporary_shadow
+    shadowed = [:temporary_shadow, :relation_ambiguous]
+    assert read_code(read(c)) in shadowed
 
-    assert {:error, %Error{details: %{reason: :temporary_shadow}}} =
+    assert {:error, %Error{details: %{reason: reason}}} =
              Adapter.execute_write_unsafe(c, update("items", [{"note", "p"}], tenant("t1")), [])
+
+    assert reason in shadowed
 
     stream =
       domain("items")
@@ -251,26 +257,53 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
       |> Selecto.select(["id", "note"])
       |> Selecto.execute_stream()
 
-    assert {:ok, rows} = stream
-    assert_raise RuntimeError, ~r/shadows a name the statement uses/, fn -> Enum.to_list(rows) end
+    case stream do
+      {:ok, rows} ->
+        assert_raise RuntimeError, ~r/shadows a name the statement uses/, fn ->
+          Enum.to_list(rows)
+        end
+
+      {:error, %{details: %{reason: reason}}} ->
+        assert reason in shadowed
+    end
+
+    assert rows!(c, "SELECT note FROM items ORDER BY id") |> length() == 3
 
     exec!(c, "DROP VIEW pg_temp.items")
     exec!(c, "CREATE DOMAIN pg_temp.text AS varchar(2)")
     assert read_code(read(c)) == :temporary_shadow
   end
 
-  test "host temp tables keep working", %{connection: c} do
+  test "host temp tables keep working when declared", %{connection: c} do
     # An unrelated temp table, and a domain over a temp table that shadows
-    # nothing (item 19).
+    # nothing (item 19): declared (source_schema / "pg_temp.name") it works;
+    # undeclared it is refused (R38).
     exec!(c, "CREATE TEMP TABLE scratch (id int)")
     exec!(c, "CREATE TEMP TABLE tonly (id int PRIMARY KEY, org_key text NOT NULL, note text)")
     exec!(c, "INSERT INTO tonly VALUES (1, 't1', 'tmp'), (2, 't2', 'x')")
 
     assert read_code(read(c)) == [[1, "mine"]]
-    assert read_code(read(c, "tonly")) == [[1, "tmp"]]
+    assert read_code(read(c, "tonly")) == :relation_unresolved
+
+    declared =
+      domain("tonly")
+      |> put_in([:source, :source_schema], "pg_temp")
+      |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+      |> Selecto.with_tenant("t1")
+      |> Selecto.select(["id", "note"])
+      |> Selecto.execute()
+
+    assert read_code(declared) == [[1, "tmp"]]
+
+    assert {:error, %Error{details: %{reason: :relation_unresolved}}} =
+             Adapter.execute_write_unsafe(c, update("tonly", [{"note", "t"}], tenant("t1")), [])
 
     assert {:ok, _} =
-             Adapter.execute_write_unsafe(c, update("tonly", [{"note", "t"}], tenant("t1")), [])
+             Adapter.execute_write_unsafe(
+               c,
+               update("pg_temp.tonly", [{"note", "t"}], tenant("t1")),
+               []
+             )
 
     assert {:ok, _} =
              Adapter.execute_write_unsafe(c, update("items", [{"note", "m"}], tenant("t1")), [])
@@ -367,13 +400,35 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
     exec!(c, "SELECT pg_catalog.set_config('search_path', '#{evil}, #{schema}', false)")
     assert rows!(c, "SELECT note FROM items ORDER BY id") == [["decoy"], ["decoy"]]
 
-    assert read_code(read(c)) == [[1, "mine"]]
+    # The session's path resolves items to the decoy, the reset path to the
+    # real table: refused (R38), never redirected.
+    assert read_code(read(c)) == :relation_ambiguous
 
-    assert {:ok, %{affected_rows: 1}} =
+    assert {:error, %Error{details: %{reason: :relation_ambiguous}}} =
              Adapter.execute_write_unsafe(c, update("items", [{"note", "m2"}], tenant("t1")), [])
 
-    assert rows!(c, "SELECT note FROM #{schema}.items WHERE id = 1") == [["m2"]]
+    assert rows!(c, "SELECT note FROM #{schema}.items WHERE id = 1") == [["mine"]]
     assert rows!(c, "SELECT note FROM #{evil}.items ORDER BY id") == [["decoy"], ["decoy"]]
+
+    # Declared, the relation is named by its schema whatever the path.
+    declared =
+      domain("items")
+      |> put_in([:source, :source_schema], schema)
+      |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+      |> Selecto.with_tenant("t1")
+      |> Selecto.select(["id", "note"])
+      |> Selecto.execute()
+
+    assert read_code(declared) == [[1, "mine"]]
+
+    assert {:ok, %{affected_rows: 1}} =
+             Adapter.execute_write_unsafe(
+               c,
+               update("#{schema}.items", [{"note", "m2"}], tenant("t1")),
+               []
+             )
+
+    assert rows!(c, "SELECT note FROM #{schema}.items WHERE id = 1") == [["m2"]]
     # The host's own (switched) value is handed back unchanged.
     assert rows!(c, "SELECT pg_catalog.current_setting('search_path')") == [
              ["#{evil}, #{schema}"]
@@ -517,6 +572,36 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
 
     assert {:ok, %{affected_rows: 1}} =
              Adapter.execute_write_unsafe(c, update("dchild", [{"note", "c"}], tenant("t1")), [])
+
+    # R37: a deferred FK whose key type is user-defined (a composite here)
+    # runs user-type comparison code at COMMIT; R32a: a deferrable UNIQUE
+    # under a user collation does too.
+    for {setup, teardown} <- [
+          {[
+             "CREATE TYPE #{schema}.kpair AS (a int, b int)",
+             "CREATE TABLE kparent (k #{schema}.kpair PRIMARY KEY)",
+             "CREATE TABLE kchild (k #{schema}.kpair REFERENCES kparent (k) DEFERRABLE INITIALLY DEFERRED)"
+           ], ["DROP TABLE kchild", "DROP TABLE kparent", "DROP TYPE #{schema}.kpair"]},
+          {[
+             "CREATE COLLATION #{schema}.ucoll (provider = libc, locale = 'C')",
+             "CREATE TABLE ucol (k text COLLATE #{schema}.ucoll UNIQUE DEFERRABLE INITIALLY DEFERRED)"
+           ], ["DROP TABLE ucol", "DROP COLLATION #{schema}.ucoll"]}
+        ] do
+      Enum.each(setup, &exec!(c, &1))
+
+      assert {:error, %Error{details: %{reason: :deferred_triggers}}} =
+               Adapter.execute_write_unsafe(
+                 c,
+                 update("dchild", [{"note", "d"}], tenant("t1")),
+                 []
+               ),
+             inspect(setup)
+
+      Enum.each(teardown, &exec!(c, &1))
+    end
+
+    assert {:ok, %{affected_rows: 1}} =
+             Adapter.execute_write_unsafe(c, update("dchild", [{"note", "e"}], tenant("t1")), [])
   end
 
   # R35: a TimeZone or DateStyle the session persisted before Selecto's call
@@ -589,5 +674,42 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
 
     assert rows!(c, "SELECT current_setting('TimeZone'), current_setting('DateStyle')") ==
              [["Asia/Karachi", "SQL, DMY"]]
+  end
+
+  # R36: PostgreSQL parses the reset search_path itself; a quoted "q,r"
+  # schema is never split into a decoy `q`.
+  test "a quoted reset search_path resolves as PostgreSQL parses it" do
+    suffix = System.unique_integer([:positive])
+    real = "selecto_q#{suffix},r"
+    decoy = "selecto_q#{suffix}"
+    options = SelectoDBPostgreSQL.Verification.ConnectionOptions.options()
+    {:ok, admin} = Adapter.connect(Keyword.put(options, :pool_size, 1))
+    exec!(admin, ~s|CREATE SCHEMA "#{real}"|)
+    exec!(admin, ~s|CREATE SCHEMA "#{decoy}"|)
+
+    for {schema, note} <- [{real, "mine"}, {decoy, "decoy"}] do
+      exec!(
+        admin,
+        ~s|CREATE TABLE "#{schema}".qitems (id int PRIMARY KEY, org_key text, note text)|
+      )
+
+      exec!(admin, ~s|INSERT INTO "#{schema}".qitems VALUES (1, 't1', '#{note}')|)
+    end
+
+    try do
+      {:ok, c} =
+        Adapter.connect(
+          options
+          |> Keyword.put(:pool_size, 1)
+          |> Keyword.put(:parameters, search_path: ~s|"#{real}"|)
+        )
+
+      assert read_code(read(c, "qitems")) == [[1, "mine"]]
+      GenServer.stop(c)
+    after
+      exec!(admin, ~s|DROP SCHEMA "#{real}" CASCADE|)
+      exec!(admin, ~s|DROP SCHEMA "#{decoy}" CASCADE|)
+      GenServer.stop(admin)
+    end
   end
 end

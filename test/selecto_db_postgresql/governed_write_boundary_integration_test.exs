@@ -153,7 +153,7 @@ defmodule SelectoDBPostgreSQL.GovernedWriteBoundaryIntegrationTest do
     {:ok, command} =
       Command.new(%{
         operation: :update,
-        relation: :selecto_governed_writes,
+        relation: "pg_temp.selecto_governed_writes",
         assignments: [%{field: :name, value: {:literal, name}}],
         predicate: {:eq, {:field, :id}, {:literal, id}}
       })
@@ -165,7 +165,7 @@ defmodule SelectoDBPostgreSQL.GovernedWriteBoundaryIntegrationTest do
     {:ok, command} =
       Command.new(%{
         operation: :insert,
-        relation: :selecto_governed_writes,
+        relation: "pg_temp.selecto_governed_writes",
         assignments: [
           %{field: :id, value: {:literal, id}},
           %{field: :tenant_id, value: {:literal, 7}},
@@ -189,7 +189,7 @@ defmodule SelectoDBPostgreSQL.GovernedWriteBoundaryIntegrationTest do
           %Node{
             id: "root",
             path: [],
-            relation: :selecto_governed_writes,
+            relation: "pg_temp.selecto_governed_writes",
             strategy: :ordered,
             rows: [%Row{id: "root", path: [], command: insert(5, "graph")}]
           }

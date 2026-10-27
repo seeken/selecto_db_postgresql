@@ -284,15 +284,22 @@ each DML (a trigger created while the write waited on a lock is seen).
 `SET CONSTRAINTS` is never used. Only two kinds of deferrable trigger are
 exempt, because PostgreSQL's own code runs them:
 
-- foreign-key triggers whose function is a pg_catalog `RI_FKey_*` function
-  (deferred foreign keys keep working);
-- unique and exclusion rechecks (`unique_key_recheck`) on an index without
-  expressions or a predicate whose operator classes, their families'
-  operators and support functions, the exclusion operators and their
-  functions, and the collations all belong to pg_catalog.
+- foreign-key triggers whose function is a pg_catalog `RI_FKey_*` function,
+  whose equality operators are pg_catalog's, whose referenced unique index
+  passes the index test below, and whose key columns on both sides have
+  pg_catalog base types (or domains over them): ordinary deferred foreign
+  keys keep working;
+- unique and exclusion rechecks (`unique_key_recheck`) on an index that
+  passes the index test, with pg_catalog exclusion operators.
 
-A `DEFERRABLE` constraint trigger, or a `DEFERRABLE EXCLUDE` or `UNIQUE`
-whose operator class or collation is user-defined, refuses every write.
+The index test: no expressions and no predicate; every collation is 0 or
+pg_catalog's; every operator class, its family's operators and support
+functions belong to pg_catalog; and every key column has a pg_catalog base
+type (or a domain over one).
+
+A `DEFERRABLE` constraint trigger, or a `DEFERRABLE EXCLUDE`, `UNIQUE` or
+foreign key whose operator class, expression, collation or key type is
+user-defined, refuses every write.
 Disable such triggers (`ALTER TABLE ... DISABLE TRIGGER`) or keep them in
 another database.
 
@@ -304,18 +311,28 @@ REPEATABLE READ transaction) must not redirect a later Selecto statement to
 another schema's relation, function or operator of the same name. So:
 
 - **Every relation of a generated read or write is schema-qualified.** A
-  domain that names a relation as `"schema.relation"` keeps it. Any other
-  name is resolved against the connection's **reset** search_path
+  domain relation declares its schema with `source_schema` next to its
+  `source_table` (`source_schema: "pg_temp"` for a host temp table), and a
+  write command with a `"schema.relation"` relation. Any other name is
+  resolved against the connection's **reset** search_path
   (`pg_settings.reset_val`: the server, database, role or startup value,
-  which `SET` and `set_config` do not change), with `"$user"` as `current_user`
-  (as PostgreSQL expands it) and `pg_temp` skipped; a name the reset path does not reach but the
-  session's own temp schema holds is the host's temp table and is named by
-  that schema explicitly. The current search_path is never consulted:
-  **a host that `SET`s search_path to reach another schema must declare that
-  schema on the domain** (or set it at connection startup, for example
-  `parameters: [search_path: "app"]`). A name that does not resolve, or a
-  lookup that cannot run, refuses (`reason: :relation_unresolved`); no
-  unqualified statement runs.
+  which `SET` and `set_config` do not change), which PostgreSQL itself
+  parses: inside a savepoint or transaction of its own that is rolled back,
+  the lookup applies it with `set_config(..., true)` and reads
+  `current_schemas(false)`, so quoting, case folding, `"$user"`
+  (`current_user`) and missing schemas follow the server, and `pg_temp`
+  never takes part. The name is also looked up under the session's
+  **current** path: a relation the two resolve differently refuses
+  (`reason: :relation_ambiguous`) instead of being redirected, and a
+  relation only the session's temp schema holds refuses unless declared
+  (`reason: :relation_unresolved`). **A host that `SET`s search_path to
+  reach another schema must declare that schema** (or set it at connection
+  startup, for example `parameters: [search_path: "app"]`). A name that
+  does not resolve, or a lookup that cannot run, refuses; and the exact
+  text every Selecto read, stream, write or candidate load executes must
+  name each relation schema-qualified, so no unqualified statement runs. A
+  Selecto read that reaches the adapter without prepared relations resolves
+  the names in its own text the same way.
 - A CTE or query member named like a real relation is scoped: in a leading
   non-recursive `WITH`, its own body and the bodies before it read the real
   (qualified) relation, the later bodies and the main query the CTE. A
