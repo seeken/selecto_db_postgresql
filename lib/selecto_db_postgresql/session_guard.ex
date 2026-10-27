@@ -115,14 +115,12 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   # Selecto keeps no session marker or GUC of its own to prove ownership
   # (item 57), so there is nothing a trigger can forge.
   #
-  # The shadow check refuses SQL whose names a temp relation or type would
-  # capture: a relation of the session temp schema named like any identifier
-  # of the statement while a same-named relation exists in a schema of the
-  # search path (current_schemas(false)), and a temp type (not a temp
-  # table's row type or its array) named like an identifier of the statement
-  # or a type the generated SQL casts to. A temp relation with no namesake is
-  # the host's own (a domain over a temp table keeps working), as is an
-  # unrelated host temp table (item 19).
+  # The shadow check refuses SQL whose names a temp TYPE would capture (not
+  # a temp table's row type or its array): one named like an identifier of
+  # the statement or a type the generated SQL casts to. Relations are
+  # qualified to the pinned resolution's schema (RelationPath, R38a), so a
+  # temp relation named like one captures nothing; an unrelated host temp
+  # table keeps working (item 19).
 
   alias Selecto.Write.Error
 
@@ -174,14 +172,13 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
 
   @snapshot_sql "SELECT " <> @snapshot_columns
 
-  @shadow_sql "SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c " <>
-                "WHERE c.relnamespace OPERATOR(pg_catalog.=) #{@temp} " <>
-                "AND CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[]) " <>
-                "AND EXISTS (SELECT 1 FROM pg_catalog.pg_class o JOIN pg_catalog.pg_namespace s " <>
-                "ON s.oid OPERATOR(pg_catalog.=) o.relnamespace " <>
-                "WHERE o.relname OPERATOR(pg_catalog.=) c.relname " <>
-                "AND o.relnamespace OPERATOR(pg_catalog.<>) c.relnamespace " <>
-                "AND s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false)))) " <>
+  # R38a: relations are qualified to the schema the pinned (reset or
+  # declared) resolution chose, never pg_temp unless declared, so a temp
+  # relation named like one cannot capture it; $1 (the relation names) is
+  # kept for the call shape only. A temp TYPE named like an identifier or a
+  # generated cast type is still refused (defence in depth: the pinned path
+  # searches pg_temp last).
+  @shadow_sql "SELECT (CASE WHEN $1::pg_catalog.text[] IS NULL THEN 0 ELSE 0 END) " <>
                 "+ (SELECT pg_catalog.count(*) FROM pg_catalog.pg_type t " <>
                 "WHERE t.typnamespace OPERATOR(pg_catalog.=) #{@temp} " <>
                 "AND t.typrelid OPERATOR(pg_catalog.=) 0 " <>

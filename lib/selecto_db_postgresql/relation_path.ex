@@ -18,8 +18,10 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   # schemas follow the server; pg_temp never takes part. The name is also
   # looked up under the host's CURRENT path (current_schemas(true), the temp
   # schema included where PostgreSQL searches it): a name the two resolve
-  # differently refuses (`relation_ambiguous`, R38), a name only the
-  # session's temp schema holds refuses unless declared, and a name neither
+  # to different non-temp relations refuses (`relation_ambiguous`, R38), a
+  # name only the session's temp schema holds refuses unless declared, a
+  # temp namesake of a resolved relation is harmless once it is qualified
+  # (R38a: resolution never prefers pg_temp), and a name neither
   # reaches, or a lookup that cannot run, refuses (`relation_unresolved`):
   # no unqualified statement runs. Every function and operator of the
   # lookup is pg_catalog qualified, and its columns carry the
@@ -154,7 +156,9 @@ defmodule SelectoDBPostgreSQL.RelationPath do
           is_nil(schema) and is_nil(host) ->
             {:halt, unresolved([name])}
 
-          is_nil(schema) or (host != nil and host != schema) or host_temp ->
+          # R38a: a temp namesake of a relation qualified to its resolved
+          # (non-temp) schema cannot affect it: not refused.
+          is_nil(schema) or (host != nil and host != schema and not host_temp) ->
             {:halt,
              refusal(
                :relation_ambiguous,
