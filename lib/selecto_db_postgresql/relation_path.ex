@@ -35,24 +35,10 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   @path_key "selecto:reset_schemas"
 
-  # Under the reset path: its schemas; the operators of those schemas
-  # (outside pg_catalog) that take two pg_catalog types under a comparison
-  # or pattern name, which an exact type match would prefer to pg_catalog's
-  # (R46: generated comparisons must not depend on operator lookup); and
-  # the session's temp relations (R42 FINAL).
+  # Under the reset path: its schemas, and the session's temp relations
+  # (R42 FINAL).
   @schemas_sql "SELECT CAST(pg_catalog.current_schemas(false) AS pg_catalog.text[]) " <>
                  "AS selecto_guard_reset_schemas, " <>
-                 "(SELECT pg_catalog.count(*) FROM pg_catalog.pg_operator o " <>
-                 "JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace " <>
-                 "JOIN pg_catalog.pg_type l ON l.oid OPERATOR(pg_catalog.=) o.oprleft " <>
-                 "JOIN pg_catalog.pg_type r ON r.oid OPERATOR(pg_catalog.=) o.oprright " <>
-                 "WHERE n.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false)) " <>
-                 "AND o.oprnamespace OPERATOR(pg_catalog.<>) CAST(11 AS pg_catalog.oid) " <>
-                 "AND l.typnamespace OPERATOR(pg_catalog.=) CAST(11 AS pg_catalog.oid) " <>
-                 "AND r.typnamespace OPERATOR(pg_catalog.=) CAST(11 AS pg_catalog.oid) " <>
-                 "AND o.oprname OPERATOR(pg_catalog.=) ANY (ARRAY['=', '<>', '<', '<=', '>', '>=', " <>
-                 "'~~', '!~~', '~~*', '!~~*', '~', '!~', '~*', '!~*', '@>', '<@', '&&', '?', '?|', '?&'])) " <>
-                 "AS selecto_guard_operator_shadows, " <>
                  "(SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c " <>
                  "WHERE c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) " <>
                  "AS selecto_guard_temp_relations"
@@ -127,19 +113,83 @@ defmodule SelectoDBPostgreSQL.RelationPath do
     # The reset path's schemas are read even when every name is declared:
     # the pin needs them (R43).
     case lookup(execute, plain, in_transaction?) do
-      {:ok, _rows, _schemas, shadows, _temps} when shadows > 0 ->
-        refusal(
-          :operator_shadow,
-          "a schema of the reset search_path defines an operator over pg_catalog types " <>
-            "that would be chosen over pg_catalog's for a generated comparison",
-          []
-        )
-
-      {:ok, rows, schemas, _shadows, temps} ->
+      {:ok, rows, schemas, temps} ->
         decide(rows, own |> Map.put(@path_key, schemas) |> Map.put(@temp_key, temps))
 
       :error ->
         unavailable()
+    end
+  end
+
+  # R46 FINAL-2: per column of each resolved relation, the schema whose
+  # operators compare it and the operators' argument type: a domain's base
+  # type (domains over domains followed), text for varchar, the type itself
+  # otherwise; pg_catalog's operators for built-in, enum, range,
+  # multirange, composite and array types, the type's own schema for an
+  # extension or user base type (citext).
+  @types_sql """
+  WITH RECURSIVE selecto_rel(name, qualified) AS (
+    SELECT * FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), pg_catalog.unnest($2::pg_catalog.text[]))
+  ),
+  selecto_base(name, attname, oid, depth) AS (
+    SELECT r.name, CAST(a.attname AS pg_catalog.text), a.atttypid, 0
+    FROM selecto_rel r
+    JOIN pg_catalog.pg_attribute a
+      ON a.attrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.qualified)
+     AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+    UNION ALL
+    SELECT b.name, b.attname, t.typbasetype, b.depth OPERATOR(pg_catalog.+) 1
+    FROM selecto_base b JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) b.oid
+    WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND b.depth OPERATOR(pg_catalog.<) 16
+  )
+  SELECT DISTINCT ON (b.name, b.attname)
+         b.name AS selecto_guard_type_relation,
+         b.attname AS selecto_guard_type_column,
+         CASE WHEN n.oid OPERATOR(pg_catalog.=) CAST(11 AS pg_catalog.oid)
+                OR t.typtype OPERATOR(pg_catalog.=) ANY (ARRAY['e', 'r', 'm', 'c']::pg_catalog."char"[])
+                OR t.typcategory OPERATOR(pg_catalog.=) 'A'
+              THEN 'pg_catalog' ELSE pg_catalog.quote_ident(CAST(n.nspname AS pg_catalog.text)) END
+           AS selecto_guard_type_schema,
+         CASE WHEN t.oid OPERATOR(pg_catalog.=) CAST(1043 AS pg_catalog.oid) THEN 'pg_catalog.text'
+              ELSE pg_catalog.quote_ident(CAST(n.nspname AS pg_catalog.text)) OPERATOR(pg_catalog.||) '.'
+                     OPERATOR(pg_catalog.||) pg_catalog.quote_ident(CAST(t.typname AS pg_catalog.text)) END
+           AS selecto_guard_type_arg
+  FROM selecto_base b
+  JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) b.oid
+  JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace
+  WHERE t.typtype OPERATOR(pg_catalog.<>) 'd'
+  ORDER BY b.name, b.attname, b.depth DESC
+  """
+
+  @doc """
+  `{:ok, %{relation => %{column => {schema, arg}}}}` for a resolve/3 map's
+  relations, keyed like the map.
+  """
+  def operator_types(execute, relations) do
+    pairs =
+      for {name, qualified} <- relations,
+          is_binary(qualified),
+          name not in [@path_key, @temp_key],
+          do: {name, qualified}
+
+    if pairs == [] do
+      {:ok, %{}}
+    else
+      case execute.(@types_sql, [Enum.map(pairs, &elem(&1, 0)), Enum.map(pairs, &elem(&1, 1))]) do
+        {:ok, %{rows: rows}} when is_list(rows) ->
+          {:ok,
+           Enum.reduce(rows, %{}, fn [name, column, schema, arg], acc ->
+             Map.update(
+               acc,
+               name,
+               %{column => {schema, arg}},
+               &Map.put(&1, column, {schema, arg})
+             )
+           end)}
+
+        _ ->
+          unavailable()
+      end
     end
   end
 
@@ -178,10 +228,10 @@ defmodule SelectoDBPostgreSQL.RelationPath do
         result =
           with {:ok, %{rows: [[host]]}} when is_list(host) <- execute.(@host_sql, []),
                {:ok, %{rows: [[_reset]]}} <- execute.(@reset_sql, []),
-               {:ok, %{rows: [[schemas, shadows, temps]]}} when is_list(schemas) <-
+               {:ok, %{rows: [[schemas, temps]]}} when is_list(schemas) <-
                  execute.(@schemas_sql, []),
                {:ok, %{rows: rows}} when is_list(rows) <- execute.(@resolve_sql, [plain, host]) do
-            {:ok, rows, Enum.reject(schemas, &String.starts_with?(&1, "pg_temp")), shadows, temps}
+            {:ok, rows, Enum.reject(schemas, &String.starts_with?(&1, "pg_temp")), temps}
           else
             _ -> :error
           end
@@ -233,8 +283,8 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   @doc """
   The search_path a statement over `relations` (a resolve/3 map) runs under
-  (R43): pg_catalog, every schema of the reset search_path (as the server
-  parsed it), the declared schemas of the relations, pg_temp last. Never
+  (R43): pg_catalog, the declared schemas of the relations, every schema
+  of the reset search_path (as the server parsed it), pg_temp last. Never
   only the statement's own relation schemas: an extension's types,
   functions and operators (citext in `ext`) must resolve as the host's own
   configuration resolves them.
@@ -250,8 +300,9 @@ defmodule SelectoDBPostgreSQL.RelationPath do
       |> Enum.sort()
       |> Enum.map(&schema_of/1)
 
+    # R43: declared schemas first, then the reset path's.
     schemas =
-      (reset ++ declared)
+      (declared ++ reset)
       |> Enum.reject(&(&1 in [nil, "pg_catalog"] or String.starts_with?(&1, "pg_temp")))
       |> Enum.uniq()
 

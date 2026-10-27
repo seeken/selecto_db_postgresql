@@ -84,7 +84,7 @@ defmodule SelectoDBPostgreSQL.GraphCompiler do
          {:ok, returning_fields} <- returning_fields(node.rows) do
       on =
         Enum.map_join(identity_fields, " AND ", fn field ->
-          "target.#{quote_identifier(field)} = source.#{quote_identifier(field)}"
+          "target.#{quote_identifier(field)} OPERATOR(pg_catalog.=) source.#{quote_identifier(field)}"
         end)
 
       clauses =

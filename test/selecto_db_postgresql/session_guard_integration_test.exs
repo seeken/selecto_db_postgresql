@@ -806,27 +806,89 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
     end
   end
 
-  # R46: an operator over pg_catalog types in a reset-path schema would be
-  # chosen over pg_catalog's by an exact type match: refused, fail closed.
-  test "a shadowing operator over pg_catalog types on the reset path refuses",
+  # R46 FINAL-2 (r46final): an always-true operator in a reset-path schema
+  # that exactly matches the operand types (a domain over text or int4, a
+  # user enum, a domain over timestamptz or date, varchar) never decides a
+  # generated comparison: every comparison names pg_catalog's operator and
+  # casts both operands to its argument types. Reads stay in scope, and a
+  # tenant-scoped update of the other tenant's row applies to nothing.
+  test "a reset-path operator matching the operand types exactly never decides a comparison",
        %{connection: c, schema: schema} do
-    exec!(
-      c,
-      "CREATE FUNCTION #{schema}.always_eq(varchar, varchar) RETURNS boolean LANGUAGE sql " <>
-        "IMMUTABLE AS 'SELECT true'"
-    )
+    cases = [
+      {"#{schema}.w_tdom", "CREATE DOMAIN #{schema}.w_tdom AS text", "#{schema}.w_tdom", ~w(= <>),
+       "'t1'", "'t2'"},
+      {"#{schema}.w_idom", "CREATE DOMAIN #{schema}.w_idom AS int4", "#{schema}.w_idom", ~w(= <>),
+       "1", "2"},
+      {"#{schema}.w_en", "CREATE TYPE #{schema}.w_en AS ENUM ('t1', 't2')", "#{schema}.w_en",
+       ~w(= <>), "'t1'", "'t2'"},
+      {"varchar(20)", nil, "varchar", ~w(= <> < <= > >= ~~), "'t1'", "'t2'"},
+      {"text", nil, "text", ~w(= <> ~~), "'t1'", "'t2'"}
+    ]
 
-    exec!(
-      c,
-      "CREATE OPERATOR #{schema}.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = #{schema}.always_eq)"
-    )
+    for {type, setup, operand, names, v1, v2, tenant, declared} <- cases do
+      exec!(c, "DROP TABLE IF EXISTS w46")
+      if setup, do: exec!(c, setup)
+      exec!(c, "CREATE TABLE w46 (id int PRIMARY KEY, org_key #{type} NOT NULL, note text)")
+      exec!(c, "INSERT INTO w46 VALUES (1, #{v1}, 'in'), (2, #{v2}, 'SECRET')")
 
-    assert read_code(read(c)) == :operator_shadow
+      # The operand's own type on both sides, and against text/int4.
+      other_side = if declared == :integer, do: "int4", else: "text"
+      signatures = Enum.uniq([{operand, operand}, {operand, other_side}])
 
-    assert {:error, %Error{details: %{reason: :operator_shadow}}} =
-             Adapter.execute_write_unsafe(c, update("items", [{"note", "q"}], tenant("t1")), [])
+      for {left, right} <- signatures do
+        exec!(
+          c,
+          "CREATE OR REPLACE FUNCTION #{schema}.w_yes(#{left}, #{right}) RETURNS boolean " <>
+            "LANGUAGE sql IMMUTABLE AS 'SELECT true'"
+        )
 
-    exec!(c, "DROP OPERATOR #{schema}.= (varchar, varchar)")
-    assert read_code(read(c)) == [[1, "mine"]]
+        for name <- names do
+          exec!(
+            c,
+            "CREATE OPERATOR #{schema}.#{name} (LEFTARG = #{left}, RIGHTARG = #{right}, " <>
+              "FUNCTION = #{schema}.w_yes)"
+          )
+        end
+      end
+
+      # The operator wins a hand-written comparison.
+      assert rows!(c, "SELECT count(*) FROM w46 WHERE org_key = CAST(#{v1} AS #{operand})") ==
+               [[2]],
+             type
+
+      result =
+        domain("w46")
+        |> put_in([:source, :columns, :org_key], %{type: declared})
+        |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+        |> Selecto.with_tenant(tenant)
+        |> Selecto.select(["id", "note"])
+        |> Selecto.order_by(["id"])
+        |> Selecto.execute()
+
+      assert read_code(result) == [[1, "in"]], type
+
+      # A tenant-t1 update of row 2 (tenant t2) applies to nothing.
+      scope = {:eq, {:field, "org_key"}, {:literal, tenant}}
+
+      {:ok, command} =
+        Command.new(%{
+          operation: :update,
+          relation: "w46",
+          predicate: {:and, [{:eq, {:field, "id"}, {:literal, 2}}, scope]},
+          assignments: [%{field: "note", value: {:literal, "PWNED"}}],
+          expected_cardinality: :many,
+          metadata: %{post_image: %{predicate: scope, key: ["id"]}}
+        })
+
+      assert {:ok, %{affected_rows: 0}} = Adapter.execute_write_unsafe(c, command, []), type
+      refute inspect(rows!(c, "SELECT note FROM w46 WHERE id = 2")) =~ "PWNED", type
+
+      for {left, right} <- signatures do
+        for name <- names, do: exec!(c, "DROP OPERATOR #{schema}.#{name} (#{left}, #{right})")
+        exec!(c, "DROP FUNCTION #{schema}.w_yes(#{left}, #{right})")
+      end
+
+      exec!(c, "DROP TABLE w46")
+    end
   end
 end

@@ -358,6 +358,21 @@ another schema's relation, function or operator of the same name. So:
   therefore resolve to pg_catalog's first, then as the host's reset path
   resolves them (an extension's types and operators included), and temp
   objects last.
+- **Explicit operators.** A search_path pin cannot stop an operator in a
+  pinned schema that matches the operand types exactly (`public.=(dom, dom)`
+  for a domain column, `=(varchar, varchar)`, an enum's own `=`): PostgreSQL
+  prefers an exact match to pg_catalog's. So every comparison Selecto
+  executes names its operator: `(CAST(col AS T) OPERATOR(s.op) CAST($n AS T))`,
+  where `s` is pg_catalog for built-in, domain, enum, range, array and
+  composite types and the type's own schema for an extension type (citext),
+  and `T` the operator's argument type (a domain's base type, text for
+  varchar, the type itself otherwise), read from the catalog for every column
+  of the read's relations. IN and NOT IN become disjunctions of equalities,
+  BETWEEN a pair of bounds, IN (subquery) `= ANY`, LIKE an explicit `~~`
+  over `like_escape`, and joins, scope keys, tenant pairs, association pins,
+  retarget membership, writes, foreign-key guards, MERGE and the post-image
+  re-read name pg_catalog's operator too. Compile-only SQL (`to_sql/1`
+  without a connection) is unchanged.
 - Every catalog read the adapter runs for its checks is pg_catalog-qualified.
 
 ## Atomic write graphs and MERGE

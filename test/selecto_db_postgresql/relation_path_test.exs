@@ -65,13 +65,13 @@ defmodule SelectoDBPostgreSQL.RelationPathTest do
   end
 
   test "the pinned path puts pg_catalog first and pg_temp last (R30)" do
-    # R43: every schema of the reset path (an extension's `ext` included),
-    # then the declared ones, pg_temp last.
+    # R43: the declared schemas, then every schema of the reset path (an
+    # extension's `ext` included), pg_temp last.
     assert RelationPath.pinned_path(%{
              "a" => ~s("app"."a"),
              "b" => ~s("pg_temp_3"."b"),
              RelationPath.path_key() => ["public", "ext"]
-           }) == ~s|pg_catalog, "public", "ext", "app", pg_temp|
+           }) == ~s|pg_catalog, "app", "public", "ext", pg_temp|
 
     assert RelationPath.pinned_path(nil) == "pg_catalog, pg_temp"
   end
