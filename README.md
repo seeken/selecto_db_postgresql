@@ -182,15 +182,14 @@ for application code.
 
 A write bound to a tenant or trusted scope (`metadata.post_image`, set by
 `SelectoUpdato`) locks its table ROW EXCLUSIVE and resolves it to its oid
-before the statement, returns the written rows' `(tableoid, ctid)`, and is
-re-read by them after the statement, inside the same transaction, from the
-schema-qualified table its oid named and only among that table's (and its
-partitions') oids. It is rolled back unless every written row is still
-inside the scope. A ctid names exactly one row version whatever the key's
-type, collation or text image, so a decoy row with the same key value can
-never answer, and a table needs no unique key for the check. A row an AFTER
-trigger updates again has a new ctid and refuses. The check refuses
-(`query_rule_not_evaluable`) whatever it cannot see through:
+before the statement, and is re-read by key after the statement, inside the
+same transaction, from the schema-qualified table that oid named and only
+among that table's (and its partitions') oids, never through a search_path
+lookup a row trigger could redirect. It is rolled back unless every written
+row is still inside the scope. The keys are bound back in Postgrex's binary
+form, independent of DateStyle, extra_float_digits or any other text-image
+setting. The check refuses (`query_rule_not_evaluable`) whatever it cannot
+see through:
 
 - **Any enabled deferrable trigger anywhere in the database refuses every
   bound-scope write.** A deferred trigger fires at commit, after the check,
@@ -200,8 +199,12 @@ trigger updates again has a new ctid and refuses. The check refuses
   scoped writes through Selecto. Disable them (`ALTER TABLE ... DISABLE
   TRIGGER`) or keep them in another database.
 - Statement-level triggers and rewrite rules for the event on the table or
-  any of its partitions, views, and tables with inheritance (non-partition)
-  children.
+  any of its partitions, views, tables with inheritance (non-partition)
+  children, and keys that are not an immediate, valid, non-partial unique
+  index over NOT NULL columns whose index collation is each column's own,
+  deterministic, with the default operator class (a unique index under
+  `"C"` over a case-insensitive column enforces uniqueness by bytes while
+  `=` follows the column's collation, so a decoy row could answer).
 - A bound-scope DELETE (`metadata.bound_scope`, graph delete-missing
   cleanups included) locks its table ROW EXCLUSIVE and is refused, before
   and again after its statement, under an enabled statement-level DELETE
