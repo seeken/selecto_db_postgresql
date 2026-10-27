@@ -98,7 +98,9 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
     assert length(rows) == 2000
 
     # The call happened in this process, so no result was copied out of a task.
-    assert [[^conn, _sql, _params, opts]] = calls
+    # A Selecto read runs on one connection checked out of `conn`, between
+    # the session checks (SessionGuard).
+    assert [[%DBConnection{}, _sql, _params, opts]] = statement_calls(calls, items)
     assert opts[:timeout] == 15_000
     assert is_integer(opts[:deadline])
   end
@@ -117,7 +119,7 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
       trace_calls({Postgrex, :query, 4}, fn -> execute(conn, items, Adapter, timeout: 5_000) end)
 
     assert {:ok, _result} = result
-    assert [[^conn, _sql, _params, opts]] = calls
+    assert [[%DBConnection{}, _sql, _params, opts]] = statement_calls(calls, items)
     assert opts[:timeout] <= 5_000 and opts[:timeout] > 4_000
   end
 
@@ -126,7 +128,7 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
     {_result, calls} =
       trace_calls({Postgrex, :query, 4}, fn -> execute(conn, items, Adapter, timeout: 60_000) end)
 
-    assert [[_conn, _sql, _params, opts]] = calls
+    assert [[_conn, _sql, _params, opts]] = statement_calls(calls, items)
     assert opts[:timeout] == 15_000
   end
 
@@ -200,7 +202,7 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
 
     assert {:ok, {rows, _columns, _aliases}} = result
     assert length(rows) == 2000
-    assert [[Repo, _sql, _params, opts]] = calls
+    assert [[Repo, _sql, _params, opts]] = statement_calls(calls, items)
     assert opts[:timeout] == 4_000
 
     assert execute(Repo, items, TaskPathAdapter) == result
@@ -220,7 +222,7 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
     {_result, calls} =
       trace_calls({Ecto.Adapters.SQL, :query, 4}, fn -> execute(Repo, items, Adapter) end)
 
-    assert [[Repo, _sql, _params, opts]] = calls
+    assert [[Repo, _sql, _params, opts]] = statement_calls(calls, items)
     assert opts[:timeout] == 15_000
   end
 
@@ -283,7 +285,7 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
 
     {result, calls} = trace_calls({Postgrex, :query, 4}, fn -> execute(name, items, Adapter) end)
     assert {:ok, _result} = result
-    assert [[^name, _sql, _params, opts]] = calls
+    assert [[%DBConnection{}, _sql, _params, opts]] = statement_calls(calls, items)
     assert opts[:timeout] == 15_000
   end
 
@@ -382,6 +384,11 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
 
     {result, calls}
   end
+
+  # The traced calls that ran the Selecto statement itself (not the session
+  # checks around it).
+  defp statement_calls(calls, table),
+    do: Enum.filter(calls, fn [_conn, sql, _params, _opts] -> String.contains?(sql, table) end)
 
   defp collect_traces(traces) do
     receive do

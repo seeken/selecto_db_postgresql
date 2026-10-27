@@ -205,7 +205,13 @@ defmodule SelectoDBPostgreSQL.GraphCompiler do
   defp merge_row_eligible?(%Row{command: %Command{} = command} = row, node) do
     no_guards? = Map.get(command.metadata, :foreign_key_guards, []) == []
 
-    command.operation in [:insert, :update] and no_guards? and
+    # A row with a post-image re-read or a bound-scope contract runs through
+    # the ordered fallback, which applies both; MERGE applies neither.
+    unbound? =
+      not Map.has_key?(command.metadata, :post_image) and
+        Map.get(command.metadata, :bound_scope) != true
+
+    command.operation in [:insert, :update] and no_guards? and unbound? and
       command.returning != :all and
       (command.operation == :insert or governed_update_predicate?(row, node))
   end
@@ -338,22 +344,25 @@ defmodule SelectoDBPostgreSQL.GraphCompiler do
     |> Enum.uniq()
   end
 
-  defp postgres_cast(type) when type in [:integer, "integer"], do: "::bigint"
-  defp postgres_cast(type) when type in [:float, "float"], do: "::double precision"
-  defp postgres_cast(type) when type in [:decimal, "decimal"], do: "::numeric"
-  defp postgres_cast(type) when type in [:string, "string", :text, "text"], do: "::text"
-  defp postgres_cast(type) when type in [:boolean, "boolean"], do: "::boolean"
-  defp postgres_cast(type) when type in [:date, "date"], do: "::date"
+  defp postgres_cast(type) when type in [:integer, "integer"], do: "::pg_catalog.int8"
+  defp postgres_cast(type) when type in [:float, "float"], do: "::pg_catalog.float8"
+  defp postgres_cast(type) when type in [:decimal, "decimal"], do: "::pg_catalog.numeric"
+
+  defp postgres_cast(type) when type in [:string, "string", :text, "text"],
+    do: "::pg_catalog.text"
+
+  defp postgres_cast(type) when type in [:boolean, "boolean"], do: "::pg_catalog.bool"
+  defp postgres_cast(type) when type in [:date, "date"], do: "::pg_catalog.date"
 
   defp postgres_cast(type)
        when type in [:datetime, "datetime", :naive_datetime, "naive_datetime"],
-       do: "::timestamp"
+       do: "::pg_catalog.timestamp"
 
   defp postgres_cast(type) when type in [:utc_datetime, "utc_datetime"],
-    do: "::timestamptz"
+    do: "::pg_catalog.timestamptz"
 
-  defp postgres_cast(type) when type in [:uuid, "uuid"], do: "::uuid"
-  defp postgres_cast(type) when type in [:binary, "binary"], do: "::bytea"
+  defp postgres_cast(type) when type in [:uuid, "uuid"], do: "::pg_catalog.uuid"
+  defp postgres_cast(type) when type in [:binary, "binary"], do: "::pg_catalog.bytea"
   defp postgres_cast(_type), do: nil
 
   defp add_update_clause(clauses, [], _fields, _ownership), do: clauses
