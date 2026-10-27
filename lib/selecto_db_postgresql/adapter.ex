@@ -723,9 +723,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # a type still a domain there is reported unresolved (typtype 'd').
   @column_catalog_sql """
   WITH RECURSIVE walk (attnum, attname, typid, typmod, colloid, depth) AS (
-    SELECT a.attnum, a.attname::text, a.atttypid, a.atttypmod, a.attcollation, 0
+    SELECT a.attnum, a.attname::pg_catalog.text, a.atttypid, a.atttypmod, a.attcollation, 0
     FROM pg_catalog.pg_attribute a
-    WHERE a.attrelid = pg_catalog.to_regclass($1::text) AND a.attnum > 0 AND NOT a.attisdropped
+    WHERE a.attrelid = pg_catalog.to_regclass($1::pg_catalog.text) AND a.attnum > 0 AND NOT a.attisdropped
     UNION ALL
     SELECT w.attnum, w.attname, t.typbasetype, t.typtypmod, w.colloid, w.depth + 1
     FROM walk w JOIN pg_catalog.pg_type t ON t.oid = w.typid
@@ -734,7 +734,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   SELECT DISTINCT ON (w.attnum)
          w.attname AS selecto_catalog_column,
          pg_catalog.format_type(w.typid, w.typmod) AS selecto_catalog_type,
-         t.typtype::text AS selecto_catalog_typtype,
+         t.typtype::pg_catalog.text AS selecto_catalog_typtype,
          COALESCE(c.collisdeterministic, true) AS selecto_catalog_deterministic
   FROM walk w
   JOIN pg_catalog.pg_type t ON t.oid = w.typid
@@ -1491,7 +1491,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp execute_write_command(connection, %Command{} = command, opts) do
-    with :ok <- verify_read_committed(connection, command, opts),
+    with :ok <- ensure_baseline(connection, opts),
+         :ok <- verify_read_committed(connection, command, opts),
          :ok <- verify_native_constraints(connection, command, opts),
          {:ok, statement} <- WriteCompiler.compile(command, opts),
          {:ok, query_result} <- execute_guarded_statement(connection, command, statement, opts),
@@ -1600,6 +1601,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # compares the session with its baseline again before it ends, so no
   # statement of the write leaves the session changed for later SQL.
   defp with_write_transaction(connection, opts, fun) do
+    host? = host_transaction?(connection)
+
     with_postgres_transaction(connection, opts, fn transactional_connection ->
       key = make_ref()
 
@@ -1608,6 +1611,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       try do
         with {:ok, result} <-
                fun.(transactional_connection, Keyword.put(opts, :selecto_session_key, key)),
+             :ok <- deferred_events(check, host?),
              :ok <- final_session_check(check, key) do
           {:ok, result}
         end
@@ -1615,6 +1619,66 @@ defmodule SelectoDBPostgreSQL.Adapter do
         Process.delete({__MODULE__, :session, key})
       end
     end)
+  end
+
+  # A deferred constraint trigger fires at COMMIT, after every snapshot of
+  # the write, and could leave a session-level set_config behind (R8). In a
+  # transaction the adapter owns, SET CONSTRAINTS ALL IMMEDIATE fires them
+  # now, before the final session check. Inside the host's transaction they
+  # would fire at the host's COMMIT, so a write there is refused while any
+  # enabled non-internal deferrable trigger exists.
+  defp deferred_events(check, false) do
+    case check.("SET CONSTRAINTS ALL IMMEDIATE", []) do
+      {:ok, _} -> :ok
+      {:error, %Error{}} = error -> error
+      {:error, reason} -> {:error, write_error(:execution_failed, reason)}
+    end
+  end
+
+  defp deferred_events(check, true) do
+    case check.(
+           "SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t " <>
+             "WHERE t.tgdeferrable AND NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'",
+           []
+         ) do
+      {:ok, %{rows: [[0]]}} ->
+        :ok
+
+      {:ok, _deferrable} ->
+        {:error,
+         Error.new(
+           :query_enforcement,
+           "PostgreSQL deferred triggers would fire at the host's COMMIT, after the session check",
+           details: %{
+             code: :query_rule_not_evaluable,
+             reason: :deferred_triggers,
+             adapter: :postgresql
+           }
+         )}
+
+      {:error, reason} ->
+        {:error, write_error(:execution_failed, reason)}
+    end
+  end
+
+  defp host_transaction?(%DBConnection{} = connection),
+    do: DBConnection.status(connection) == :transaction
+
+  defp host_transaction?(connection) when is_atom(connection) and not is_nil(connection) do
+    ecto_repo?(connection) and module_exports?(connection, :in_transaction?, 0) and
+      apply(connection, :in_transaction?, [])
+  end
+
+  defp host_transaction?(_connection), do: false
+
+  # The write's session baseline is taken before any other SQL of the
+  # command (R1): verify_read_committed and the native-constraint attestation
+  # follow it, so no catalog read or user code runs unobserved.
+  defp ensure_baseline(connection, opts) do
+    with {:ok, current} <- SessionGuard.snapshot(&guard_statement(connection, &1, &2)),
+         {:ok, _baseline} <- session_baseline(opts, current) do
+      :ok
+    end
   end
 
   defp final_session_check(check, key) do
@@ -1694,7 +1758,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
          {:ok, %{rows: [[^expected_type]]}} <-
            execute_statement(
              connection,
-             "SELECT c.contype FROM pg_constraint c WHERE c.conname = $1 AND c.conrelid = to_regclass($2)",
+             "SELECT c.contype FROM pg_catalog.pg_constraint c WHERE c.conname OPERATOR(pg_catalog.=) $1::pg_catalog.name AND c.conrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($2::pg_catalog.text)",
              [constraint, to_string(relation)],
              Keyword.take(opts, [:timeout, :log])
            ) do
