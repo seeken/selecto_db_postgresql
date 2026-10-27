@@ -237,17 +237,23 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
   end
 
   defp foreign_key_guard_text(relation, target_field, value, nil, offset) do
-    {"EXISTS (SELECT 1 FROM #{quote_relation(relation)} WHERE #{quote_identifier(target_field)} = $#{offset + 1})",
-     [value]}
+    {"EXISTS (SELECT 1 FROM #{quote_relation(relation)} WHERE " <>
+       guard_equality(quote_identifier(target_field), "$#{offset + 1}") <> ")", [value]}
   end
 
   defp foreign_key_guard_text(relation, target_field, value, {tenant_field, tenant}, offset) do
     alias_name = quote_identifier("selecto_fk_parent")
 
     {"EXISTS (SELECT 1 FROM #{quote_relation(relation)} AS #{alias_name} " <>
-       "WHERE #{alias_name}.#{quote_identifier(target_field)} = $#{offset + 1} " <>
-       "AND #{alias_name}.#{quote_identifier(tenant_field)} = $#{offset + 2})", [value, tenant]}
+       "WHERE " <>
+       guard_equality("#{alias_name}.#{quote_identifier(target_field)}", "$#{offset + 1}") <>
+       " AND " <>
+       guard_equality("#{alias_name}.#{quote_identifier(tenant_field)}", "$#{offset + 2}") <> ")",
+     [value, tenant]}
   end
+
+  # A foreign-key guard's equality names pg_catalog's operator (R46 FINAL-2).
+  defp guard_equality(left, right), do: "#{left} OPERATOR(pg_catalog.=) #{right}"
 
   defp guard_suffix(nil), do: ""
   defp guard_suffix(text), do: " AND " <> text
@@ -291,11 +297,16 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     end)
     |> case do
       {:ok, texts, params, _next_offset} ->
-        {:ok,
-         %{
-           text: "#{quote_field(field, opts)} IN (#{texts |> Enum.reverse() |> Enum.join(", ")})",
-           params: params
-         }}
+        texts = Enum.reverse(texts)
+
+        text =
+          if explicit?(opts),
+            do:
+              "(" <>
+                Enum.map_join(texts, " OR ", &typed_comparison(field, "=", &1, opts)) <> ")",
+            else: "#{quote_field(field, opts)} IN (#{Enum.join(texts, ", ")})"
+
+        {:ok, %{text: text, params: params}}
 
       error ->
         error
@@ -307,11 +318,12 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     with {:ok, compiled_value} <- compile_field_value(field, value, opts, offset) do
       operator_text = %{eq: "=", neq: "!=", gt: ">", gte: ">=", lt: "<", lte: "<="}[operator]
 
-      {:ok,
-       %{
-         text: "#{quote_field(field, opts)} #{operator_text} #{compiled_value.text}",
-         params: compiled_value.params
-       }}
+      text =
+        if explicit?(opts),
+          do: typed_comparison(field, operator_text, compiled_value.text, opts),
+          else: "#{quote_field(field, opts)} #{operator_text} #{compiled_value.text}"
+
+      {:ok, %{text: text, params: compiled_value.params}}
     end
   end
 
@@ -594,6 +606,36 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     |> to_string()
     |> String.replace("\"", "\"\"")
     |> then(&"\"#{&1}\"")
+  end
+
+  # R46 FINAL-2: with `explicit_operators: true` (the adapter's executed
+  # writes) every predicate names its operator, pg_catalog's unless the
+  # column's catalog type (`operator_types:` column => {schema, arg}) says
+  # otherwise, and casts both operands to the operator's argument type, so
+  # no operator or implicit cast is looked up by name.
+  defp explicit?(opts), do: Keyword.get(opts, :explicit_operators) == true
+
+  @doc false
+  def typed_comparison(field, operator, right, opts) do
+    pg_operator =
+      %{
+        "=" => "=",
+        "!=" => "<>",
+        "<>" => "<>",
+        ">" => ">",
+        ">=" => ">=",
+        "<" => "<",
+        "<=" => "<="
+      }[operator]
+
+    {schema, arg} =
+      opts
+      |> Keyword.get(:operator_types, %{})
+      |> Map.get(to_string(field), {"pg_catalog", nil})
+
+    cast = fn operand -> if arg, do: "CAST(#{operand} AS #{arg})", else: operand end
+
+    "(#{cast.(quote_field(field, opts))} OPERATOR(#{schema}.#{pg_operator}) #{cast.(right)})"
   end
 
   defp quote_field(field, opts) do

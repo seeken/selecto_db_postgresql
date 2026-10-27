@@ -356,13 +356,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
         # by that schema; "schema.relation" names keep theirs.
         names = Enum.map(names, &if(schema = declared[&1], do: schema <> "." <> &1, else: &1))
 
-        case with_declared(resolve_relations(connection, names), declared) do
-          {:ok, relations} ->
-            set = Map.put(Map.get(selecto, :set) || %{}, :qualified_relations, relations)
-            {:ok, %{selecto | set: set}}
+        # R46 FINAL-2: the catalog operator types of the relations' columns,
+        # so every generated comparison names its operator and casts both
+        # operands (Selecto.Builder.TypedOperator).
+        with {:ok, relations} <- with_declared(resolve_relations(connection, names), declared),
+             {:ok, types} <- operator_types(connection, relations) do
+          set =
+            (Map.get(selecto, :set) || %{})
+            |> Map.put(:qualified_relations, relations)
+            |> Map.put(:pg_operator_types, types)
 
-          {:error, %Error{} = error} ->
-            {:error, read_refusal(error)}
+          {:ok, %{selecto | set: set}}
+        else
+          {:error, %Error{} = error} -> {:error, read_refusal(error)}
         end
     end
   end
@@ -634,6 +640,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   # R36: the relation lookup runs its own savepoint or transaction, so all
   # of its statements go to one connection checkout.
+  defp operator_types(connection, relations),
+    do:
+      with_checkout(connection, fn guard, _in_transaction? ->
+        RelationPath.operator_types(guard, relations)
+      end)
+
   defp resolve_relations(_connection, []), do: {:ok, %{}}
   defp resolve_relations(connection, names), do: resolve_all(connection, names)
 
@@ -1181,7 +1193,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
     with :ok <- validate_candidate_request(request),
          {:ok, predicate} <-
            WriteCompiler.compile_predicate(request.parent_command.predicate,
-             context: request.context
+             context: request.context,
+             explicit_operators: true
            ),
          parent_query =
            "SELECT #{quote_identifier(request.parent_key)} FROM " <>
@@ -1222,7 +1235,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
     with :ok <- validate_record_request(request),
          :ok <- ensure_upsert_serializable(connection, request, opts),
          {:ok, predicate} <-
-           WriteCompiler.compile_predicate(request.predicate, context: request.context),
+           WriteCompiler.compile_predicate(request.predicate,
+             context: request.context,
+             explicit_operators: true
+           ),
          fields = request.fields |> Enum.map(&to_string/1) |> Enum.uniq() |> Enum.sort(),
          selected = Enum.map_join(fields, ", ", &quote_identifier/1),
          query =
@@ -1324,7 +1340,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
          false <- is_nil(root_command.predicate),
          {:ok, predicate} <-
            WriteCompiler.compile_predicate(root_command.predicate,
-             context: Keyword.get(opts, :context, %{})
+             context: Keyword.get(opts, :context, %{}),
+             explicit_operators: true
            ),
          query =
            "SELECT #{quote_identifier(parent_key)} FROM #{quote_relation(root_command.relation)} " <>
@@ -1703,7 +1720,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
     declared = command.relation
 
     with :ok <- ensure_baseline(connection, opts),
-         {:ok, command} <- qualify_command(connection, command, opts),
+         {:ok, command, operator_types} <- qualify_command(connection, command, opts),
+         opts = Keyword.put(opts, :operator_types, operator_types),
          :ok <- verify_read_committed(connection, command, opts),
          :ok <- verify_native_constraints(connection, command, declared, opts),
          {:ok, statement} <- WriteCompiler.compile(command, opts),
@@ -1820,7 +1838,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
       try do
         with {:ok, result} <-
-               fun.(transactional_connection, Keyword.put(opts, :selecto_session_key, key)),
+               fun.(
+                 transactional_connection,
+                 opts
+                 |> Keyword.put(:selecto_session_key, key)
+                 |> Keyword.put(:explicit_operators, true)
+               ),
              :ok <- final_session_check(check, key) do
           {:ok, result}
         end
@@ -1858,7 +1881,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
           do: Map.put(command.metadata, :foreign_key_guards, guards),
           else: command.metadata
 
-      {:ok, %{command | relation: qualified.(command.relation), metadata: metadata}}
+      # R46 FINAL-2: the written relation's column operator types.
+      types =
+        case Map.get(relations, to_string(command.relation)) do
+          quoted when is_binary(quoted) ->
+            with_checkout(connection, fn guard, _in_transaction? ->
+              RelationPath.operator_types(guard, %{"target" => quoted})
+            end)
+
+          _ ->
+            {:ok, %{}}
+        end
+
+      with {:ok, types} <- types do
+        {:ok, %{command | relation: qualified.(command.relation), metadata: metadata},
+         Map.get(types, "target", %{})}
+      end
     end
   end
 

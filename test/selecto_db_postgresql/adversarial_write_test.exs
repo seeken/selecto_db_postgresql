@@ -31,8 +31,8 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteTest do
       assert sql ==
                "INSERT INTO \"tasks\" (\"project_id\") SELECT $1 WHERE EXISTS " <>
                  "(SELECT 1 FROM \"projects\" AS \"selecto_fk_parent\" " <>
-                 "WHERE \"selecto_fk_parent\".\"id\" = $2 " <>
-                 "AND \"selecto_fk_parent\".\"tenant_id\" = $3)"
+                 "WHERE \"selecto_fk_parent\".\"id\" OPERATOR(pg_catalog.=) $2 " <>
+                 "AND \"selecto_fk_parent\".\"tenant_id\" OPERATOR(pg_catalog.=) $3)"
     end
 
     test "an update guard carries its tenant after the predicate parameters" do
@@ -53,7 +53,7 @@ defmodule SelectoDBPostgreSQL.AdversarialWriteTest do
                Adapter.preview_write(:unused, command)
 
       assert sql =~
-               ~s|WHERE ("id" = $2 AND "tenant_id" = $3) AND EXISTS (SELECT 1 FROM "projects" AS "selecto_fk_parent" WHERE "selecto_fk_parent"."id" = $4 AND "selecto_fk_parent"."tenant_id" = $5)|
+               ~s|WHERE ("id" = $2 AND "tenant_id" = $3) AND EXISTS (SELECT 1 FROM "projects" AS "selecto_fk_parent" WHERE "selecto_fk_parent"."id" OPERATOR(pg_catalog.=) $4 AND "selecto_fk_parent"."tenant_id" OPERATOR(pg_catalog.=) $5)|
     end
 
     test "a tenant guard without a tenant value fails closed" do

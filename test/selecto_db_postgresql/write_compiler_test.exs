@@ -316,7 +316,7 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
              Adapter.preview_write(:unused, command)
 
     assert sql ==
-             "INSERT INTO \"items\" (\"name\", \"account_id\") SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM \"accounts\" WHERE \"id\" = $3)"
+             "INSERT INTO \"items\" (\"name\", \"account_id\") SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM \"accounts\" WHERE \"id\" OPERATOR(pg_catalog.=) $3)"
   end
 
   test "portable ISO dates become driver values only for domain-typed assignments and predicates" do
