@@ -8,30 +8,34 @@ defmodule SelectoDBPostgreSQL.PostImage do
   # Before the statement the relation is locked ROW EXCLUSIVE and resolved
   # to its oid, schema and name, and to the oids its rows may live in (the
   # relation and its partitions): every later statement names it by that
-  # schema-qualified name and keeps only rows of those oids, never through a
-  # search_path lookup an allowed row trigger could redirect with
-  # set_config('search_path', ..., true) (items 51, 51a, 58).
+  # schema-qualified name and keeps only rows of those oids, and the trigger
+  # and rule checks go by oid, never through a search_path lookup an allowed
+  # row trigger could redirect with set_config('search_path', ..., true)
+  # (items 51, 51a, 58).
   #
-  # The statement returns the written rows' physical identity, (tableoid,
-  # ctid), as tagged RETURNING columns. A ctid names exactly one row version
-  # of one relation, whatever the key's type, collation or text image under
-  # the session's settings (items 34, 40, 43, 47). After the statement
-  # completes, when every non-deferred BEFORE and AFTER row trigger, rule and
-  # generated column has run, and after the session check of
-  # SelectoDBPostgreSQL.SessionGuard, one tagged SELECT inside the same
-  # transaction re-reads those rows under the scope predicate and reports
-  # what could defeat the check:
+  # The statement returns the written rows' keys (tagged RETURNING columns
+  # when it returns none itself). After it completes, when every
+  # non-deferred BEFORE and AFTER row trigger, rule and generated column has
+  # run, and after the session check of SelectoDBPostgreSQL.SessionGuard,
+  # one tagged SELECT inside the same transaction re-reads those rows by key
+  # under the scope predicate and reports what could defeat the check:
   #
   # - `selecto_post_image_matched`: written rows still inside the scope;
-  # - `selecto_post_image_rows`: rows carrying the returned identities (a
-  #   row an AFTER trigger updated again has a new ctid and refuses);
+  # - `selecto_post_image_rows`: rows carrying the returned keys;
   # - `selecto_post_image_blocked`: the relation is not a plain or
   #   partitioned table (a view), or it has enabled non-internal
   #   statement-level or deferrable triggers for the event (they act on
-  #   other rows or at commit, after this check), or rewrite rules for it.
+  #   other rows or at commit, after this check), or rewrite rules for it;
+  # - `selecto_post_image_keyed`: the key is exactly an immediate, valid,
+  #   non-partial, non-expression unique index over NOT NULL columns whose
+  #   index collation is each column's own, deterministic, with the default
+  #   operator class, so `=` in the re-read decides as the index enforces
+  #   uniqueness (item 40). The keys are bound back in their native binary
+  #   form (Postgrex), independent of DateStyle, extra_float_digits or any
+  #   other text-image setting (items 34, 43, 47).
   #
-  # Unless the relation is unblocked and every written row matches, the
-  # transaction rolls back with a typed refusal. Row-level triggers
+  # Unless the relation is unblocked and keyed and every written row matches,
+  # the transaction rolls back with a typed refusal. Row-level triggers
   # (updated_at, audit) keep working; triggers that change OTHER rows are
   # outside the scope guarantee.
 
@@ -51,7 +55,7 @@ defmodule SelectoDBPostgreSQL.PostImage do
   statement: its oid, its schema-qualified name and the oids of the
   relation and its partitions.
   """
-  def resolve(%Command{} = command, execute) do
+  def resolve(%Command{} = command, lock, execute) do
     sql = """
     SELECT c.oid, n.nspname::pg_catalog.text, c.relname::pg_catalog.text,
            ARRAY(SELECT t.relid FROM pg_catalog.pg_partition_tree(c.oid) t
@@ -63,7 +67,7 @@ defmodule SelectoDBPostgreSQL.PostImage do
 
     with {:ok, _} <-
            lock_result(
-             execute.("LOCK TABLE #{quote_relation(command.relation)} IN ROW EXCLUSIVE MODE", [])
+             lock.("LOCK TABLE #{quote_relation(command.relation)} IN ROW EXCLUSIVE MODE", [])
            ),
          {:ok, %{rows: [[oid, schema, name, oids]]}} when is_integer(oid) <-
            execute.(sql, [quote_relation(command.relation)]) do
@@ -82,51 +86,73 @@ defmodule SelectoDBPostgreSQL.PostImage do
   defp lock_result(_other), do: :error
 
   @doc """
-  The statement text that returns the written rows' (tableoid, ctid) as
-  tagged columns.
+  The statement text that returns the written rows' keys: unchanged when its
+  RETURNING already names every key column (`:all`, or a list holding them),
+  otherwise extended by tagged key columns.
   """
-  def returning(text, %Command{returning: returning}) do
-    keys =
-      "tableoid AS #{@key_alias}1, CAST(ctid AS pg_catalog.text) AS #{@key_alias}2"
+  def returning(text, %Command{metadata: %{post_image: %{key: key}}, returning: returning}) do
+    if returns_keys?(returning, key) do
+      text
+    else
+      keys =
+        key
+        |> Enum.with_index(1)
+        |> Enum.map_join(", ", fn {column, index} ->
+          "#{quote_identifier(column)} AS #{@key_alias}#{index}"
+        end)
 
-    if returning == :none, do: text <> " RETURNING " <> keys, else: text <> ", " <> keys
+      if returning == :none, do: text <> " RETURNING " <> keys, else: text <> ", " <> keys
+    end
   end
 
+  defp returns_keys?(:all, _key), do: true
+
+  defp returns_keys?(fields, key) when is_list(fields) do
+    names = Enum.map(fields, &to_string/1)
+    Enum.all?(key, &(&1 in names))
+  end
+
+  defp returns_keys?(_returning, _key), do: false
+
   @doc """
-  The statement result without the tagged identity columns, and the written
-  rows' identities.
+  The statement result without the tagged key columns, and the written rows'
+  keys (from the tags, or from the returned key columns).
   """
-  def split_result(%{columns: columns, rows: rows} = result, %Command{})
-      when is_list(columns) and is_list(rows) do
+  def split_result(%{columns: columns, rows: rows} = result, %Command{
+        metadata: %{post_image: %{key: key}}
+      })
+      when is_list(columns) do
     tagged =
       columns
       |> Enum.with_index()
       |> Enum.filter(fn {column, _index} -> String.starts_with?(column, @key_alias) end)
       |> Enum.map(&elem(&1, 1))
 
-    case tagged do
-      [oid_index, ctid_index] ->
-        keys = Enum.map(rows, fn row -> {Enum.at(row, oid_index), Enum.at(row, ctid_index)} end)
+    if tagged == [] do
+      indexes = Enum.map(key, fn column -> Enum.find_index(columns, &(&1 == column)) end)
 
-        keep = fn list ->
-          list
-          |> Enum.with_index()
-          |> Enum.reject(&(elem(&1, 1) in tagged))
-          |> Enum.map(&elem(&1, 0))
+      if Enum.any?(indexes, &is_nil/1),
+        do: {result, :unknown},
+        else: {result, Enum.map(rows, fn row -> Enum.map(indexes, &Enum.at(row, &1)) end)}
+    else
+      keys = Enum.map(rows, fn row -> Enum.map(tagged, &Enum.at(row, &1)) end)
+
+      keep = fn list ->
+        list
+        |> Enum.with_index()
+        |> Enum.reject(&(elem(&1, 1) in tagged))
+        |> Enum.map(&elem(&1, 0))
+      end
+
+      # A statement that returned only the tagged keys reports no rows, as it
+      # would have without RETURNING.
+      result =
+        case keep.(columns) do
+          [] -> %{result | columns: [], rows: []}
+          kept -> %{result | columns: kept, rows: Enum.map(rows, keep)}
         end
 
-        # A statement that returned only the tagged columns reports no rows,
-        # as it would have without RETURNING.
-        result =
-          case keep.(columns) do
-            [] -> %{result | columns: [], rows: []}
-            kept -> %{result | columns: kept, rows: Enum.map(rows, keep)}
-          end
-
-        {result, keys}
-
-      _other ->
-        {result, :unknown}
+      {result, keys}
     end
   end
 
@@ -141,66 +167,85 @@ defmodule SelectoDBPostgreSQL.PostImage do
     do: refused(:query_rule_not_evaluable, "cannot identify the written rows")
 
   def verify(%Command{} = command, target, keys, compile_predicate, execute) do
-    %{predicate: predicate} = command.metadata.post_image
+    %{predicate: predicate, key: key} = command.metadata.post_image
     affected = length(keys)
 
-    if Enum.all?(keys, fn {oid, ctid} -> is_integer(oid) and is_binary(ctid) end) do
-      with {:ok, scope} <- compile_predicate.(untyped_text(predicate), 3) do
-        rows = """
-        FROM #{target.relation} AS selecto_target
-        WHERE selecto_target.tableoid OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.oid[])
-          AND EXISTS (
-            SELECT 1
-            FROM ROWS FROM (pg_catalog.unnest($2::pg_catalog.oid[]),
-                            pg_catalog.unnest(CAST($3::pg_catalog.text[] AS pg_catalog.tid[])))
-              AS selecto_key(o, t)
-            WHERE selecto_key.o OPERATOR(pg_catalog.=) selecto_target.tableoid
-              AND selecto_key.t OPERATOR(pg_catalog.=) selecto_target.ctid)
-        """
+    # $1 the pre-resolved oids, $2 the key's column names, then the keys.
+    {key_match, key_params} = key_match(key, keys, 3)
 
-        oid_param = 4 + length(scope.params)
+    with {:ok, scope} <- compile_predicate.(untyped_text(predicate), 2 + length(key_params)) do
+      oid_param = 2 + length(key_params) + length(scope.params) + 1
 
-        sql = """
-        SELECT
-          (SELECT pg_catalog.count(*) #{rows} AND (#{scope.text})) AS selecto_post_image_matched,
-          (SELECT pg_catalog.count(*) #{rows}) AS selecto_post_image_rows,
-          #{blocked_sql(command)} AS selecto_post_image_blocked
-        FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) $#{oid_param}::pg_catalog.oid
-        """
+      rows = """
+      FROM #{target.relation} AS selecto_target
+      WHERE selecto_target.tableoid OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.oid[])
+        AND #{key_match}
+      """
 
-        params =
-          [target.oids, Enum.map(keys, &elem(&1, 0)), Enum.map(keys, &elem(&1, 1))] ++
-            scope.params ++ [target.oid]
+      sql = """
+      SELECT
+        (SELECT pg_catalog.count(*) #{rows} AND (#{scope.text})) AS selecto_post_image_matched,
+        (SELECT pg_catalog.count(*) #{rows}) AS selecto_post_image_rows,
+        #{blocked_sql(command)} AS selecto_post_image_blocked,
+        #{keyed_sql()} AS selecto_post_image_keyed
+      FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) $#{oid_param}::pg_catalog.oid
+      """
 
-        case execute.(sql, params) do
-          {:ok, %{rows: [[matched, rows, blocked]]}} ->
-            cond do
-              blocked != 0 ->
-                refused(
-                  :query_rule_not_evaluable,
-                  "the relation cannot prove the written rows' scope"
-                )
+      params = [target.oids, Enum.sort(key) | key_params] ++ scope.params ++ [target.oid]
 
-              rows != affected or matched != affected ->
-                refused(:query_rule_violation, "the written rows left the trusted write scope")
+      case execute.(sql, params) do
+        {:ok, %{rows: [[matched, rows, blocked, keyed]]}} ->
+          cond do
+            blocked != 0 or keyed != true ->
+              refused(
+                :query_rule_not_evaluable,
+                "the relation cannot prove the written rows' scope"
+              )
 
-              true ->
-                :ok
-            end
+            rows != affected or matched != affected ->
+              refused(:query_rule_violation, "the written rows left the trusted write scope")
 
-          {:ok, _other} ->
-            refused(
-              :query_rule_not_evaluable,
-              "the relation cannot prove the written rows' scope"
-            )
+            true ->
+              :ok
+          end
 
-          {:error, _reason} = error ->
-            error
-        end
+        {:ok, _other} ->
+          refused(:query_rule_not_evaluable, "the relation cannot prove the written rows' scope")
+
+        {:error, _reason} = error ->
+          error
       end
-    else
-      refused(:query_rule_not_evaluable, "cannot identify the written rows")
     end
+  end
+
+  defp keyed_sql do
+    """
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_index i
+      WHERE i.indrelid OPERATOR(pg_catalog.=) c.oid AND i.indisunique AND i.indimmediate
+        AND i.indisvalid AND i.indpred IS NULL AND i.indexprs IS NULL
+        AND i.indnatts OPERATOR(pg_catalog.=) i.indnkeyatts
+        AND i.indnkeyatts OPERATOR(pg_catalog.=) pg_catalog.cardinality($2::pg_catalog.text[])
+        AND (SELECT pg_catalog.array_agg(a.attname::pg_catalog.text ORDER BY a.attname::pg_catalog.text)
+             FROM pg_catalog.pg_attribute a
+             WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid
+               AND a.attnum OPERATOR(pg_catalog.=) ANY (i.indkey::pg_catalog.int2[]) AND a.attnotnull)
+            OPERATOR(pg_catalog.=) $2::pg_catalog.text[]
+        -- Item 40: each key column's index collation is its own and
+        -- deterministic, with the default operator class.
+        AND NOT EXISTS (
+          SELECT 1
+          FROM pg_catalog.generate_subscripts(i.indkey::pg_catalog.int2[], 1) AS k(n)
+          JOIN pg_catalog.pg_attribute a
+            ON a.attrelid OPERATOR(pg_catalog.=) c.oid
+           AND a.attnum OPERATOR(pg_catalog.=) (i.indkey::pg_catalog.int2[])[k.n]
+          LEFT JOIN pg_catalog.pg_collation col ON col.oid OPERATOR(pg_catalog.=) a.attcollation
+          LEFT JOIN pg_catalog.pg_opclass o
+            ON o.oid OPERATOR(pg_catalog.=) (i.indclass::pg_catalog.oid[])[k.n]
+          WHERE (i.indcollation::pg_catalog.oid[])[k.n] OPERATOR(pg_catalog.<>) a.attcollation
+             OR NOT COALESCE(col.collisdeterministic, true)
+             OR NOT COALESCE(o.opcdefault, false)))
+    """
   end
 
   defp blocked_sql(command) do
@@ -246,6 +291,33 @@ defmodule SelectoDBPostgreSQL.PostImage do
   defp untyped_text(list) when is_list(list), do: Enum.map(list, &untyped_text/1)
   defp untyped_text(value), do: value
 
+  # Single-column keys match `= ANY($n)`; composite keys a VALUES list.
+  defp key_match([column], keys, first) do
+    {"#{quote_identifier(column)} = ANY ($#{first})", [Enum.map(keys, &hd/1)]}
+  end
+
+  defp key_match(columns, [], _first) do
+    {"(#{Enum.map_join(columns, ", ", &quote_identifier/1)}) IN (SELECT #{Enum.map_join(columns, ", ", fn _ -> "NULL" end)} WHERE false)",
+     []}
+  end
+
+  defp key_match(columns, keys, first) do
+    width = length(columns)
+
+    values =
+      keys
+      |> Enum.with_index()
+      |> Enum.map_join(", ", fn {_row, row_index} ->
+        "(" <>
+          Enum.map_join(0..(width - 1), ", ", fn column_index ->
+            "$#{first + row_index * width + column_index}"
+          end) <> ")"
+      end)
+
+    {"(#{Enum.map_join(columns, ", ", &quote_identifier/1)}) IN (VALUES #{values})",
+     List.flatten(keys)}
+  end
+
   # tgtype bits: INSERT 4, UPDATE 16 (an upsert can fire either).
   defp event_bits(:insert), do: 4
   defp event_bits(:update), do: 16
@@ -284,8 +356,8 @@ defmodule SelectoDBPostgreSQL.PostImage do
 
   def bound_delete?(_command), do: false
 
-  def lock_delete(%Command{} = command, execute) do
-    with {:ok, target} <- resolve(command, execute),
+  def lock_delete(%Command{} = command, execute, resolve_execute) do
+    with {:ok, target} <- resolve(command, execute, resolve_execute),
          :ok <- check_delete(command, target, execute) do
       {:ok, target}
     end
