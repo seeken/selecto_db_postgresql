@@ -831,9 +831,9 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
       exec!(c, "CREATE TABLE w46 (id int PRIMARY KEY, org_key #{type} NOT NULL, note text)")
       exec!(c, "INSERT INTO w46 VALUES (1, #{v1}, 'in'), (2, #{v2}, 'SECRET')")
 
-      # The operand's own type on both sides, and against text/int4.
-      other_side = if declared == :integer, do: "int4", else: "text"
-      signatures = Enum.uniq([{operand, operand}, {operand, other_side}])
+      # The operand's own type on both sides: the exact match an untyped
+      # parameter would pick.
+      signatures = [{operand, operand}]
 
       for {left, right} <- signatures do
         exec!(
@@ -856,10 +856,19 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
                [[2]],
              type
 
+      # A connection opened after the types and operators exist (its
+      # driver type cache knows them), as a host's would be.
+      {:ok, fresh} =
+        Adapter.connect(
+          SelectoDBPostgreSQL.Verification.ConnectionOptions.options()
+          |> Keyword.put(:pool_size, 1)
+          |> Keyword.put(:parameters, search_path: schema)
+        )
+
       result =
         domain("w46")
         |> put_in([:source, :columns, :org_key], %{type: declared})
-        |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+        |> Selecto.configure(fresh, adapter: Adapter, validate: false, rollup_sort_fix: false)
         |> Selecto.with_tenant(tenant)
         |> Selecto.select(["id", "note"])
         |> Selecto.order_by(["id"])
@@ -880,7 +889,8 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
           metadata: %{post_image: %{predicate: scope, key: ["id"]}}
         })
 
-      assert {:ok, %{affected_rows: 0}} = Adapter.execute_write_unsafe(c, command, []), type
+      assert {:ok, %{affected_rows: 0}} = Adapter.execute_write_unsafe(fresh, command, []), type
+      GenServer.stop(fresh)
       refute inspect(rows!(c, "SELECT note FROM w46 WHERE id = 2")) =~ "PWNED", type
 
       for {left, right} <- signatures do
