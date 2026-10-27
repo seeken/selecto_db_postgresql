@@ -720,4 +720,113 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
       GenServer.stop(admin)
     end
   end
+
+  # R43: the pin keeps every schema of the reset path, so an extension's
+  # operators (citext in its own schema) resolve as the host's
+  # configuration resolves them; a narrowed pin turned citext = into text =.
+  # Its own database, whose search_path names the extension schema: the
+  # driver's per-database type cache then knows citext.
+  test "an extension schema on the reset path keeps its operators under the pin" do
+    prefix = System.get_env("SELECTO_TEST_DATABASE_PREFIX", "selecto")
+    database = "#{prefix}_ext_#{System.unique_integer([:positive])}"
+    options = SelectoDBPostgreSQL.Verification.ConnectionOptions.options()
+    {:ok, admin} = Adapter.connect(Keyword.put(options, :pool_size, 1))
+    exec!(admin, ~s|CREATE DATABASE "#{database}"|)
+    exec!(admin, ~s|ALTER DATABASE "#{database}" SET search_path = "$user", public, ext|)
+
+    try do
+      {:ok, setup} =
+        Adapter.connect(options |> Keyword.put(:pool_size, 1) |> Keyword.put(:database, database))
+
+      exec!(setup, "CREATE SCHEMA ext")
+      exec!(setup, "CREATE EXTENSION citext SCHEMA ext")
+      exec!(setup, "CREATE TABLE public.ci (id int PRIMARY KEY, org_key text, note ext.citext)")
+
+      exec!(
+        setup,
+        "INSERT INTO public.ci VALUES (1, 't1', 'ABC'), (2, 't1', 'abc'), (3, 't2', 'abc')"
+      )
+
+      GenServer.stop(setup)
+
+      {:ok, c} =
+        Adapter.connect(options |> Keyword.put(:pool_size, 1) |> Keyword.put(:database, database))
+
+      # citext equality, as the host's own SQL sees it.
+      assert rows!(c, "SELECT id FROM ci WHERE org_key = 't1' AND note = 'abc' ORDER BY id") ==
+               [[1], [2]]
+
+      result =
+        domain("ci")
+        |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+        |> Selecto.with_tenant("t1")
+        |> Selecto.select(["id"])
+        |> Selecto.filter({"note", "abc"})
+        |> Selecto.order_by(["id"])
+        |> Selecto.execute()
+
+      assert read_code(result) == [[1], [2]], inspect(result)
+      GenServer.stop(c)
+    after
+      exec!(admin, ~s|DROP DATABASE IF EXISTS "#{database}" WITH (FORCE)|)
+      GenServer.stop(admin)
+    end
+  end
+
+  # R42 / R42 FINAL: a hand-built Selecto read (no compile-time relation
+  # list) refuses while the session holds any temp relation; without one,
+  # its relations, in comma FROM lists and scalar subqueries too, are
+  # qualified like any other. A caller-supplied empty list fails closed.
+  test "hand-built reads refuse while temp relations exist; comma lists and subqueries are qualified",
+       %{connection: c} do
+    sqls = [
+      ~s|SELECT "s0"."id", "s0"."note" FROM (SELECT 1) AS "d", "items" AS "s0" WHERE "s0"."org_key" = $1 ORDER BY 1|,
+      "SELECT s0.id, s0.note FROM pg_catalog.pg_am d, items s0 WHERE s0.org_key = $1 AND d.amname = 'btree' ORDER BY 1",
+      "SELECT 1 AS id, (SELECT pg_catalog.string_agg(note, ',' ORDER BY id) FROM (SELECT 1) z, items WHERE org_key = $1) AS note"
+    ]
+
+    exec!(c, "CREATE TEMP VIEW items AS SELECT id, 't1'::text AS org_key, note FROM items")
+
+    for sql <- sqls do
+      assert {:error, %{details: %{reason: :temporary_relations}}} =
+               Adapter.execute(c, sql, ["t1"], selecto_read: true),
+             sql
+    end
+
+    exec!(c, "DROP VIEW pg_temp.items")
+
+    for sql <- sqls do
+      assert {:ok, %{rows: [[1, "mine"]]}} = Adapter.execute(c, sql, ["t1"], selecto_read: true)
+
+      assert {:error, %{details: %{reason: :relation_unresolved}}} =
+               Adapter.execute(c, sql, ["t1"],
+                 selecto_read: true,
+                 selecto_qualified_relations: %{}
+               )
+    end
+  end
+
+  # R46: an operator over pg_catalog types in a reset-path schema would be
+  # chosen over pg_catalog's by an exact type match: refused, fail closed.
+  test "a shadowing operator over pg_catalog types on the reset path refuses",
+       %{connection: c, schema: schema} do
+    exec!(
+      c,
+      "CREATE FUNCTION #{schema}.always_eq(varchar, varchar) RETURNS boolean LANGUAGE sql " <>
+        "IMMUTABLE AS 'SELECT true'"
+    )
+
+    exec!(
+      c,
+      "CREATE OPERATOR #{schema}.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = #{schema}.always_eq)"
+    )
+
+    assert read_code(read(c)) == :operator_shadow
+
+    assert {:error, %Error{details: %{reason: :operator_shadow}}} =
+             Adapter.execute_write_unsafe(c, update("items", [{"note", "q"}], tenant("t1")), [])
+
+    exec!(c, "DROP OPERATOR #{schema}.= (varchar, varchar)")
+    assert read_code(read(c)) == [[1, "mine"]]
+  end
 end

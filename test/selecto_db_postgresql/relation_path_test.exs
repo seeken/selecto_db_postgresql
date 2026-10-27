@@ -65,8 +65,13 @@ defmodule SelectoDBPostgreSQL.RelationPathTest do
   end
 
   test "the pinned path puts pg_catalog first and pg_temp last (R30)" do
-    assert RelationPath.pinned_path(%{"a" => ~s("app"."a"), "b" => ~s("pg_temp_3"."b")}) ==
-             ~s|pg_catalog, "app", pg_temp|
+    # R43: every schema of the reset path (an extension's `ext` included),
+    # then the declared ones, pg_temp last.
+    assert RelationPath.pinned_path(%{
+             "a" => ~s("app"."a"),
+             "b" => ~s("pg_temp_3"."b"),
+             RelationPath.path_key() => ["public", "ext"]
+           }) == ~s|pg_catalog, "public", "ext", "app", pg_temp|
 
     assert RelationPath.pinned_path(nil) == "pg_catalog, pg_temp"
   end
@@ -74,5 +79,50 @@ defmodule SelectoDBPostgreSQL.RelationPathTest do
   test "the shadow check reads relation positions only (R28)" do
     assert "items" in SessionGuard.relation_tokens(~s|select note from "app"."items"|)
     refute "note" in SessionGuard.relation_tokens(~s|select note from "app"."items"|)
+  end
+
+  # R42: every relation position, not only the token after FROM or JOIN.
+  test "comma FROM lists, scalar subqueries and USING lists are relation positions" do
+    for {sql, want} <- [
+          {~s|SELECT s0.id FROM (SELECT 1) AS d, "items" AS s0|, ["items"]},
+          {"SELECT s0.id FROM pg_catalog.pg_am d, items s0, c_root r", ["items", "c_root"]},
+          {"SELECT 1, (SELECT count(*) FROM (SELECT 1) z, items WHERE org_key = $1) AS n",
+           ["items"]},
+          {"DELETE FROM c_root USING items, c_items WHERE c_root.id = items.id",
+           ["c_root", "items", "c_items"]},
+          {"UPDATE c_root SET n = 1 FROM items i, c_items WHERE true",
+           ["c_root", "items", "c_items"]},
+          {"SELECT a FROM t1 JOIN t2 USING (id), t3", ["t1", "t2", "t3"]},
+          {"MERGE INTO c_root USING items ON true WHEN MATCHED THEN UPDATE SET n = 1",
+           ["c_root", "items"]}
+        ] do
+      assert RelationPath.names(sql) == want, sql
+    end
+  end
+
+  test "FROM inside functions, IS DISTINCT FROM, conflict and locking clauses are not relations" do
+    sql =
+      "SELECT extract(year FROM ts), substring(note FROM 2), trim(both 'x' FROM note) " <>
+        "FROM c_root WHERE a IS DISTINCT FROM $1 AND b = 'from items' " <>
+        "-- FROM commented\n FOR UPDATE"
+
+    assert RelationPath.names(sql) == ["c_root"]
+
+    insert =
+      "INSERT INTO c_items (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id " <>
+        "RETURNING id"
+
+    assert RelationPath.names(insert) == ["c_items"]
+  end
+
+  test "comma-list and subquery relations are qualified in place" do
+    sql = "SELECT 1 FROM c_root r, c_items i WHERE i.id IN (SELECT id FROM c_items)"
+    assert {:ok, qualified} = RelationPath.qualify(sql, @map)
+
+    assert qualified ==
+             ~s|SELECT 1 FROM "app"."c_root" r, "app"."c_items" i WHERE i.id IN (SELECT id FROM "app"."c_items")|
+
+    assert :ok = RelationPath.qualified(qualified)
+    assert {:error, _} = RelationPath.qualified(sql)
   end
 end
