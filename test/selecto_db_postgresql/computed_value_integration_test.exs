@@ -53,6 +53,8 @@ defmodule SelectoDBPostgreSQL.ComputedValueIntegrationTest do
       name: "Computed boundary",
       source: %{
         source_table: "selecto_computed_boundary",
+        # A host temp table is declared (R38).
+        source_schema: "pg_temp",
         primary_key: :id,
         fields: Map.keys(columns),
         columns: columns,

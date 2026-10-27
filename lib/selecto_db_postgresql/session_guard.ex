@@ -1,50 +1,90 @@
 defmodule SelectoDBPostgreSQL.SessionGuard.Deferrable do
   @moduledoc false
 
-  # The deferrable triggers that can run user code at COMMIT (R23, R32):
-  # every enabled deferrable trigger except
+  # The deferrable triggers that can run user code at COMMIT (R23, R32,
+  # R32a, R37): every enabled deferrable trigger except
   # (1) a foreign-key trigger whose function is a pg_catalog RI_FKey_*
-  #     function (deferred foreign keys keep working), and
-  # (2) a unique or exclusion recheck (pg_catalog.unique_key_recheck) on an
-  #     index with no expressions or predicate whose operator classes, their
-  #     families' operators and support functions, the exclusion operators
-  #     and their functions, and the collations are all pg_catalog's.
-  # A DEFERRABLE EXCLUDE whose opclass calls plpgsql counts.
+  #     function, whose equality operators (conpfeqop, conppeqop,
+  #     conffeqop) and their functions are pg_catalog's, whose referenced
+  #     unique index passes the index test below, and whose key columns on
+  #     both sides have pg_catalog base types (or domains over them);
+  # (2) a unique or exclusion recheck (pg_catalog.unique_key_recheck) whose
+  #     index passes the index test and whose exclusion operators and their
+  #     functions are pg_catalog's.
+  # Index test: no expressions, no predicate, every collation 0 or
+  # pg_catalog's, every operator class, its family's operators and support
+  # functions pg_catalog's, and every key column of a pg_catalog base type.
+  # A DEFERRABLE EXCLUDE whose opclass, expression, collation or key type is
+  # user-defined counts, as does a constraint trigger.
 
   @catalog "CAST(11 AS pg_catalog.oid)"
 
-  @count_sql "SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t " <>
-               "JOIN pg_catalog.pg_proc f ON f.oid OPERATOR(pg_catalog.=) t.tgfoid " <>
-               "WHERE t.tgdeferrable AND t.tgenabled OPERATOR(pg_catalog.<>) 'D' " <>
-               "AND NOT (t.tgisinternal AND f.pronamespace OPERATOR(pg_catalog.=) #{@catalog} AND (" <>
-               "pg_catalog.left(CAST(f.proname AS pg_catalog.text), 8) OPERATOR(pg_catalog.=) 'RI_FKey_' " <>
-               "OR (f.proname OPERATOR(pg_catalog.=) 'unique_key_recheck' AND EXISTS (" <>
-               "SELECT 1 FROM pg_catalog.pg_constraint c " <>
-               "JOIN pg_catalog.pg_index i ON i.indexrelid OPERATOR(pg_catalog.=) c.conindid " <>
-               "WHERE c.oid OPERATOR(pg_catalog.=) t.tgconstraint " <>
-               "AND i.indexprs IS NULL AND i.indpred IS NULL " <>
-               "AND NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(i.indclass AS pg_catalog.oid[])) AS k(o) " <>
-               "JOIN pg_catalog.pg_opclass x ON x.oid OPERATOR(pg_catalog.=) k.o " <>
-               "LEFT JOIN pg_catalog.pg_amproc ap ON ap.amprocfamily OPERATOR(pg_catalog.=) x.opcfamily " <>
-               "LEFT JOIN pg_catalog.pg_proc pp ON pp.oid OPERATOR(pg_catalog.=) ap.amproc " <>
-               "LEFT JOIN pg_catalog.pg_amop ao ON ao.amopfamily OPERATOR(pg_catalog.=) x.opcfamily " <>
-               "LEFT JOIN pg_catalog.pg_operator op ON op.oid OPERATOR(pg_catalog.=) ao.amopopr " <>
-               "LEFT JOIN pg_catalog.pg_proc opf ON opf.oid OPERATOR(pg_catalog.=) op.oprcode " <>
-               "WHERE x.opcnamespace OPERATOR(pg_catalog.<>) #{@catalog} " <>
-               "OR pp.pronamespace OPERATOR(pg_catalog.<>) #{@catalog} " <>
-               "OR op.oprnamespace OPERATOR(pg_catalog.<>) #{@catalog} " <>
-               "OR opf.pronamespace OPERATOR(pg_catalog.<>) #{@catalog}) " <>
-               "AND NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(c.conexclop) AS e(o) " <>
-               "JOIN pg_catalog.pg_operator op ON op.oid OPERATOR(pg_catalog.=) e.o " <>
-               "LEFT JOIN pg_catalog.pg_proc opf ON opf.oid OPERATOR(pg_catalog.=) op.oprcode " <>
-               "WHERE op.oprnamespace OPERATOR(pg_catalog.<>) #{@catalog} " <>
-               "OR opf.pronamespace OPERATOR(pg_catalog.<>) #{@catalog}) " <>
-               "AND NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(i.indcollation AS pg_catalog.oid[])) AS l(o) " <>
-               "JOIN pg_catalog.pg_collation co ON co.oid OPERATOR(pg_catalog.=) l.o " <>
-               "WHERE co.collnamespace OPERATOR(pg_catalog.<>) #{@catalog})))))"
+  defp base_types(relation, attnums),
+    do:
+      "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a " <>
+        "JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) a.atttypid " <>
+        "LEFT JOIN pg_catalog.pg_type bt ON bt.oid OPERATOR(pg_catalog.=) ty.typbasetype " <>
+        "WHERE a.attrelid OPERATOR(pg_catalog.=) #{relation} " <>
+        "AND a.attnum OPERATOR(pg_catalog.=) ANY (#{attnums}) " <>
+        "AND NOT ((ty.typtype OPERATOR(pg_catalog.=) 'b' AND ty.typnamespace OPERATOR(pg_catalog.=) #{@catalog}) " <>
+        "OR (ty.typtype OPERATOR(pg_catalog.=) 'd' AND bt.typtype OPERATOR(pg_catalog.=) 'b' " <>
+        "AND bt.typnamespace OPERATOR(pg_catalog.=) #{@catalog})))"
+
+  defp catalog_operators(array),
+    do:
+      "NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(#{array}) AS e(o) " <>
+        "JOIN pg_catalog.pg_operator op ON op.oid OPERATOR(pg_catalog.=) e.o " <>
+        "LEFT JOIN pg_catalog.pg_proc opf ON opf.oid OPERATOR(pg_catalog.=) op.oprcode " <>
+        "WHERE op.oprnamespace OPERATOR(pg_catalog.<>) #{@catalog} " <>
+        "OR opf.pronamespace OPERATOR(pg_catalog.<>) #{@catalog})"
+
+  defp catalog_index(index),
+    do:
+      "EXISTS (SELECT 1 FROM pg_catalog.pg_index i " <>
+        "WHERE i.indexrelid OPERATOR(pg_catalog.=) #{index} " <>
+        "AND i.indexprs IS NULL AND i.indpred IS NULL " <>
+        "AND NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(i.indclass AS pg_catalog.oid[])) AS k(o) " <>
+        "JOIN pg_catalog.pg_opclass x ON x.oid OPERATOR(pg_catalog.=) k.o " <>
+        "LEFT JOIN pg_catalog.pg_amproc ap ON ap.amprocfamily OPERATOR(pg_catalog.=) x.opcfamily " <>
+        "LEFT JOIN pg_catalog.pg_proc pp ON pp.oid OPERATOR(pg_catalog.=) ap.amproc " <>
+        "LEFT JOIN pg_catalog.pg_amop ao ON ao.amopfamily OPERATOR(pg_catalog.=) x.opcfamily " <>
+        "LEFT JOIN pg_catalog.pg_operator op ON op.oid OPERATOR(pg_catalog.=) ao.amopopr " <>
+        "LEFT JOIN pg_catalog.pg_proc opf ON opf.oid OPERATOR(pg_catalog.=) op.oprcode " <>
+        "WHERE x.opcnamespace OPERATOR(pg_catalog.<>) #{@catalog} " <>
+        "OR pp.pronamespace OPERATOR(pg_catalog.<>) #{@catalog} " <>
+        "OR op.oprnamespace OPERATOR(pg_catalog.<>) #{@catalog} " <>
+        "OR opf.pronamespace OPERATOR(pg_catalog.<>) #{@catalog}) " <>
+        "AND NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(i.indcollation AS pg_catalog.oid[])) AS l(o) " <>
+        "JOIN pg_catalog.pg_collation co ON co.oid OPERATOR(pg_catalog.=) l.o " <>
+        "WHERE co.collnamespace OPERATOR(pg_catalog.<>) #{@catalog}) " <>
+        "AND " <> base_types("i.indrelid", "CAST(i.indkey AS pg_catalog.int2[])") <> ")"
 
   @doc "The count statement (no parameters); every name pg_catalog-qualified."
-  def count_sql, do: @count_sql
+  def count_sql,
+    do:
+      "SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t " <>
+        "JOIN pg_catalog.pg_proc f ON f.oid OPERATOR(pg_catalog.=) t.tgfoid " <>
+        "WHERE t.tgdeferrable AND t.tgenabled OPERATOR(pg_catalog.<>) 'D' " <>
+        "AND NOT (t.tgisinternal AND f.pronamespace OPERATOR(pg_catalog.=) #{@catalog} AND EXISTS (" <>
+        "SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.oid OPERATOR(pg_catalog.=) t.tgconstraint AND (" <>
+        "(pg_catalog.left(CAST(f.proname AS pg_catalog.text), 8) OPERATOR(pg_catalog.=) 'RI_FKey_' " <>
+        "AND " <>
+        catalog_operators("c.conpfeqop") <>
+        " AND " <>
+        catalog_operators("c.conppeqop") <>
+        " AND " <>
+        catalog_operators("c.conffeqop") <>
+        " AND " <>
+        catalog_index("c.conindid") <>
+        " AND " <>
+        base_types("c.conrelid", "c.conkey") <>
+        " AND " <>
+        base_types("c.confrelid", "c.confkey") <>
+        ") " <>
+        "OR (f.proname OPERATOR(pg_catalog.=) 'unique_key_recheck' AND " <>
+        catalog_index("c.conindid") <>
+        " AND " <>
+        "(c.conexclop IS NULL OR " <> catalog_operators("c.conexclop") <> ")))))"
 end
 
 defmodule SelectoDBPostgreSQL.SessionGuard do
