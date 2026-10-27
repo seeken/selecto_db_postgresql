@@ -1516,7 +1516,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # write's transaction or savepoint rolls back (items 54, 54a, 54b, 56, 59).
   #
   # A guarded INSERT/UPDATE (TW-09 post-image) locks and resolves its
-  # relation first, returns its rows' (tableoid, ctid) and is re-read by them
+  # relation first, returns its rows' keys and is re-read by them
   # after the statement (SelectoDBPostgreSQL.PostImage).
   defp execute_guarded_statement(connection, command, statement, opts) do
     check = &execute_statement(connection, &1, &2, Keyword.take(opts, [:timeout, :log]))
