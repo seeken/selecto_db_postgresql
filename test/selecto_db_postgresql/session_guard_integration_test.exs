@@ -236,38 +236,24 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
     assert read_code(read(c)) == [[1, "mine"]]
   end
 
-  test "a temp relation or type shadowing a domain name refuses reads, streams and writes",
+  test "a temp namesake cannot capture a qualified relation; a temp type is refused",
        %{connection: c} do
-    # A temp relation shadowing a domain relation resolves it differently
-    # under the session's path (R38: relation_ambiguous); a shadow the
-    # lookup cannot see (a temp type) is the shadow check's (item 56).
+    # R38a: the domain relation resolves (reset path) to its own schema and
+    # is named by it, so a temp view of the same name reads nothing.
     exec!(c, "CREATE TEMP VIEW items AS SELECT id, 't1'::text AS org_key, note FROM items")
-    shadowed = [:temporary_shadow, :relation_ambiguous]
-    assert read_code(read(c)) in shadowed
+    assert read_code(read(c)) == [[1, "mine"]]
 
-    assert {:error, %Error{details: %{reason: reason}}} =
+    assert {:ok, %{affected_rows: 1}} =
              Adapter.execute_write_unsafe(c, update("items", [{"note", "p"}], tenant("t1")), [])
 
-    assert reason in shadowed
-
-    stream =
+    {:ok, rows} =
       domain("items")
       |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
       |> Selecto.with_tenant("t1")
       |> Selecto.select(["id", "note"])
       |> Selecto.execute_stream()
 
-    case stream do
-      {:ok, rows} ->
-        assert_raise RuntimeError, ~r/shadows a name the statement uses/, fn ->
-          Enum.to_list(rows)
-        end
-
-      {:error, %{details: %{reason: reason}}} ->
-        assert reason in shadowed
-    end
-
-    assert rows!(c, "SELECT note FROM items ORDER BY id") |> length() == 3
+    assert [{[1, "p"], ["id", "note"]}] = Enum.map(Enum.to_list(rows), &elem(&1, 0))
 
     exec!(c, "DROP VIEW pg_temp.items")
     exec!(c, "CREATE DOMAIN pg_temp.text AS varchar(2)")
