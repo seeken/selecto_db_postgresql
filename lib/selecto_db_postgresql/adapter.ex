@@ -290,8 +290,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   """
   @impl true
   def execute(connection, query, params, opts) do
-    if Keyword.get(opts, :selecto_read) == true do
-      guarded_read(connection, query, params, Keyword.delete(opts, :selecto_read))
+    if Selecto.Executor.selecto_read?() do
+      guarded_read(connection, query, params, opts)
     else
       execute_plain(connection, query, params, opts)
     end
@@ -307,8 +307,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  # A Selecto read (`selecto_read: true`, set by Selecto's executor) runs on
-  # one connection between two session snapshots
+  # A Selecto read (marked by Selecto's executor, Selecto.Executor.selecto_read?/0)
+  # runs on one connection between two session snapshots
   # (SelectoDBPostgreSQL.SessionGuard, items 56, 56b, 56c, 61): first the
   # shadow check of its text, then the statement, then the snapshot again.
   # Inside the host's transaction the three run under a savepoint with a
@@ -319,7 +319,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp guarded_read(%DBConnection{} = connection, query, params, opts) do
     work = fn ->
       in_transaction? = DBConnection.status(connection) == :transaction
-      run_guarded_read(&query_postgrex(connection, &1, &2, opts), in_transaction?, query, params)
+
+      run_guarded_read(
+        &query_postgrex(connection, &1, &2, opts),
+        &guard_statement(connection, &1, &2),
+        in_transaction?,
+        query,
+        params
+      )
     end
 
     case Keyword.get(opts, :timeout) do
@@ -362,6 +369,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         # statement; the checks run through it as the statement does.
         run_guarded_read(
           &execute_module_connection(connection, &1, &2, opts),
+          &execute_module_connection(connection, &1, &2, opts),
           false,
           query,
           params
@@ -389,6 +397,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
         run_guarded_read(
           &query_postgrex(checked_out, &1, &2, opts),
+          &guard_statement(checked_out, &1, &2),
           in_transaction?,
           query,
           params
@@ -421,6 +430,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
         run_guarded_read(
           &execute_ecto_query(repo, &1, &2, Keyword.take(opts, [:timeout])),
+          &execute_ecto_query(repo, &1, &2, Keyword.take(opts, [:timeout])),
           in_transaction?,
           query,
           params
@@ -435,19 +445,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
     :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
-  defp run_guarded_read(execute, true, query, params) do
+  defp run_guarded_read(execute, guard, true, query, params) do
     name = "selecto_read_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
 
     undo = fn ->
-      Enum.each(["ROLLBACK TO SAVEPOINT ", "RELEASE SAVEPOINT "], &execute.(&1 <> name, []))
+      Enum.each(["ROLLBACK TO SAVEPOINT ", "RELEASE SAVEPOINT "], &guard.(&1 <> name, []))
     end
 
-    case execute.("SAVEPOINT " <> name, []) do
+    case guard.("SAVEPOINT " <> name, []) do
       {:ok, _} ->
-        with {:ok, before} <- read_check(execute, query),
+        with {:ok, before} <- read_check(guard, query),
              {:ok, result} <- execute.(query, params),
-             :ok <- read_compare(execute, before) do
-          case execute.("RELEASE SAVEPOINT " <> name, []) do
+             :ok <- read_compare(guard, before) do
+          case guard.("RELEASE SAVEPOINT " <> name, []) do
             {:ok, _} -> {:ok, result}
             {:error, _} = error -> error
           end
@@ -462,18 +472,49 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp run_guarded_read(execute, false, query, params) do
-    with {:ok, before} <- read_check(execute, query),
+  defp run_guarded_read(execute, guard, false, query, params) do
+    with {:ok, before} <- read_check(guard, query),
          {:ok, result} <- execute.(query, params) do
-      case read_compare(execute, before) do
+      case read_compare(guard, before) do
         :ok ->
           {:ok, result}
 
         error ->
-          SessionGuard.restore(execute, before)
+          SessionGuard.restore(guard, before)
           error
       end
     end
+  end
+
+  # The session checks, savepoints and catalog reads Selecto runs around a
+  # statement: unnamed prepared statements, kept apart from the statement
+  # cache and from the query/4 calls that carry the domain's own SQL.
+  defp guard_statement({:pool, pool_ref}, sql, params) do
+    case resolve_live_pool_pid(pool_ref) do
+      {:ok, pool_pid} -> guard_statement(pool_pid, sql, params)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp guard_statement(connection, sql, params)
+       when is_atom(connection) and not is_nil(connection) do
+    if ecto_repo?(connection),
+      do: execute_ecto_query(connection, sql, params),
+      else: prepare_execute_guard(connection, sql, params)
+  end
+
+  defp guard_statement(connection, sql, params),
+    do: prepare_execute_guard(connection, sql, params)
+
+  defp prepare_execute_guard(connection, sql, params) do
+    case Postgrex.prepare_execute(connection, "", sql, params) do
+      {:ok, _query, result} -> {:ok, normalize_result(result)}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    exception -> {:error, {:query_exception, exception.__struct__, Exception.message(exception)}}
+  catch
+    :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
   defp read_check(execute, query) do
@@ -1005,9 +1046,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # A candidate or record load inside a write runs the shadow check of its
   # statements and is held to the write's session baseline.
   defp candidate_session(connection, sql, opts) do
-    check = &execute_statement(connection, &1, &2, Keyword.take(opts, [:timeout, :log]))
-
-    case write_session(check, sql, opts) do
+    case write_session(&guard_statement(connection, &1, &2), sql, opts) do
       {:ok, _baseline} -> :ok
       {:error, _} = error -> error
     end
@@ -1391,13 +1430,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp execute_graph_node(connection, node, server_major, opts) do
     if GraphCompiler.merge_eligible?(node, server_major) do
-      check = &execute_statement(connection, &1, &2, Keyword.take(opts, [:timeout, :log]))
+      guard = &guard_statement(connection, &1, &2)
 
       with {:ok, statement} <- GraphCompiler.compile_merge(node, opts),
-           {:ok, session} <- write_session(check, statement.text, opts),
+           {:ok, session} <- write_session(guard, statement.text, opts),
            {:ok, query_result} <-
              execute_statement(connection, statement.text, statement.params, opts),
-           :ok <- SessionGuard.compare(check, session),
+           :ok <- SessionGuard.compare(guard, session),
            {:ok, {results, affected_rows}} <- GraphCompiler.merge_results(node, query_result) do
         {:ok, results, affected_rows, :merge}
       else
@@ -1481,22 +1520,23 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # after the statement (SelectoDBPostgreSQL.PostImage).
   defp execute_guarded_statement(connection, command, statement, opts) do
     check = &execute_statement(connection, &1, &2, Keyword.take(opts, [:timeout, :log]))
+    guard = &guard_statement(connection, &1, &2)
 
-    with {:ok, session} <- write_session(check, statement.text, opts) do
+    with {:ok, session} <- write_session(guard, statement.text, opts) do
       case PostImage.prepare(command) do
         {:plain, _command} ->
           if PostImage.bound_delete?(command) do
-            with {:ok, target} <- PostImage.lock_delete(command, check),
+            with {:ok, target} <- PostImage.lock_delete(command, check, guard),
                  {:ok, query_result} <-
                    execute_statement(connection, statement.text, statement.params, opts),
-                 :ok <- SessionGuard.compare(check, session),
+                 :ok <- SessionGuard.compare(guard, session),
                  :ok <- PostImage.check_delete(command, target, check) do
               {:ok, query_result}
             end
           else
             with {:ok, query_result} <-
                    execute_statement(connection, statement.text, statement.params, opts),
-                 :ok <- SessionGuard.compare(check, session) do
+                 :ok <- SessionGuard.compare(guard, session) do
               {:ok, query_result}
             end
           end
@@ -1504,9 +1544,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
         {:post_image, command} ->
           text = PostImage.returning(statement.text, command)
 
-          with {:ok, target} <- PostImage.resolve(command, check),
+          with {:ok, target} <- PostImage.resolve(command, guard, guard),
                {:ok, query_result} <- execute_statement(connection, text, statement.params, opts),
-               :ok <- SessionGuard.compare(check, session),
+               :ok <- SessionGuard.compare(guard, session),
                {query_result, keys} = PostImage.split_result(query_result, command),
                :ok <-
                  PostImage.verify(
@@ -1563,8 +1603,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     with_postgres_transaction(connection, opts, fn transactional_connection ->
       key = make_ref()
 
-      check =
-        &execute_statement(transactional_connection, &1, &2, Keyword.take(opts, [:timeout, :log]))
+      check = &guard_statement(transactional_connection, &1, &2)
 
       try do
         with {:ok, result} <-
@@ -1961,26 +2000,37 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   @impl true
-  def stream({:pool, pool_ref}, query, params, opts) do
+  def stream(connection, query, params, opts) do
+    # A Selecto read's stream checks the session (Selecto.Executor.selecto_read?/0,
+    # captured here: the stream's producer runs in its own process).
+    opts =
+      if Selecto.Executor.selecto_read?(),
+        do: Keyword.put(opts, :selecto_session_guard, true),
+        else: opts
+
+    open_stream(connection, query, params, opts)
+  end
+
+  defp open_stream({:pool, pool_ref}, query, params, opts) do
     case resolve_stream_pool_connection(pool_ref) do
       {:ok, pool_conn} -> {:ok, build_postgrex_cursor_stream(pool_conn, query, params, opts)}
       {:error, details} -> {:error, {:invalid_stream_pool, details}}
     end
   end
 
-  def stream(conn, query, params, opts) when is_pid(conn) do
+  defp open_stream(conn, query, params, opts) when is_pid(conn) do
     if Process.alive?(conn),
       do: {:ok, build_postgrex_cursor_stream(conn, query, params, opts)},
       else: {:error, {:invalid_connection, conn}}
   end
 
-  def stream(conn, query, params, opts) when is_atom(conn) and not is_nil(conn) do
+  defp open_stream(conn, query, params, opts) when is_atom(conn) and not is_nil(conn) do
     if valid_named_connection?(conn),
       do: {:ok, build_postgrex_cursor_stream(conn, query, params, opts)},
       else: {:error, {:invalid_connection, conn}}
   end
 
-  def stream(connection, _query, _params, _opts) do
+  defp open_stream(connection, _query, _params, _opts) do
     {:error, {:invalid_connection, connection}}
   end
 
@@ -3284,12 +3334,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
         # fetched batch and before its rows are handed out. A change rolls
         # the stream's own transaction back (reverting local and session
         # set_config) and the stream fails.
-        guarded? = Keyword.get(opts, :selecto_read) == true
+        guarded? = Keyword.get(opts, :selecto_session_guard) == true
 
         Postgrex.transaction(
           conn,
           fn tx_conn ->
-            check = &query_postgrex(tx_conn, &1, &2, [])
+            check = &guard_statement(tx_conn, &1, &2)
 
             before =
               if guarded? do
