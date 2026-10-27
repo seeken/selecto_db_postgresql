@@ -309,4 +309,37 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
     assert_raise RuntimeError, ~r/changed the session/, fn -> Enum.to_list(rows) end
     assert rows!(c, "SELECT pg_catalog.current_setting('search_path')") == [[schema]]
   end
+
+  # R8: a deferred constraint trigger fires at COMMIT, after the post-DML
+  # snapshot; its session-level set_config would outlive the write.
+  test "a deferred trigger's session change is seen before the write commits",
+       %{connection: c, evil: evil, schema: schema} do
+    exec!(
+      c,
+      "CREATE OR REPLACE FUNCTION other_deferred() RETURNS trigger LANGUAGE plpgsql AS " <>
+        "$$ BEGIN PERFORM set_config('search_path', '#{evil}, #{schema}', false); RETURN NULL; END $$"
+    )
+
+    exec!(
+      c,
+      "CREATE CONSTRAINT TRIGGER other_deferred_tr AFTER UPDATE ON other " <>
+        "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION other_deferred()"
+    )
+
+    assert changed?(Adapter.execute_write_unsafe(c, update("other", [{"note", "y"}]), []))
+    assert rows!(c, "SELECT pg_catalog.current_setting('search_path')") == [[schema]]
+    assert rows!(c, "SELECT note FROM other") == [["x"]]
+    assert read_code(read(c)) == [[1, "mine"]]
+
+    # Inside the host's transaction the trigger would fire at the host's
+    # COMMIT: the write is refused.
+    {:ok, outcome} =
+      Postgrex.transaction(c, fn conn ->
+        Adapter.execute_write_unsafe(conn, update("other", [{"note", "h"}]), [])
+      end)
+
+    assert {:error, %Error{details: %{reason: :deferred_triggers}}} = outcome
+    assert rows!(c, "SELECT note FROM other") == [["x"]]
+    exec!(c, "DROP TRIGGER other_deferred_tr ON other")
+  end
 end

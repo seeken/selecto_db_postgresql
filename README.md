@@ -261,6 +261,20 @@ the client:
   reads, streams and writes. A domain over a temp table that shadows nothing,
   and unrelated temp tables, keep working.
 
+- **Deferred triggers.** A deferred constraint trigger fires at COMMIT,
+  after every snapshot. In a transaction the adapter owns, the write runs
+  `SET CONSTRAINTS ALL IMMEDIATE` before its final session check, so they
+  fire (and are checked) first. Inside the host's transaction they would
+  fire at the host's COMMIT, so a write there is refused
+  (`reason: :deferred_triggers`) while any enabled non-internal deferrable
+  trigger exists in the database.
+
+**Behaviour change.** A row trigger that runs `CREATE TEMP TABLE IF NOT
+EXISTS ...` (a scratch table) changes the session's temp namespace on the
+write that creates it. That write is refused and rolled back, which drops
+the table again, so every write on that table is refused. Create such
+tables up front in the session (or in a regular schema) instead.
+
 Generated write SQL qualifies its casts with `pg_catalog`, and Selecto keeps
 no session marker or GUC of its own that a trigger could forge. Beyond
 search_path and temp shadowing, a row trigger's other side effects (other
