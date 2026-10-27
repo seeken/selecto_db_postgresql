@@ -3,10 +3,10 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
   # stored rows must stay inside the engine tenant and the trusted/host scope
   # (`metadata.post_image`, set by SelectoUpdato), whatever the update
   # assigns, BEFORE/AFTER row triggers rewrite or a generated column derives.
-  # The statement returns its rows' keys and one tagged SELECT re-reads them
-  # inside the transaction; statement-level and deferrable triggers, rules,
-  # views and tables without a usable key are refused. Ordinary triggers
-  # keep working. Query-member laterals keep their output names.
+  # The statement returns its rows' (tableoid, ctid) and one tagged SELECT
+  # re-reads them inside the transaction; statement-level and deferrable
+  # triggers, rules and views are refused. Ordinary triggers keep working.
+  # Query-member laterals keep their output names.
   use ExUnit.Case, async: false
 
   alias Selecto.Write.{Command, Error}
@@ -688,22 +688,35 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
     GenServer.stop(watcher)
   end
 
-  test "a table without a usable unique key is refused", %{connection: c} do
+  # The re-read names the written rows by (tableoid, ctid), not by a key
+  # whose type, collation or text image could let a decoy row answer
+  # (items 34, 40, 43, 47): a table without a unique key is proven exactly.
+  test "a table without a unique key is re-read by the rows' physical identity",
+       %{connection: c} do
     exec!(c, "CREATE TABLE dk (id int NOT NULL, site text, name text)")
-    exec!(c, "CREATE INDEX dk_id ON dk (id)")
-    exec!(c, "INSERT INTO dk VALUES (1, 'S1', 'x'), (1, 'S2', 'y')")
+    exec!(c, "INSERT INTO dk VALUES (1, 'S1', 'x'), (1, 'S1', 'y')")
 
-    {:ok, command} =
-      Command.new(%{
-        operation: :update,
-        relation: "dk",
-        predicate: {:and, [{:eq, {:field, "name"}, {:literal, "x"}}, site("S1")]},
-        assignments: [%{field: "name", value: {:literal, "u"}}],
-        expected_cardinality: {:exactly, 1},
-        metadata: %{post_image: %{predicate: site("S1"), key: ["id"]}}
-      })
+    command = fn name, assignments ->
+      {:ok, command} =
+        Command.new(%{
+          operation: :update,
+          relation: "dk",
+          predicate: {:and, [{:eq, {:field, "name"}, {:literal, name}}, site("S1")]},
+          assignments: Enum.map(assignments, fn {f, v} -> %{field: f, value: {:literal, v}} end),
+          expected_cardinality: {:exactly, 1},
+          metadata: %{post_image: %{predicate: site("S1"), key: ["id"]}}
+        })
 
-    assert not_evaluable?(Adapter.execute_write_unsafe(c, command, []))
+      command
+    end
+
+    assert {:ok, _} = Adapter.execute_write_unsafe(c, command.("x", [{"name", "u"}]), [])
+
+    # The decoy row with the same id stays in scope; the written row left it.
+    assert violation?(Adapter.execute_write_unsafe(c, command.("y", [{"site", "S9"}]), []))
+
+    {:ok, %{rows: rows}} = Adapter.execute(c, "SELECT site, name FROM dk ORDER BY name", [], [])
+    assert rows == [["S1", "u"], ["S1", "y"]]
   end
 
   test "a generated scope column is re-read", %{connection: c} do

@@ -181,10 +181,16 @@ for application code.
 ### Post-image check and its operational limits
 
 A write bound to a tenant or trusted scope (`metadata.post_image`, set by
-`SelectoUpdato`) is re-read by key after its statement, inside the same
-transaction, and rolled back unless every written row is still inside the
-scope. The check refuses (`query_rule_not_evaluable`) whatever it cannot see
-through:
+`SelectoUpdato`) locks its table ROW EXCLUSIVE and resolves it to its oid
+before the statement, returns the written rows' `(tableoid, ctid)`, and is
+re-read by them after the statement, inside the same transaction, from the
+schema-qualified table its oid named and only among that table's (and its
+partitions') oids. It is rolled back unless every written row is still
+inside the scope. A ctid names exactly one row version whatever the key's
+type, collation or text image, so a decoy row with the same key value can
+never answer, and a table needs no unique key for the check. A row an AFTER
+trigger updates again has a new ctid and refuses. The check refuses
+(`query_rule_not_evaluable`) whatever it cannot see through:
 
 - **Any enabled deferrable trigger anywhere in the database refuses every
   bound-scope write.** A deferred trigger fires at commit, after the check,
@@ -194,9 +200,8 @@ through:
   scoped writes through Selecto. Disable them (`ALTER TABLE ... DISABLE
   TRIGGER`) or keep them in another database.
 - Statement-level triggers and rewrite rules for the event on the table or
-  any of its partitions, views, tables with inheritance (non-partition)
-  children, and keys that are not an immediate, valid, non-partial unique
-  index over NOT NULL columns.
+  any of its partitions, views, and tables with inheritance (non-partition)
+  children.
 - A bound-scope DELETE (`metadata.bound_scope`, graph delete-missing
   cleanups included) locks its table ROW EXCLUSIVE and is refused, before
   and again after its statement, under an enabled statement-level DELETE
@@ -221,6 +226,43 @@ rows the statement itself wrote; a row-level trigger that updates or deletes
 *other* rows, another tenant's included, runs and is not checked.
 Statement-level triggers, rewrite rules and deferrable triggers stay
 refused under a bound scope, for inserts, updates, upserts and deletes.
+
+### Session state
+
+A row trigger, or a function a domain view calls, can change the session for
+the statements after it: `set_config('search_path' | 'TimeZone' | ...,
+..., true)`, or a `TEMP` view, table or type, which PostgreSQL resolves before
+the search path for the rest of the session (a temp relation survives
+COMMIT). Every write and every Selecto read therefore runs between two
+pg_catalog-qualified session snapshots (search_path, TimeZone, DateStyle,
+IntervalStyle, extra_float_digits, and the oid, xmin and name of every
+relation, rewrite rule and type in the session's temp schema), compared in
+the client:
+
+- **Writes, bound or not, in any mode.** The snapshot after a write
+  statement is the FIRST statement after it, before the re-read or any
+  other SQL; it must equal the snapshot the write took first. A change rolls
+  the write's transaction, or its savepoint inside the host's transaction,
+  back (which also reverts `set_config`) and refuses with
+  `query_rule_violation`, `reason: :session_state_changed`.
+- **Reads.** Inside the host's transaction a read runs under its own
+  savepoint (a random name) and a change rolls back to it and refuses. In
+  autocommit a change restores the settings seen before and refuses. A
+  stream checks after every fetched batch, before handing its rows out, and
+  rolls its own transaction back on a change.
+- **Temp shadows.** A statement whose names a temp relation would capture (a
+  temp relation named like an identifier of the statement while a
+  same-named relation exists in a schema of the search path), or a temp type
+  named like one of its identifiers or a type the generated SQL casts to, is
+  refused (`query_rule_not_evaluable`, `reason: :temporary_shadow`), for
+  reads, streams and writes. A domain over a temp table that shadows nothing,
+  and unrelated temp tables, keep working.
+
+Generated write SQL qualifies its casts with `pg_catalog`, and Selecto keeps
+no session marker or GUC of its own that a trigger could forge. Beyond
+search_path and temp shadowing, a row trigger's other side effects (other
+settings, role changes, writes to unrelated tables, DDL) are host-owned
+schema behaviour and the schema owner's responsibility.
 
 ## Atomic write graphs and MERGE
 

@@ -5,23 +5,33 @@ defmodule SelectoDBPostgreSQL.PostImage do
   # (`metadata.post_image`, set by SelectoUpdato: the engine tenant and the
   # trusted and host scope, plus the full guard for an insert).
   #
-  # The statement returns the written rows' keys (tagged RETURNING columns).
-  # After it completes, when every non-deferred BEFORE and AFTER row trigger,
-  # rule and generated column has run, one tagged SELECT inside the same
-  # transaction re-reads those rows by key under the scope predicate and
-  # reports what could defeat the check:
+  # Before the statement the relation is locked ROW EXCLUSIVE and resolved
+  # to its oid, schema and name, and to the oids its rows may live in (the
+  # relation and its partitions): every later statement names it by that
+  # schema-qualified name and keeps only rows of those oids, never through a
+  # search_path lookup an allowed row trigger could redirect with
+  # set_config('search_path', ..., true) (items 51, 51a, 58).
+  #
+  # The statement returns the written rows' physical identity, (tableoid,
+  # ctid), as tagged RETURNING columns. A ctid names exactly one row version
+  # of one relation, whatever the key's type, collation or text image under
+  # the session's settings (items 34, 40, 43, 47). After the statement
+  # completes, when every non-deferred BEFORE and AFTER row trigger, rule and
+  # generated column has run, and after the session check of
+  # SelectoDBPostgreSQL.SessionGuard, one tagged SELECT inside the same
+  # transaction re-reads those rows under the scope predicate and reports
+  # what could defeat the check:
   #
   # - `selecto_post_image_matched`: written rows still inside the scope;
-  # - `selecto_post_image_rows`: rows carrying the returned keys;
+  # - `selecto_post_image_rows`: rows carrying the returned identities (a
+  #   row an AFTER trigger updated again has a new ctid and refuses);
   # - `selecto_post_image_blocked`: the relation is not a plain or
   #   partitioned table (a view), or it has enabled non-internal
   #   statement-level or deferrable triggers for the event (they act on
-  #   other rows or at commit, after this check), or rewrite rules for it;
-  # - `selecto_post_image_keyed`: the key is exactly an immediate, valid,
-  #   non-partial, non-expression unique index over NOT NULL columns.
+  #   other rows or at commit, after this check), or rewrite rules for it.
   #
-  # Unless the relation is unblocked and keyed and every written row matches,
-  # the transaction rolls back with a typed refusal. Row-level triggers
+  # Unless the relation is unblocked and every written row matches, the
+  # transaction rolls back with a typed refusal. Row-level triggers
   # (updated_at, audit) keep working; triggers that change OTHER rows are
   # outside the scope guarantee.
 
@@ -29,7 +39,7 @@ defmodule SelectoDBPostgreSQL.PostImage do
 
   @key_alias "selecto_post_image_key_"
 
-  @doc "The command to run: its RETURNING extended by the tagged key columns."
+  @doc "The command to run: its RETURNING extended by the tagged identity columns."
   def prepare(%Command{metadata: %{post_image: %{key: [_ | _]}}, operation: operation} = command)
       when operation in [:insert, :update, :upsert],
       do: {:post_image, command}
@@ -37,73 +47,86 @@ defmodule SelectoDBPostgreSQL.PostImage do
   def prepare(command), do: {:plain, command}
 
   @doc """
-  The statement text that returns the written rows' keys: unchanged when its
-  RETURNING already names every key column (`:all`, or a list holding them),
-  otherwise extended by tagged key columns.
+  Locks the written relation ROW EXCLUSIVE and resolves it, before the
+  statement: its oid, its schema-qualified name and the oids of the
+  relation and its partitions.
   """
-  def returning(text, %Command{metadata: %{post_image: %{key: key}}, returning: returning}) do
-    if returns_keys?(returning, key) do
-      text
-    else
-      keys =
-        key
-        |> Enum.with_index(1)
-        |> Enum.map_join(", ", fn {column, index} ->
-          "#{quote_identifier(column)} AS #{@key_alias}#{index}"
-        end)
+  def resolve(%Command{} = command, execute) do
+    sql = """
+    SELECT c.oid, n.nspname::pg_catalog.text, c.relname::pg_catalog.text,
+           ARRAY(SELECT t.relid FROM pg_catalog.pg_partition_tree(c.oid) t
+                 UNION SELECT c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+    WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1::pg_catalog.text)
+    """
 
-      if returning == :none, do: text <> " RETURNING " <> keys, else: text <> ", " <> keys
+    with {:ok, _} <-
+           lock_result(
+             execute.("LOCK TABLE #{quote_relation(command.relation)} IN ROW EXCLUSIVE MODE", [])
+           ),
+         {:ok, %{rows: [[oid, schema, name, oids]]}} when is_integer(oid) <-
+           execute.(sql, [quote_relation(command.relation)]) do
+      {:ok,
+       %{
+         oid: oid,
+         relation: quote_identifier(schema) <> "." <> quote_identifier(name),
+         oids: Enum.uniq([oid | List.wrap(oids)])
+       }}
+    else
+      _ -> refused(:query_rule_not_evaluable, "cannot lock and resolve the written relation")
     end
   end
 
-  defp returns_keys?(:all, _key), do: true
-
-  defp returns_keys?(fields, key) when is_list(fields) do
-    names = Enum.map(fields, &to_string/1)
-    Enum.all?(key, &(&1 in names))
-  end
-
-  defp returns_keys?(_returning, _key), do: false
+  defp lock_result({:ok, _} = ok), do: ok
+  defp lock_result(_other), do: :error
 
   @doc """
-  The statement result without the tagged key columns, and the written rows'
-  keys (from the tags, or from the returned key columns).
+  The statement text that returns the written rows' (tableoid, ctid) as
+  tagged columns.
   """
-  def split_result(%{columns: columns, rows: rows} = result, %Command{
-        metadata: %{post_image: %{key: key}}
-      })
-      when is_list(columns) do
+  def returning(text, %Command{returning: returning}) do
+    keys =
+      "tableoid AS #{@key_alias}1, CAST(ctid AS pg_catalog.text) AS #{@key_alias}2"
+
+    if returning == :none, do: text <> " RETURNING " <> keys, else: text <> ", " <> keys
+  end
+
+  @doc """
+  The statement result without the tagged identity columns, and the written
+  rows' identities.
+  """
+  def split_result(%{columns: columns, rows: rows} = result, %Command{})
+      when is_list(columns) and is_list(rows) do
     tagged =
       columns
       |> Enum.with_index()
       |> Enum.filter(fn {column, _index} -> String.starts_with?(column, @key_alias) end)
       |> Enum.map(&elem(&1, 1))
 
-    if tagged == [] do
-      indexes = Enum.map(key, fn column -> Enum.find_index(columns, &(&1 == column)) end)
+    case tagged do
+      [oid_index, ctid_index] ->
+        keys = Enum.map(rows, fn row -> {Enum.at(row, oid_index), Enum.at(row, ctid_index)} end)
 
-      if Enum.any?(indexes, &is_nil/1),
-        do: {result, :unknown},
-        else: {result, Enum.map(rows, fn row -> Enum.map(indexes, &Enum.at(row, &1)) end)}
-    else
-      keys = Enum.map(rows, fn row -> Enum.map(tagged, &Enum.at(row, &1)) end)
-
-      keep = fn list ->
-        list
-        |> Enum.with_index()
-        |> Enum.reject(&(elem(&1, 1) in tagged))
-        |> Enum.map(&elem(&1, 0))
-      end
-
-      # A statement that returned only the tagged keys reports no rows, as it
-      # would have without RETURNING.
-      result =
-        case keep.(columns) do
-          [] -> %{result | columns: [], rows: []}
-          kept -> %{result | columns: kept, rows: Enum.map(rows, keep)}
+        keep = fn list ->
+          list
+          |> Enum.with_index()
+          |> Enum.reject(&(elem(&1, 1) in tagged))
+          |> Enum.map(&elem(&1, 0))
         end
 
-      {result, keys}
+        # A statement that returned only the tagged columns reports no rows,
+        # as it would have without RETURNING.
+        result =
+          case keep.(columns) do
+            [] -> %{result | columns: [], rows: []}
+            kept -> %{result | columns: kept, rows: Enum.map(rows, keep)}
+          end
+
+        {result, keys}
+
+      _other ->
+        {result, :unknown}
     end
   end
 
@@ -114,87 +137,103 @@ defmodule SelectoDBPostgreSQL.PostImage do
   predicate with placeholders after the given offset; `execute` runs SQL on
   the transaction's connection.
   """
-  def verify(_command, :unknown, _compile_predicate, _execute),
+  def verify(_command, _target, :unknown, _compile_predicate, _execute),
     do: refused(:query_rule_not_evaluable, "cannot identify the written rows")
 
-  def verify(%Command{} = command, keys, compile_predicate, execute) do
-    %{predicate: predicate, key: key} = command.metadata.post_image
-    relation = quote_relation(command.relation)
+  def verify(%Command{} = command, target, keys, compile_predicate, execute) do
+    %{predicate: predicate} = command.metadata.post_image
     affected = length(keys)
 
-    {key_match, key_params} = key_match(key, keys, 2)
+    if Enum.all?(keys, fn {oid, ctid} -> is_integer(oid) and is_binary(ctid) end) do
+      with {:ok, scope} <- compile_predicate.(untyped_text(predicate), 3) do
+        rows = """
+        FROM #{target.relation} AS selecto_target
+        WHERE selecto_target.tableoid OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.oid[])
+          AND EXISTS (
+            SELECT 1
+            FROM ROWS FROM (pg_catalog.unnest($2::pg_catalog.oid[]),
+                            pg_catalog.unnest(CAST($3::pg_catalog.text[] AS pg_catalog.tid[])))
+              AS selecto_key(o, t)
+            WHERE selecto_key.o OPERATOR(pg_catalog.=) selecto_target.tableoid
+              AND selecto_key.t OPERATOR(pg_catalog.=) selecto_target.ctid)
+        """
 
-    with {:ok, scope} <- compile_predicate.(untyped_text(predicate), 1 + length(key_params)) do
-      key_names = Enum.sort(key)
-      names_param = 1 + length(key_params) + length(scope.params) + 1
+        oid_param = 4 + length(scope.params)
 
-      sql = """
-      SELECT
-        (SELECT count(*) FROM #{relation} WHERE #{key_match} AND (#{scope.text})) AS selecto_post_image_matched,
-        (SELECT count(*) FROM #{relation} WHERE #{key_match}) AS selecto_post_image_rows,
-        (CASE WHEN c.relkind IN ('r', 'p') THEN 0 ELSE 1 END
-          -- Statement-level triggers and rewrite rules for the event on the
-          -- relation or any of its partitions.
-          + (SELECT count(*) FROM pg_catalog.pg_trigger t
-             WHERE (t.tgrelid = c.oid OR t.tgrelid IN (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
-               AND NOT t.tgisinternal AND t.tgenabled <> 'D'
-               AND (t.tgtype & #{event_bits(command.operation)}) <> 0
-               AND (t.tgtype & 1) = 0)
-          + (SELECT count(*) FROM pg_catalog.pg_rewrite r
-             WHERE (r.ev_class = c.oid OR r.ev_class IN (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
-               AND r.rulename <> '_RETURN'
-               AND r.ev_type IN (#{rule_events(command.operation)}))
-          -- A deferrable constraint trigger fires at commit, after this
-          -- check, and can sit on any table a row trigger writes to (an
-          -- audit table) or on a leaf partition: any in the database refuses.
-          -- This runs after the DML (a trigger committed while the write
-          -- waited on a row lock is seen), which needs a fresh statement
-          -- snapshot: outside READ COMMITTED the check is refused.
-          + (SELECT count(*) FROM pg_catalog.pg_trigger t
-             WHERE t.tgdeferrable AND NOT t.tgisinternal AND t.tgenabled <> 'D')
-          + (CASE WHEN pg_catalog.current_setting('transaction_isolation') = 'read committed'
-                  THEN 0 ELSE 1 END)
-          -- Inheritance (non-partition) children share the parent's key
-          -- values, so the key does not name one row.
-          + (SELECT count(*) FROM pg_catalog.pg_inherits i
-             WHERE i.inhparent = c.oid AND c.relkind = 'r')) AS selecto_post_image_blocked,
-        EXISTS (
-          SELECT 1 FROM pg_catalog.pg_index i
-          WHERE i.indrelid = c.oid AND i.indisunique AND i.indimmediate AND i.indisvalid
-            AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnatts = i.indnkeyatts
-            AND i.indnkeyatts = cardinality($#{names_param}::text[])
-            AND (SELECT array_agg(a.attname::text ORDER BY a.attname::text)
-                 FROM pg_catalog.pg_attribute a
-                 WHERE a.attrelid = c.oid AND a.attnum = ANY (i.indkey::int2[]) AND a.attnotnull)
-                = $#{names_param}::text[]) AS selecto_post_image_keyed
-      FROM pg_catalog.pg_class c WHERE c.oid = pg_catalog.to_regclass($1::text)
-      """
+        sql = """
+        SELECT
+          (SELECT pg_catalog.count(*) #{rows} AND (#{scope.text})) AS selecto_post_image_matched,
+          (SELECT pg_catalog.count(*) #{rows}) AS selecto_post_image_rows,
+          #{blocked_sql(command)} AS selecto_post_image_blocked
+        FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) $#{oid_param}::pg_catalog.oid
+        """
 
-      params = [relation | key_params] ++ scope.params ++ [key_names]
+        params =
+          [target.oids, Enum.map(keys, &elem(&1, 0)), Enum.map(keys, &elem(&1, 1))] ++
+            scope.params ++ [target.oid]
 
-      case execute.(sql, params) do
-        {:ok, %{rows: [[matched, rows, blocked, keyed]]}} ->
-          cond do
-            blocked != 0 or keyed != true ->
-              refused(
-                :query_rule_not_evaluable,
-                "the relation cannot prove the written rows' scope"
-              )
+        case execute.(sql, params) do
+          {:ok, %{rows: [[matched, rows, blocked]]}} ->
+            cond do
+              blocked != 0 ->
+                refused(
+                  :query_rule_not_evaluable,
+                  "the relation cannot prove the written rows' scope"
+                )
 
-            rows != affected or matched != affected ->
-              refused(:query_rule_violation, "the written rows left the trusted write scope")
+              rows != affected or matched != affected ->
+                refused(:query_rule_violation, "the written rows left the trusted write scope")
 
-            true ->
-              :ok
-          end
+              true ->
+                :ok
+            end
 
-        {:ok, _other} ->
-          refused(:query_rule_not_evaluable, "the relation cannot prove the written rows' scope")
+          {:ok, _other} ->
+            refused(
+              :query_rule_not_evaluable,
+              "the relation cannot prove the written rows' scope"
+            )
 
-        {:error, _reason} = error ->
-          error
+          {:error, _reason} = error ->
+            error
+        end
       end
+    else
+      refused(:query_rule_not_evaluable, "cannot identify the written rows")
     end
+  end
+
+  defp blocked_sql(command) do
+    """
+    (CASE WHEN c.relkind IN ('r', 'p') THEN 0 ELSE 1 END
+      -- Statement-level triggers and rewrite rules for the event on the
+      -- relation or any of its partitions.
+      + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
+         WHERE (t.tgrelid OPERATOR(pg_catalog.=) c.oid
+                OR t.tgrelid IN (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
+           AND NOT t.tgisinternal AND t.tgenabled <> 'D'
+           AND (t.tgtype & #{event_bits(command.operation)}) <> 0
+           AND (t.tgtype & 1) = 0)
+      + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_rewrite r
+         WHERE (r.ev_class OPERATOR(pg_catalog.=) c.oid
+                OR r.ev_class IN (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
+           AND r.rulename <> '_RETURN'
+           AND r.ev_type IN (#{rule_events(command.operation)}))
+      -- A deferrable constraint trigger fires at commit, after this
+      -- check, and can sit on any table a row trigger writes to (an
+      -- audit table) or on a leaf partition: any in the database refuses.
+      -- This runs after the DML (a trigger committed while the write
+      -- waited on a row lock is seen), which needs a fresh statement
+      -- snapshot: outside READ COMMITTED the check is refused.
+      + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
+         WHERE t.tgdeferrable AND NOT t.tgisinternal AND t.tgenabled <> 'D')
+      + (CASE WHEN pg_catalog.current_setting('transaction_isolation') = 'read committed'
+              THEN 0 ELSE 1 END)
+      -- Inheritance (non-partition) children: the parent's rows are not the
+      -- only ones the relation's name reads.
+      + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_inherits i
+         WHERE i.inhparent OPERATOR(pg_catalog.=) c.oid AND c.relkind = 'r'))
+    """
   end
 
   # Text literals of the scope compare as untyped SQL literals, as the host's
@@ -206,30 +245,6 @@ defmodule SelectoDBPostgreSQL.PostImage do
 
   defp untyped_text(list) when is_list(list), do: Enum.map(list, &untyped_text/1)
   defp untyped_text(value), do: value
-
-  # Direct row expressions let PostgreSQL infer each parameter from its key
-  # column. A VALUES subquery instead resolves unknown parameters as text.
-  defp key_match([column], keys, first) do
-    {"#{quote_identifier(column)} = ANY ($#{first})", [Enum.map(keys, &hd/1)]}
-  end
-
-  defp key_match(_columns, [], _first), do: {"false", []}
-
-  defp key_match(columns, keys, first) do
-    width = length(columns)
-
-    values =
-      keys
-      |> Enum.with_index()
-      |> Enum.map_join(", ", fn {_row, row_index} ->
-        "(" <>
-          Enum.map_join(0..(width - 1), ", ", fn column_index ->
-            "$#{first + row_index * width + column_index}"
-          end) <> ")"
-      end)
-
-    {"(#{Enum.map_join(columns, ", ", &quote_identifier/1)}) IN (#{values})", List.flatten(keys)}
-  end
 
   # tgtype bits: INSERT 4, UPDATE 16 (an upsert can fire either).
   defp event_bits(:insert), do: 4
@@ -270,39 +285,42 @@ defmodule SelectoDBPostgreSQL.PostImage do
   def bound_delete?(_command), do: false
 
   def lock_delete(%Command{} = command, execute) do
-    case execute.("LOCK TABLE #{quote_relation(command.relation)} IN ROW EXCLUSIVE MODE", []) do
-      {:ok, _} -> check_delete(command, execute)
-      _ -> refused(:query_rule_not_evaluable, "cannot lock the delete's relation")
+    with {:ok, target} <- resolve(command, execute),
+         :ok <- check_delete(command, target, execute) do
+      {:ok, target}
     end
   end
 
-  def check_delete(%Command{} = command, execute) do
+  # Checked by the oid resolved under the lock, never by the relation's
+  # name, which a row trigger's search_path switch could redirect (item 51a).
+  def check_delete(%Command{} = command, %{oid: oid}, execute) do
     sql = """
     WITH RECURSIVE tree(oid) AS (
-      SELECT pg_catalog.to_regclass($1::text)
+      SELECT $1::pg_catalog.oid
       UNION
-      SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN tree ON i.inhparent = tree.oid
+      SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+      JOIN tree ON i.inhparent OPERATOR(pg_catalog.=) tree.oid
     )
     SELECT
-      (SELECT count(*) FROM pg_catalog.pg_class c
-       WHERE c.oid = pg_catalog.to_regclass($1::text) AND c.relkind IN ('r', 'p'))
+      (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c
+       WHERE c.oid OPERATOR(pg_catalog.=) $1::pg_catalog.oid AND c.relkind IN ('r', 'p'))
         AS selecto_delete_relation,
-      (SELECT count(*) FROM pg_catalog.pg_trigger t
+      (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
        WHERE t.tgrelid IN (SELECT oid FROM tree)
          AND NOT t.tgisinternal AND t.tgenabled <> 'D'
          AND (t.tgtype & #{event_bits(command.operation)}) <> 0 AND (t.tgtype & 1) = 0)
-      + (SELECT count(*) FROM pg_catalog.pg_rewrite r
+      + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_rewrite r
          WHERE r.ev_class IN (SELECT oid FROM tree)
            AND r.rulename <> '_RETURN' AND r.ev_type IN (#{rule_events(command.operation)}))
       -- A deferrable trigger fires at commit, after this check, and can sit
       -- on any table a row trigger writes to: any in the database refuses,
       -- as for inserts, updates and upserts (w3exrev17).
-      + (SELECT count(*) FROM pg_catalog.pg_trigger t
+      + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
          WHERE t.tgdeferrable AND NOT t.tgisinternal AND t.tgenabled <> 'D')
         AS selecto_delete_blocked
     """
 
-    case execute.(sql, [quote_relation(command.relation)]) do
+    case execute.(sql, [oid]) do
       {:ok, %{rows: [[1, 0]]}} ->
         :ok
 
