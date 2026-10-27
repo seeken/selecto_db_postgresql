@@ -511,8 +511,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
       {:ok, _} ->
         with {:ok, before} <- read_check(guard, query),
              {:ok, pinned} <- read_step(SessionGuard.pin(guard, path)),
+             :ok <- read_step(RelationPath.qualified(query)),
              {:ok, result} <- execute.(query, params),
-             :ok <- read_step(SessionGuard.unpin(guard, pinned, SessionGuard.search_path(before))),
+             :ok <- read_step(SessionGuard.unpin(guard, pinned, before)),
              :ok <- read_compare(guard, before),
              :ok <- run_all(guard, close) do
           {:ok, result}
@@ -1328,7 +1329,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_candidate_query(connection, query, params, opts) do
     with {:ok, query} <- qualify_sql(connection, query, opts),
          {:ok, result} <-
-           execute_statement(connection, query, params, Keyword.take(opts, [:timeout, :log])) do
+           execute_qualified(connection, query, params, Keyword.take(opts, [:timeout, :log])) do
       {:ok, result}
     end
     |> case do
@@ -1490,7 +1491,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
            statement = %{statement | text: text},
            {:ok, session} <- write_session(guard, statement.text, opts),
            {:ok, query_result} <-
-             execute_statement(connection, statement.text, statement.params, opts),
+             execute_qualified(connection, statement.text, statement.params, opts),
            :ok <- SessionGuard.compare(guard, session, write_compare(opts)),
            {:ok, {results, affected_rows}} <- GraphCompiler.merge_results(node, query_result) do
         {:ok, results, affected_rows, :merge}
@@ -1587,14 +1588,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
           if PostImage.bound_delete?(command) do
             with {:ok, target} <- PostImage.lock_delete(command, check, guard),
                  {:ok, query_result} <-
-                   execute_statement(connection, statement.text, statement.params, opts),
+                   execute_qualified(connection, statement.text, statement.params, opts),
                  :ok <- SessionGuard.compare(guard, session, write_compare(opts)),
                  :ok <- PostImage.check_delete(command, target, check) do
               {:ok, query_result}
             end
           else
             with {:ok, query_result} <-
-                   execute_statement(connection, statement.text, statement.params, opts),
+                   execute_qualified(connection, statement.text, statement.params, opts),
                  :ok <- SessionGuard.compare(guard, session, write_compare(opts)) do
               {:ok, query_result}
             end
@@ -1604,7 +1605,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
           text = PostImage.returning(statement.text, command)
 
           with {:ok, target} <- PostImage.resolve(command, guard, guard),
-               {:ok, query_result} <- execute_statement(connection, text, statement.params, opts),
+               {:ok, query_result} <- execute_qualified(connection, text, statement.params, opts),
                :ok <- SessionGuard.compare(guard, session, write_compare(opts)),
                {query_result, keys} = PostImage.split_result(query_result, command),
                :ok <-
@@ -1648,7 +1649,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
             {:ok, current}
 
           baseline ->
-            if SessionGuard.same?(current, baseline, search_path: pinned_value(opts)),
+            if SessionGuard.same?(current, baseline, pinned: pinned_value(opts)),
               do: {:ok, baseline},
               else: SessionGuard.changed()
         end
@@ -1720,6 +1721,15 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
+  # The execution-time half of R29: a generated write statement runs only
+  # when every relation position of the very text executed is schema
+  # qualified (a CTE name excepted).
+  defp execute_qualified(connection, sql, params, opts) do
+    with :ok <- RelationPath.qualified(sql) do
+      execute_statement(connection, sql, params, opts)
+    end
+  end
+
   # R30: inside a write's transaction, once its baseline is taken, the
   # session's search_path is pinned to pg_catalog, the schemas of every
   # relation the write has resolved so far, and pg_temp (set_config(...,
@@ -1765,7 +1775,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp write_compare(opts), do: [writes: true, search_path: pinned_value(opts)]
+  defp write_compare(opts), do: [writes: true, pinned: pinned_value(opts)]
 
   # "schema.relation" for the compilers' dot-split quoting.
   defp qualified_name(relations, relation) do
@@ -1802,7 +1812,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         with :ok <- SessionGuard.compare(check, baseline, write_compare(opts)) do
           case pinned_value(opts) do
             nil -> :ok
-            pinned -> SessionGuard.unpin(check, pinned, SessionGuard.search_path(baseline))
+            pinned -> SessionGuard.unpin(check, pinned, baseline)
           end
         end
     end
@@ -3539,7 +3549,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
             # is compared with the pin expected in place.
             {before, pinned} =
               if guarded? do
-                with {:ok, before} <- SessionGuard.check(check, query),
+                with :ok <- RelationPath.qualified(query),
+                     {:ok, before} <- SessionGuard.check(check, query),
                      {:ok, pinned} <- SessionGuard.pin(check, read_path(opts)) do
                   {before, pinned}
                 else
@@ -3553,7 +3564,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
             |> Postgrex.stream(query, params, max_rows: max_rows)
             |> Enum.each(fn %Postgrex.Result{rows: rows, columns: columns} ->
               if guarded? do
-                case SessionGuard.compare(check, before, search_path: pinned) do
+                case SessionGuard.compare(check, before, pinned: pinned) do
                   :ok -> :ok
                   error -> refuse.(error)
                 end
@@ -3563,7 +3574,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
             end)
 
             if guarded? do
-              case SessionGuard.unpin(check, pinned, SessionGuard.search_path(before)) do
+              case SessionGuard.unpin(check, pinned, before) do
                 :ok -> :ok
                 error -> refuse.(error)
               end

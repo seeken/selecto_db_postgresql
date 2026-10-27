@@ -68,9 +68,9 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   # again as the FIRST statement after every DML; every Selecto read takes it
   # before and after the statement (and after every stream batch). Any
   # change refuses with `session_state_changed`: the write's transaction or
-  # savepoint rolls back (which also reverts set_config), a read in a
-  # host-owned transaction rolls back to its own savepoint, and a read in
-  # autocommit restores the settings it saw before.
+  # savepoint rolls back (which also reverts set_config), and a read rolls
+  # back to its own savepoint (host transaction) or its own transaction
+  # (autocommit).
   #
   # Selecto keeps no session marker or GUC of its own to prove ownership
   # (item 57), so there is nothing a trigger can forge.
@@ -86,7 +86,28 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
 
   alias Selecto.Write.Error
 
-  @settings ["search_path", "TimeZone", "DateStyle", "IntervalStyle", "extra_float_digits"]
+  @settings [
+    "search_path",
+    "TimeZone",
+    "DateStyle",
+    "IntervalStyle",
+    "extra_float_digits",
+    "bytea_output",
+    "standard_conforming_strings"
+  ]
+
+  # R30, R35: the values every Selecto statement runs under (search_path is
+  # given per statement); a masked set_config(guc, evil, false) persisted by
+  # earlier SQL therefore never decides how a Selecto statement parses or
+  # renders a value.
+  @pinned [
+    {"TimeZone", "UTC"},
+    {"DateStyle", "ISO, MDY"},
+    {"IntervalStyle", "postgres"},
+    {"extra_float_digits", "3"},
+    {"bytea_output", "hex"},
+    {"standard_conforming_strings", "on"}
+  ]
 
   # Type names the generated SQL casts to or literals parse through.
   @generated_types ~w(text varchar bpchar char date time timetz timestamp timestamptz uuid
@@ -95,14 +116,9 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
 
   @temp "pg_catalog.pg_my_temp_schema()"
 
-  # search_path is compared on its own (R30: Selecto pins it around its
-  # statements), every other setting and the temp catalog in one string.
-  @snapshot_columns "pg_catalog.concat_ws(' | ', " <>
-                      Enum.map_join(
-                        @settings -- ["search_path"],
-                        ", ",
-                        &"pg_catalog.current_setting('#{&1}')"
-                      ) <>
+  # The settings are compared one by one (R30, R35: Selecto pins them
+  # around its statements), the temp catalog in one string.
+  @snapshot_columns "pg_catalog.concat_ws(' | ', 'temp'" <>
                       ", (SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', CAST(c.oid AS pg_catalog.text), " <>
                       "CAST(c.xmin AS pg_catalog.text), CAST(c.relname AS pg_catalog.text)), ',' ORDER BY c.oid) " <>
                       "FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) #{@temp}), " <>
@@ -187,7 +203,7 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   def compare(execute, %{snapshot: before} = baseline, opts \\ []) do
     case snapshot(execute) do
       {:ok, %{snapshot: ^before} = current} ->
-        if search_path(current) == expected_path(baseline, opts),
+        if settings_expected?(current, baseline, opts),
           do: deferrable_free(current, opts),
           else: changed()
 
@@ -201,49 +217,81 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
 
   @doc """
   Whether `current` (a check/2 or snapshot/1 state) matches `baseline`:
-  the same snapshot and the expected search_path (`search_path:` in
-  `opts`, the pinned value while Selecto's pin is in place, else the
-  baseline's own).
+  the same temp catalog and the expected settings (`pinned:` in `opts`, the
+  values pin/2 set while Selecto's pin is in place, else the baseline's).
   """
   def same?(current, baseline, opts \\ []) do
-    current.snapshot == baseline.snapshot and
-      search_path(current) == expected_path(baseline, opts)
+    current.snapshot == baseline.snapshot and settings_expected?(current, baseline, opts)
+  end
+
+  defp settings_expected?(current, baseline, opts) do
+    pinned = Keyword.get(opts, :pinned) || %{}
+
+    Enum.all?(baseline.settings, fn {name, value} ->
+      :proplists.get_value(name, current.settings, nil) == Map.get(pinned, name, value)
+    end)
   end
 
   @doc "The search_path of a snapshot state."
   def search_path(%{settings: settings}), do: :proplists.get_value("search_path", settings, nil)
 
-  defp expected_path(baseline, opts),
-    do: Keyword.get(opts, :search_path) || search_path(baseline)
-
   @doc """
-  R30: pins search_path to `path` for the rest of the current transaction
-  (set_config(..., true)); run only inside Selecto's own transaction or
-  savepoint, after the snapshot it is compared with. Returns the value as
-  the server normalised it.
+  R30, R35: pins search_path to `path` and every other result-affecting
+  setting to Selecto's value for the rest of the current transaction
+  (set_config(..., true)), in one statement; run only inside Selecto's own
+  transaction or savepoint, after the snapshot it is compared with. Returns
+  `{:ok, pinned}`, each setting's value as the server normalised it.
   """
   def pin(execute, path) do
-    case execute.(
-           "SELECT pg_catalog.set_config('search_path', $1::pg_catalog.text, true) " <>
-             "AS selecto_guard_pin",
-           [path]
-         ) do
-      {:ok, %{rows: [[value]]}} when is_binary(value) -> {:ok, value}
-      _other -> unavailable()
+    names = ["search_path" | Enum.map(@pinned, &elem(&1, 0))]
+
+    sql =
+      "SELECT " <>
+        Enum.map_join(Enum.with_index(names), ", ", fn {name, index} ->
+          "pg_catalog.set_config('#{name}', $#{index + 1}::pg_catalog.text, true) " <>
+            "AS selecto_guard_pin_#{index}"
+        end)
+
+    case execute.(sql, [path | Enum.map(@pinned, &elem(&1, 1))]) do
+      {:ok, %{rows: [values]}} when length(values) == length(names) ->
+        {:ok, Map.new(Enum.zip(names, values))}
+
+      _other ->
+        unavailable()
     end
   end
 
   @doc """
-  R30: restores the host's search_path `previous` (set_config(..., true)) in
-  the same expression that checks the pin `pinned` is still in place, so a
-  statement that switched it in between refuses.
+  R30, R35: restores the host's values (the settings of `before`) with
+  set_config(..., true), in the same expression that checks every pin is
+  still in place, so a statement that switched one in between refuses.
   """
-  def unpin(execute, pinned, previous) do
+  def unpin(execute, pinned, %{settings: settings}) do
+    names = Map.keys(pinned) |> Enum.sort()
+    count = length(names)
+
+    held =
+      names
+      |> Enum.with_index(1)
+      |> Enum.map_join(" AND ", fn {name, index} ->
+        "pg_catalog.current_setting('#{name}') OPERATOR(pg_catalog.=) $#{index}::pg_catalog.text"
+      end)
+
+    restore =
+      names
+      |> Enum.with_index(count + 1)
+      |> Enum.map_join(", ", fn {name, index} ->
+        "pg_catalog.set_config('#{name}', $#{index}::pg_catalog.text, true)"
+      end)
+
+    params =
+      Enum.map(names, &Map.fetch!(pinned, &1)) ++
+        Enum.map(names, &:proplists.get_value(&1, settings, nil))
+
     case execute.(
-           "SELECT CASE WHEN pg_catalog.current_setting('search_path') OPERATOR(pg_catalog.=) " <>
-             "$1::pg_catalog.text THEN pg_catalog.set_config('search_path', $2::pg_catalog.text, true) " <>
-             "END AS selecto_guard_unpin",
-           [pinned, previous]
+           "SELECT CASE WHEN #{held} THEN pg_catalog.concat_ws(',', #{restore}) END " <>
+             "AS selecto_guard_unpin",
+           params
          ) do
       {:ok, %{rows: [[value]]}} when is_binary(value) -> :ok
       {:ok, %{rows: [[nil]]}} -> changed()
@@ -273,22 +321,6 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   end
 
   def deferrable_free(_state, _opts), do: :ok
-
-  @doc """
-  Restores the settings of `before` for the session (autocommit reads, where
-  no transaction state is left to roll back), best effort.
-  """
-  def restore(execute, %{settings: settings}) do
-    Enum.each(settings, fn {name, value} ->
-      _ =
-        execute.(
-          "SELECT pg_catalog.set_config($1::pg_catalog.text, $2::pg_catalog.text, false)",
-          [name, value]
-        )
-    end)
-
-    :ok
-  end
 
   @doc "The refusal for a changed session."
   def changed,

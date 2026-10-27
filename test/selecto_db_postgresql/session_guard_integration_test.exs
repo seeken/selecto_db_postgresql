@@ -518,4 +518,76 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
     assert {:ok, %{affected_rows: 1}} =
              Adapter.execute_write_unsafe(c, update("dchild", [{"note", "c"}], tenant("t1")), [])
   end
+
+  # R35: a TimeZone or DateStyle the session persisted before Selecto's call
+  # (masked by a local value of the same setting inside a transaction, so
+  # no before/after compare sees it) never decides how a Selecto statement
+  # renders or parses a value: every statement runs under TimeZone=UTC and
+  # DateStyle='ISO, MDY', and the host's values are handed back.
+  test "a persisted or masked TimeZone/DateStyle does not decide a scope compare",
+       %{connection: c} do
+    exec!(c, "CREATE TABLE ev (id int PRIMARY KEY, org_key text NOT NULL, ts timestamptz)")
+
+    exec!(
+      c,
+      "INSERT INTO ev VALUES (1, 't1', '2024-01-01 02:00:00+00'), " <>
+        "(2, 't1', '2023-12-31 20:00:00+00')"
+    )
+
+    # A text rendering of the instant depends on TimeZone and DateStyle.
+    exec!(
+      c,
+      "CREATE VIEW ev_v AS SELECT id, org_key, CAST(ts AS text) AS ts_text, " <>
+        "current_setting('TimeZone') AS tz, current_setting('DateStyle') AS ds FROM ev"
+    )
+
+    read = fn select, filters ->
+      %{
+        name: "ev_v",
+        source: %{
+          source_table: "ev_v",
+          primary_key: :id,
+          fields: [:id, :org_key, :ts_text, :tz, :ds],
+          redact_fields: [],
+          columns: %{
+            id: %{type: :integer},
+            org_key: %{type: :string},
+            ts_text: %{type: :string},
+            tz: %{type: :string},
+            ds: %{type: :string}
+          },
+          associations: %{}
+        },
+        schemas: %{},
+        joins: %{},
+        required_filters: filters
+      }
+      |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+      |> Selecto.select(select)
+      |> Selecto.order_by(["id"])
+      |> Selecto.execute()
+      |> read_code()
+    end
+
+    {:ok, _} =
+      Postgrex.transaction(c, fn conn ->
+        Postgrex.query!(conn, "SELECT set_config('TimeZone', 'Asia/Karachi', false)", [])
+        Postgrex.query!(conn, "SELECT set_config('DateStyle', 'SQL, DMY', false)", [])
+        Postgrex.query!(conn, "SELECT set_config('TimeZone', 'UTC', true)", [])
+        Postgrex.query!(conn, "SELECT set_config('DateStyle', 'ISO, MDY', true)", [])
+      end)
+
+    assert rows!(c, "SELECT current_setting('TimeZone')") == [["Asia/Karachi"]]
+
+    # Under Asia/Karachi (and SQL, DMY) row 2 renders as 01/01/2024 01:00
+    # and would sort into the scope.
+    assert read.(["id"], [{"ts_text", {:gte, "2024-01-01"}}]) == [[1]]
+    assert read.(["tz", "ds"], [{"id", 1}]) == [["UTC", "ISO, MDY"]]
+
+    assert {:ok, %{affected_rows: 1}} =
+             Adapter.execute_write_unsafe(c, update("items", [{"note", "z"}], tenant("t1")), [])
+
+    assert rows!(c, "SELECT current_setting('TimeZone'), current_setting('DateStyle')") ==
+             [["Asia/Karachi", "SQL, DMY"]]
+  end
 end
