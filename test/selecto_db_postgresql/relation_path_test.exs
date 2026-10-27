@@ -52,6 +52,18 @@ defmodule SelectoDBPostgreSQL.RelationPathTest do
              ["c_root"]
   end
 
+  test "LATERAL and ONLY are keywords, not relations" do
+    sql =
+      "select 1 from c_root r CROSS JOIN LATERAL UNNEST(r.tags) WITH ORDINALITY AS t(v, p) " <>
+        "join lateral (select 1) x on true join only c_items i on true"
+
+    assert RelationPath.names(sql) == ["c_root", "c_items"]
+    assert {:ok, qualified} = RelationPath.qualify(sql, @map)
+    assert qualified =~ ~s|JOIN LATERAL UNNEST(|
+    assert qualified =~ ~s|from "app"."c_root" r|
+    assert :ok = RelationPath.qualified(qualified)
+  end
+
   test "the pinned path puts pg_catalog first and pg_temp last (R30)" do
     assert RelationPath.pinned_path(%{"a" => ~s("app"."a"), "b" => ~s("pg_temp_3"."b")}) ==
              ~s|pg_catalog, "app", pg_temp|

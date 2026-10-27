@@ -28,7 +28,9 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   alias Selecto.Write.Error
 
-  @position ~r/(\b(?:from|join|into)\s+)("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)(?!\s*[.(])(?![A-Za-z0-9_$])/i
+  # A relation position: after FROM, JOIN or INTO (and an optional LATERAL
+  # or ONLY), a name that is not a function call or qualified.
+  @position ~r/(\b(?:from|join|into)\s+(?>(?:(?:lateral|only)\b\s*)?))("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)(?!\s*[.(])(?![A-Za-z0-9_$])/i
 
   @resolve_sql """
   WITH selecto_path AS (
