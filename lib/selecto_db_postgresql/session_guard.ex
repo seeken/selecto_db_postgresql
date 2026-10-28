@@ -179,8 +179,8 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   # kept for the call shape only. A temp TYPE named like an identifier or a
   # generated cast type is still refused (defence in depth: the pinned path
   # searches pg_temp last).
-  @shadow_sql "SELECT (CASE WHEN $1::pg_catalog.text[] IS NULL THEN 0 ELSE 0 END) " <>
-                "+ (SELECT pg_catalog.count(*) FROM pg_catalog.pg_type t " <>
+  @shadow_sql "SELECT CAST(CASE WHEN $1::pg_catalog.text[] IS NULL THEN 0 ELSE 0 END AS pg_catalog.int8) " <>
+                "OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.pg_type t " <>
                 "WHERE t.typnamespace OPERATOR(pg_catalog.=) #{@temp} " <>
                 "AND t.typrelid OPERATOR(pg_catalog.=) 0 " <>
                 "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type e WHERE e.oid OPERATOR(pg_catalog.=) t.typelem " <>

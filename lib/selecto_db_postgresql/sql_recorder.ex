@@ -18,10 +18,10 @@ defmodule SelectoDBPostgreSQL.SQLRecorder do
 
   def enabled?, do: Application.get_env(:selecto_db_postgresql, :record_sql) == true
 
-  def record(sql) do
+  def record(sql, kind \\ :statement) do
     if enabled?() do
       ensure_table()
-      :ets.insert(@table, {System.unique_integer([:monotonic]), IO.iodata_to_binary(sql)})
+      :ets.insert(@table, {System.unique_integer([:monotonic]), kind, IO.iodata_to_binary(sql)})
     end
 
     sql
@@ -30,7 +30,12 @@ defmodule SelectoDBPostgreSQL.SQLRecorder do
   def statements do
     if :ets.whereis(@table) == :undefined,
       do: [],
-      else: @table |> :ets.tab2list() |> Enum.sort() |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
+      else:
+        @table
+        |> :ets.tab2list()
+        |> Enum.sort()
+        |> Enum.map(fn {_order, kind, sql} -> {kind, sql} end)
+        |> Enum.uniq()
   end
 
   defp ensure_table do

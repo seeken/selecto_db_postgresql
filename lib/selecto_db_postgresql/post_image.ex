@@ -205,36 +205,60 @@ defmodule SelectoDBPostgreSQL.PostImage do
     end
   end
 
+  # Every term an int8 count, summed with pg_catalog's int8 operator; the
+  # trigger type is cast to int4 for pg_catalog's int4 & (R48).
   defp blocked_sql(command) do
-    """
-    (CASE WHEN c.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r', 'p']::pg_catalog."char"[]) THEN 0 ELSE 1 END
-      -- Statement-level triggers and rewrite rules for the event on the
-      -- relation or any of its partitions.
-      + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
-         WHERE (t.tgrelid OPERATOR(pg_catalog.=) c.oid
-                OR t.tgrelid OPERATOR(pg_catalog.=) ANY (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
-           AND NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
-           AND (t.tgtype OPERATOR(pg_catalog.&) #{event_bits(command.operation)}) OPERATOR(pg_catalog.<>) 0
-           AND (t.tgtype OPERATOR(pg_catalog.&) 1) OPERATOR(pg_catalog.=) 0)
-      + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_rewrite r
-         WHERE (r.ev_class OPERATOR(pg_catalog.=) c.oid
-                OR r.ev_class OPERATOR(pg_catalog.=) ANY (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
-           AND r.rulename OPERATOR(pg_catalog.<>) '_RETURN'
-           AND r.ev_type OPERATOR(pg_catalog.=) ANY (ARRAY[#{rule_events(command.operation)}]::pg_catalog."char"[]))
-      -- A deferrable constraint trigger fires at commit, after this
-      -- check, and can sit on any table a row trigger writes to (an
-      -- audit table) or on a leaf partition: any in the database refuses.
-      -- This runs after the DML (a trigger committed while the write
-      -- waited on a row lock is seen), which needs a fresh statement
-      -- snapshot: outside READ COMMITTED the check is refused.
-      + (#{SelectoDBPostgreSQL.SessionGuard.Deferrable.count_sql()})
-      + (CASE WHEN pg_catalog.current_setting('transaction_isolation') OPERATOR(pg_catalog.=) 'read committed'
-              THEN 0 ELSE 1 END)
-      -- Inheritance (non-partition) children: the parent's rows are not the
-      -- only ones the relation's name reads.
-      + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_inherits i
-         WHERE i.inhparent OPERATOR(pg_catalog.=) c.oid AND c.relkind OPERATOR(pg_catalog.=) 'r'))
-    """
+    [
+      "CASE WHEN c.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r', 'p']::pg_catalog.\"char\"[]) THEN 0 ELSE 1 END",
+      # Statement-level triggers and rewrite rules for the event on the
+      # relation or any of its partitions.
+      """
+      SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
+       WHERE (t.tgrelid OPERATOR(pg_catalog.=) c.oid
+              OR t.tgrelid OPERATOR(pg_catalog.=) ANY (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
+         AND NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
+         AND #{statement_trigger(command)}
+      """,
+      """
+      SELECT pg_catalog.count(*) FROM pg_catalog.pg_rewrite r
+       WHERE (r.ev_class OPERATOR(pg_catalog.=) c.oid
+              OR r.ev_class OPERATOR(pg_catalog.=) ANY (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
+         AND r.rulename OPERATOR(pg_catalog.<>) '_RETURN'
+         AND r.ev_type OPERATOR(pg_catalog.=) ANY (ARRAY[#{rule_events(command.operation)}]::pg_catalog."char"[])
+      """,
+      # A deferrable constraint trigger fires at commit, after this check,
+      # and can sit on any table a row trigger writes to (an audit table)
+      # or on a leaf partition: any in the database refuses. This runs
+      # after the DML (a trigger committed while the write waited on a row
+      # lock is seen), which needs a fresh statement snapshot: outside READ
+      # COMMITTED the check is refused.
+      SelectoDBPostgreSQL.SessionGuard.Deferrable.count_sql(),
+      "CASE WHEN pg_catalog.current_setting('transaction_isolation') OPERATOR(pg_catalog.=) 'read committed' THEN 0 ELSE 1 END",
+      # Inheritance (non-partition) children: the parent's rows are not the
+      # only ones the relation's name reads.
+      """
+      SELECT pg_catalog.count(*) FROM pg_catalog.pg_inherits i
+       WHERE i.inhparent OPERATOR(pg_catalog.=) c.oid AND c.relkind OPERATOR(pg_catalog.=) 'r'
+      """
+    ]
+    |> int8_sum()
+  end
+
+  # pg_trigger.tgtype bits: a statement-level trigger for the event.
+  defp statement_trigger(command),
+    do:
+      "(CAST(t.tgtype AS pg_catalog.int4) OPERATOR(pg_catalog.&) #{event_bits(command.operation)}) " <>
+        "OPERATOR(pg_catalog.<>) 0 AND " <>
+        "(CAST(t.tgtype AS pg_catalog.int4) OPERATOR(pg_catalog.&) 1) OPERATOR(pg_catalog.=) 0"
+
+  defp int8_sum(terms) do
+    "(" <>
+      Enum.map_join(
+        terms,
+        " OPERATOR(pg_catalog.+) ",
+        &"CAST((#{String.trim(&1)}) AS pg_catalog.int8)"
+      ) <>
+      ")"
   end
 
   # Text literals of the scope compare as untyped SQL literals, as the host's
@@ -309,14 +333,15 @@ defmodule SelectoDBPostgreSQL.PostImage do
       (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
        WHERE t.tgrelid OPERATOR(pg_catalog.=) ANY (SELECT oid FROM tree)
          AND NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
-         AND (t.tgtype OPERATOR(pg_catalog.&) #{event_bits(command.operation)}) OPERATOR(pg_catalog.<>) 0 AND (t.tgtype OPERATOR(pg_catalog.&) 1) OPERATOR(pg_catalog.=) 0)
-      + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_rewrite r
+         AND #{statement_trigger(command)})
+        OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.pg_rewrite r
          WHERE r.ev_class OPERATOR(pg_catalog.=) ANY (SELECT oid FROM tree)
            AND r.rulename OPERATOR(pg_catalog.<>) '_RETURN' AND r.ev_type OPERATOR(pg_catalog.=) ANY (ARRAY[#{rule_events(command.operation)}]::pg_catalog."char"[]))
       -- A deferrable trigger fires at commit, after this check, and can sit
       -- on any table a row trigger writes to: any in the database refuses,
-      -- as for inserts, updates and upserts (w3exrev17).
-      + (#{SelectoDBPostgreSQL.SessionGuard.Deferrable.count_sql()})
+      -- as for inserts, updates and upserts (w3exrev17). Every term is an
+      -- int8 count (pg_catalog's int8 +).
+        OPERATOR(pg_catalog.+) (#{SelectoDBPostgreSQL.SessionGuard.Deferrable.count_sql()})
         AS selecto_delete_blocked
     """
 

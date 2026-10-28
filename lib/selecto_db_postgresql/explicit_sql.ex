@@ -179,6 +179,47 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     set
   end
 
+  @doc """
+  R48: Selecto's own guard and catalog SQL names every operator, not only
+  comparisons: any operator token outside OPERATOR(...) (casts, `*` and
+  array brackets aside) and any unqualified function.
+  """
+  def guard_violations(sql) do
+    sql = IO.iodata_to_binary(sql)
+
+    bare =
+      sql
+      |> Scanner.tokenize()
+      |> strip_operator_groups([])
+      |> Enum.filter(fn
+        {:other, text, _} ->
+          not Regex.match?(
+            ~r/\A(\$[0-9]+|[0-9][0-9.]*|'.*'|E'.*'|[\[\]:]+|\*|\$[A-Za-z_]*\$.*)\z/s,
+            text
+          )
+
+        {:word, word, _} ->
+          String.downcase(word) in @comparison_words
+
+        _ ->
+          false
+      end)
+      |> Enum.map(&{:operator, elem(&1, 1)})
+
+    lock_ok = Regex.match?(~r/\A\s*LOCK\s+TABLE\b/i, sql)
+    bare = if lock_ok, do: Enum.reject(bare, &(&1 == {:operator, "IN"})), else: bare
+
+    bare ++ Enum.map(function_calls(sql), &{:function, &1.name})
+  end
+
+  defp strip_operator_groups([], acc), do: Enum.reverse(acc)
+
+  defp strip_operator_groups([{:word, word, _}, {:punct, "(", _} | rest], acc)
+       when word in ["OPERATOR", "operator"],
+       do: strip_operator_groups(drop_group(rest, 1), acc)
+
+  defp strip_operator_groups([token | rest], acc), do: strip_operator_groups(rest, [token | acc])
+
   @doc "Bare comparison operators and unqualified function calls left in `sql`."
   def violations(sql) do
     sql = IO.iodata_to_binary(sql)
