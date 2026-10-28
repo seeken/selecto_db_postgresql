@@ -718,7 +718,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # itself; their result columns carry the `selecto_guard_` tag (R22), so a
   # certification harness can recognise exactly these receipts.
   defp guard_statement(connection, sql, params),
-    do: guard_statement_run(connection, SQLRecorder.record(sql), params)
+    do: guard_statement_run(connection, SQLRecorder.record(sql, :guard), params)
 
   defp guard_statement_run({:pool, pool_ref}, sql, params) do
     case resolve_live_pool_pid(pool_ref) do
@@ -1759,7 +1759,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     check = fn sql, params ->
       execute_statement(
         connection,
-        SQLRecorder.record(sql),
+        SQLRecorder.record(sql, :guard),
         params,
         Keyword.take(opts, [:timeout, :log])
       )

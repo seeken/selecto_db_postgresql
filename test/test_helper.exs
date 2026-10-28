@@ -6,9 +6,15 @@ SelectoDBPostgreSQL.SQLRecorder.start()
 ExUnit.after_suite(fn _result ->
   statements = SelectoDBPostgreSQL.SQLRecorder.statements()
 
+  # Business statements: comparisons and functions (R47); Selecto's own
+  # guard and catalog SQL: every operator and function (R48).
   violations =
-    for sql <- statements,
-        found = SelectoDBPostgreSQL.ExplicitSQL.violations(sql),
+    for {kind, sql} <- statements,
+        found =
+          if(kind == :guard,
+            do: SelectoDBPostgreSQL.ExplicitSQL.guard_violations(sql),
+            else: SelectoDBPostgreSQL.ExplicitSQL.violations(sql)
+          ),
         found != [],
         do: {found, sql}
 
