@@ -14,6 +14,9 @@ defmodule SelectoDBPostgreSQL.RelationPath.Scanner do
   @statement ~w(select update delete insert merge with values)
   @ends ~w(where group having order limit offset window union intersect except returning set fetch for)
 
+  @doc "The statement's tokens: {kind, text, start}."
+  def tokenize(sql), do: sql |> IO.iodata_to_binary() |> tokens(0, [])
+
   def refs(sql) do
     sql
     |> IO.iodata_to_binary()

@@ -207,20 +207,20 @@ defmodule SelectoDBPostgreSQL.PostImage do
 
   defp blocked_sql(command) do
     """
-    (CASE WHEN c.relkind IN ('r', 'p') THEN 0 ELSE 1 END
+    (CASE WHEN c.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r', 'p']::pg_catalog."char"[]) THEN 0 ELSE 1 END
       -- Statement-level triggers and rewrite rules for the event on the
       -- relation or any of its partitions.
       + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
          WHERE (t.tgrelid OPERATOR(pg_catalog.=) c.oid
-                OR t.tgrelid IN (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
-           AND NOT t.tgisinternal AND t.tgenabled <> 'D'
-           AND (t.tgtype & #{event_bits(command.operation)}) <> 0
-           AND (t.tgtype & 1) = 0)
+                OR t.tgrelid OPERATOR(pg_catalog.=) ANY (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
+           AND NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
+           AND (t.tgtype OPERATOR(pg_catalog.&) #{event_bits(command.operation)}) OPERATOR(pg_catalog.<>) 0
+           AND (t.tgtype OPERATOR(pg_catalog.&) 1) OPERATOR(pg_catalog.=) 0)
       + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_rewrite r
          WHERE (r.ev_class OPERATOR(pg_catalog.=) c.oid
-                OR r.ev_class IN (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
-           AND r.rulename <> '_RETURN'
-           AND r.ev_type IN (#{rule_events(command.operation)}))
+                OR r.ev_class OPERATOR(pg_catalog.=) ANY (SELECT relid FROM pg_catalog.pg_partition_tree(c.oid)))
+           AND r.rulename OPERATOR(pg_catalog.<>) '_RETURN'
+           AND r.ev_type OPERATOR(pg_catalog.=) ANY (ARRAY[#{rule_events(command.operation)}]::pg_catalog."char"[]))
       -- A deferrable constraint trigger fires at commit, after this
       -- check, and can sit on any table a row trigger writes to (an
       -- audit table) or on a leaf partition: any in the database refuses.
@@ -228,12 +228,12 @@ defmodule SelectoDBPostgreSQL.PostImage do
       -- waited on a row lock is seen), which needs a fresh statement
       -- snapshot: outside READ COMMITTED the check is refused.
       + (#{SelectoDBPostgreSQL.SessionGuard.Deferrable.count_sql()})
-      + (CASE WHEN pg_catalog.current_setting('transaction_isolation') = 'read committed'
+      + (CASE WHEN pg_catalog.current_setting('transaction_isolation') OPERATOR(pg_catalog.=) 'read committed'
               THEN 0 ELSE 1 END)
       -- Inheritance (non-partition) children: the parent's rows are not the
       -- only ones the relation's name reads.
       + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_inherits i
-         WHERE i.inhparent OPERATOR(pg_catalog.=) c.oid AND c.relkind = 'r'))
+         WHERE i.inhparent OPERATOR(pg_catalog.=) c.oid AND c.relkind OPERATOR(pg_catalog.=) 'r'))
     """
   end
 
@@ -304,15 +304,15 @@ defmodule SelectoDBPostgreSQL.PostImage do
     )
     SELECT
       (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c
-       WHERE c.oid OPERATOR(pg_catalog.=) $1::pg_catalog.oid AND c.relkind IN ('r', 'p'))
+       WHERE c.oid OPERATOR(pg_catalog.=) $1::pg_catalog.oid AND c.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r', 'p']::pg_catalog."char"[]))
         AS selecto_delete_relation,
       (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
-       WHERE t.tgrelid IN (SELECT oid FROM tree)
-         AND NOT t.tgisinternal AND t.tgenabled <> 'D'
-         AND (t.tgtype & #{event_bits(command.operation)}) <> 0 AND (t.tgtype & 1) = 0)
+       WHERE t.tgrelid OPERATOR(pg_catalog.=) ANY (SELECT oid FROM tree)
+         AND NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
+         AND (t.tgtype OPERATOR(pg_catalog.&) #{event_bits(command.operation)}) OPERATOR(pg_catalog.<>) 0 AND (t.tgtype OPERATOR(pg_catalog.&) 1) OPERATOR(pg_catalog.=) 0)
       + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_rewrite r
-         WHERE r.ev_class IN (SELECT oid FROM tree)
-           AND r.rulename <> '_RETURN' AND r.ev_type IN (#{rule_events(command.operation)}))
+         WHERE r.ev_class OPERATOR(pg_catalog.=) ANY (SELECT oid FROM tree)
+           AND r.rulename OPERATOR(pg_catalog.<>) '_RETURN' AND r.ev_type OPERATOR(pg_catalog.=) ANY (ARRAY[#{rule_events(command.operation)}]::pg_catalog."char"[]))
       -- A deferrable trigger fires at commit, after this check, and can sit
       -- on any table a row trigger writes to: any in the database refuses,
       -- as for inserts, updates and upserts (w3exrev17).

@@ -388,7 +388,7 @@ defmodule SelectoDBPostgreSQL.GraphCompiler do
 
     clauses ++
       [
-        "WHEN NOT MATCHED AND source.#{quote_identifier(@existing_column)} = FALSE " <>
+        "WHEN NOT MATCHED AND source.#{quote_identifier(@existing_column)} OPERATOR(pg_catalog.=) FALSE " <>
           "THEN INSERT (#{columns}) VALUES (#{values})"
       ]
   end
