@@ -114,4 +114,124 @@ defmodule SelectoDBPostgreSQL.ExplicitOperatorIntegrationTest do
       end
     end
   end
+
+  # pg_r46_residual / pg_r46_retarget ports (R47): with an always-true
+  # =(varchar, varchar) and a lower(varchar) returning 't1' in the reset-path
+  # schema, a scope-keyed join, a required computed lower(...) predicate and
+  # retarget membership (IN and EXISTS) stay exact.
+  test "scope-keyed joins, computed functions and retarget membership never resolve by name" do
+    schema = "selecto_r47_#{System.unique_integer([:positive])}"
+    {:ok, admin} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
+
+    for sql <- [
+          "CREATE SCHEMA #{schema}",
+          "CREATE TABLE #{schema}.lr_acc (pk int PRIMARY KEY, id varchar(10), site varchar(10), secret varchar(30))",
+          "INSERT INTO #{schema}.lr_acc VALUES (1, 'A', 's1', 'mine'), (2, 'A', 's2', 'OTHER-SITE-SECRET'), (3, 'B', 's1', 'OTHER-KEY')",
+          "CREATE TABLE #{schema}.lr_root (id int PRIMARY KEY, org_key varchar(10) NOT NULL, site varchar(10), acc_id varchar(10))",
+          "INSERT INTO #{schema}.lr_root VALUES (1, 't1', 's1', 'A'), (2, 'T1', 's2', 'A'), (3, 't2', 's2', 'B')",
+          "CREATE FUNCTION #{schema}.ev_eq(varchar, varchar) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'",
+          "CREATE OPERATOR #{schema}.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = #{schema}.ev_eq)",
+          "CREATE FUNCTION #{schema}.lower(varchar) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT ''t1''::text'"
+        ],
+        do: exec!(admin, sql)
+
+    {:ok, c} =
+      Adapter.connect(
+        options()
+        |> Keyword.put(:pool_size, 1)
+        |> Keyword.put(:parameters, search_path: schema)
+      )
+
+    rel = fn table, columns ->
+      %{
+        source_table: table,
+        primary_key: if(table == "lr_acc", do: :pk, else: :id),
+        fields: Map.keys(columns),
+        redact_fields: [],
+        columns: columns,
+        associations: %{}
+      }
+    end
+
+    domain = %{
+      name: "L",
+      source:
+        rel.("lr_root", %{
+          id: %{type: :integer},
+          org_key: %{type: :string},
+          site: %{type: :string},
+          acc_id: %{type: :string},
+          org_lc: %{
+            type: :string,
+            computed: %{kind: :expression, expression: ["lower", ["field", "org_key"]]}
+          }
+        })
+        |> Map.put(:tenant_field, :org_key)
+        |> Map.put(:associations, %{
+          acc: %{
+            queryable: :acc,
+            field: :acc,
+            owner_key: :acc_id,
+            related_key: :id,
+            cardinality: :one,
+            source_scope_key: :site,
+            target_scope_key: :site
+          }
+        }),
+      schemas: %{
+        acc:
+          rel.("lr_acc", %{
+            pk: %{type: :integer},
+            id: %{type: :string},
+            site: %{type: :string},
+            secret: %{type: :string}
+          })
+      },
+      joins: %{acc: %{type: :left, name: "acc"}}
+    }
+
+    try do
+      # The evil objects win hand-written SQL.
+      assert {:ok, %{rows: [["t1"]]}} =
+               Adapter.execute(c, "SELECT lower(CAST('T2' AS varchar))", [], [])
+
+      joined =
+        domain
+        |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+        |> Selecto.with_tenant("t1")
+        |> Selecto.select(["id", "acc.secret"])
+        |> Selecto.order_by(["id"])
+        |> Selecto.execute()
+
+      assert {:ok, {[[1, "mine"]], _, _}} = joined
+
+      required =
+        domain
+        |> Map.put(:required_filters, [{"org_lc", "t1"}])
+        |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+        |> Selecto.select(["id"])
+        |> Selecto.order_by(["id"])
+        |> Selecto.execute()
+
+      # pg_catalog.lower: 't1' and 'T1' lower to 't1'; never every row.
+      assert {:ok, {[[1], [2]], _, _}} = required
+
+      for strategy <- [:in, :exists] do
+        retargeted =
+          domain
+          |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+          |> Selecto.with_tenant("t1")
+          |> Selecto.retarget("acc", strategy: strategy)
+          |> Selecto.select(["secret"])
+          |> Selecto.order_by(["secret"])
+          |> Selecto.execute()
+
+        assert {:ok, {[["mine"]], _, _}} = retargeted, inspect(strategy)
+      end
+    after
+      GenServer.stop(c)
+      exec!(admin, "DROP SCHEMA #{schema} CASCADE")
+      GenServer.stop(admin)
+    end
+  end
 end

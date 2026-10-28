@@ -35,6 +35,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   alias SelectoDBPostgreSQL.PostImage
   alias SelectoDBPostgreSQL.RelationPath
+  alias SelectoDBPostgreSQL.{ExplicitSQL, SQLRecorder}
   alias SelectoDBPostgreSQL.SessionGuard
 
   @read_committed "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
@@ -604,7 +605,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
         with {:ok, before} <- read_check(guard, query),
              {:ok, pinned} <- read_step(SessionGuard.pin(guard, path)),
              :ok <- read_step(RelationPath.qualified(query)),
-             {:ok, result} <- execute.(query, params),
+             {:ok, query} <- read_step(ExplicitSQL.prepare(guard, query)),
+             {:ok, result} <- execute.(SQLRecorder.record(query), params),
              :ok <- read_step(SessionGuard.unpin(guard, pinned, before)),
              :ok <- read_compare(guard, before),
              :ok <- run_all(guard, close) do
@@ -715,21 +717,25 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # statement go through the same traced driver call as the statement
   # itself; their result columns carry the `selecto_guard_` tag (R22), so a
   # certification harness can recognise exactly these receipts.
-  defp guard_statement({:pool, pool_ref}, sql, params) do
+  defp guard_statement(connection, sql, params),
+    do: guard_statement_run(connection, SQLRecorder.record(sql), params)
+
+  defp guard_statement_run({:pool, pool_ref}, sql, params) do
     case resolve_live_pool_pid(pool_ref) do
-      {:ok, pool_pid} -> guard_statement(pool_pid, sql, params)
+      {:ok, pool_pid} -> guard_statement_run(pool_pid, sql, params)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp guard_statement(connection, sql, params)
+  defp guard_statement_run(connection, sql, params)
        when is_atom(connection) and not is_nil(connection) do
     if ecto_repo?(connection),
       do: execute_ecto_query(connection, sql, params),
       else: query_postgrex(connection, sql, params, [])
   end
 
-  defp guard_statement(connection, sql, params), do: query_postgrex(connection, sql, params, [])
+  defp guard_statement_run(connection, sql, params),
+    do: query_postgrex(connection, sql, params, [])
 
   defp read_check(execute, query) do
     case SessionGuard.check(execute, normalize_query(query)) do
@@ -1571,7 +1577,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     order = Enum.map_join(request.identity_fields, ", ", &quote_identifier/1)
 
     "SELECT #{selected} FROM #{quote_relation(request.child_relation)} " <>
-      "WHERE #{quote_identifier(request.child_key)} = $1 ORDER BY #{order} " <>
+      "WHERE #{quote_identifier(request.child_key)} OPERATOR(pg_catalog.=) $1 ORDER BY #{order} " <>
       "LIMIT #{request.max_rows + 1}"
   end
 
@@ -1750,7 +1756,15 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # relation first, returns its rows' keys and is re-read by them
   # after the statement (SelectoDBPostgreSQL.PostImage).
   defp execute_guarded_statement(connection, command, statement, opts) do
-    check = &execute_statement(connection, &1, &2, Keyword.take(opts, [:timeout, :log]))
+    check = fn sql, params ->
+      execute_statement(
+        connection,
+        SQLRecorder.record(sql),
+        params,
+        Keyword.take(opts, [:timeout, :log])
+      )
+    end
+
     guard = &guard_statement(connection, &1, &2)
 
     with {:ok, session} <- write_session(guard, statement.text, opts) do
@@ -1916,8 +1930,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # when every relation position of the very text executed is schema
   # qualified (a CTE name excepted).
   defp execute_qualified(connection, sql, params, opts) do
-    with :ok <- RelationPath.qualified(sql) do
-      execute_statement(connection, sql, params, opts)
+    with :ok <- RelationPath.qualified(sql),
+         {:ok, sql} <- ExplicitSQL.prepare(&guard_statement(connection, &1, &2), sql) do
+      execute_statement(connection, SQLRecorder.record(sql), params, opts)
     end
   end
 
@@ -3738,17 +3753,18 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
             # R30: the cursor runs under the pinned search_path; every batch
             # is compared with the pin expected in place.
-            {before, pinned} =
+            {before, pinned, query} =
               if guarded? do
                 with :ok <- RelationPath.qualified(query),
                      {:ok, before} <- SessionGuard.check(check, query),
-                     {:ok, pinned} <- SessionGuard.pin(check, read_path(opts)) do
-                  {before, pinned}
+                     {:ok, pinned} <- SessionGuard.pin(check, read_path(opts)),
+                     {:ok, prepared} <- ExplicitSQL.prepare(check, query) do
+                  {before, pinned, SQLRecorder.record(prepared)}
                 else
                   error -> refuse.(error)
                 end
               else
-                {nil, nil}
+                {nil, nil, query}
               end
 
             tx_conn

@@ -373,6 +373,18 @@ another schema's relation, function or operator of the same name. So:
   retarget membership, writes, foreign-key guards, MERGE and the post-image
   re-read name pg_catalog's operator too. Compile-only SQL (`to_sql/1`
   without a connection) is unchanged.
+- **One last step before every statement runs** (R47): every function the
+  statement calls without a schema is qualified with the schema PostgreSQL
+  would pick under the pinned search_path (pg_catalog's when it has one,
+  so a `public.lower(varchar)` never shadows it; else the extension's own
+  schema), a comparison of two atoms that a builder wrote bare (recursive
+  query-member joins, a retarget's context correlation) becomes
+  pg_catalog's operator, and a statement that would still resolve an
+  operator or function by name is refused (`reason: :bare_operator`).
+  Builders that write compound bare comparisons (tagging, hierarchy, OLAP,
+  enhanced joins, subfilters) are therefore refused on PostgreSQL rather
+  than run. The test suite records every statement the adapter generates
+  and fails if any of them would resolve by name.
 - Every catalog read the adapter runs for its checks is pg_catalog-qualified.
 
 ## Atomic write graphs and MERGE

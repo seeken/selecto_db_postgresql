@@ -780,9 +780,9 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
   test "hand-built reads refuse while temp relations exist; comma lists and subqueries are qualified",
        %{connection: c} do
     sqls = [
-      ~s|SELECT "s0"."id", "s0"."note" FROM (SELECT 1) AS "d", "items" AS "s0" WHERE "s0"."org_key" = $1 ORDER BY 1|,
-      "SELECT s0.id, s0.note FROM pg_catalog.pg_am d, items s0 WHERE s0.org_key = $1 AND d.amname = 'btree' ORDER BY 1",
-      "SELECT 1 AS id, (SELECT pg_catalog.string_agg(note, ',' ORDER BY id) FROM (SELECT 1) z, items WHERE org_key = $1) AS note"
+      ~s|SELECT "s0"."id", "s0"."note" FROM (SELECT 1) AS "d", "items" AS "s0" WHERE "s0"."org_key" OPERATOR(pg_catalog.=) $1 ORDER BY 1|,
+      "SELECT s0.id, s0.note FROM pg_catalog.pg_am d, items s0 WHERE s0.org_key OPERATOR(pg_catalog.=) $1 AND d.amname OPERATOR(pg_catalog.=) 'btree' ORDER BY 1",
+      "SELECT 1 AS id, (SELECT pg_catalog.string_agg(note, ',' ORDER BY id) FROM (SELECT 1) z, items WHERE org_key OPERATOR(pg_catalog.=) $1) AS note"
     ]
 
     exec!(c, "CREATE TEMP VIEW items AS SELECT id, 't1'::text AS org_key, note FROM items")
