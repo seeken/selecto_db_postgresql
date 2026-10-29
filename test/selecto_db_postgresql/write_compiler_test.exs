@@ -319,6 +319,26 @@ defmodule SelectoDBPostgreSQL.WriteCompilerTest do
              "INSERT INTO \"items\" (\"name\", \"account_id\") SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM \"accounts\" WHERE \"id\" = $3)"
   end
 
+  test "portable ISO dates become driver values only for domain-typed assignments and predicates" do
+    {:ok, command} =
+      Command.new(%{
+        operation: :update,
+        relation: :items,
+        assignments: [
+          %{field: :read_on, value: {:literal, "2026-10-29"}},
+          %{field: :label, value: {:literal, "2026-10-29"}}
+        ],
+        predicate: {:eq, {:field, :read_on}, {:literal, "2026-10-28"}},
+        metadata: %{field_types: %{"read_on" => :date, label: :string}}
+      })
+
+    assert {:ok, %{params: [~D[2026-10-29], "2026-10-29", ~D[2026-10-28]]}} =
+             SelectoDBPostgreSQL.WriteCompiler.compile(command, [])
+
+    bad = %{command | assignments: [%{field: :read_on, value: {:literal, "bad-date"}}]}
+    assert {:error, %Error{}} = SelectoDBPostgreSQL.WriteCompiler.compile(bad, [])
+  end
+
   defp command!(:insert, opts) do
     {:ok, command} =
       Command.new(%{

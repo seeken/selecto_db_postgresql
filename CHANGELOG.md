@@ -4,6 +4,10 @@ CHANGES
 Unreleased
 ----------
 
+- Bind domain-typed ISO temporal values as Postgrex date/time values in writes
+  and compare predicates. Date-shaped text fields remain text, and malformed
+  temporal literals fail compilation before dispatch.
+
 - Composite post-image keys use direct row comparisons so PostgreSQL infers
   each bound value from its key column. Empty returned key sets remain empty
   without an untyped NULL subquery; counted writes retain cardinality errors.

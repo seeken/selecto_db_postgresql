@@ -49,6 +49,44 @@ defmodule SelectoDBPostgreSQL.WriteProtocolIntegrationTest do
     end
   end
 
+  test "domain-typed portable temporal writes and compare predicates bind through Postgrex", %{
+    connection: connection
+  } do
+    execute!(
+      connection,
+      "CREATE TEMP TABLE selecto_temporal_write (id integer PRIMARY KEY, read_on date, observed_at timestamptz)"
+    )
+
+    {:ok, insert} =
+      Command.new(%{
+        operation: :insert,
+        relation: :selecto_temporal_write,
+        assignments: [
+          %{field: :id, value: {:literal, 1}},
+          %{field: :read_on, value: {:literal, "2026-10-28"}},
+          %{field: :observed_at, value: {:literal, "2026-10-28T10:00:00Z"}}
+        ],
+        metadata: %{field_types: %{read_on: :date, observed_at: :utc_datetime}}
+      })
+
+    assert {:ok, %{affected_rows: 1}} = Adapter.execute_write_unsafe(connection, insert)
+
+    {:ok, update} =
+      Command.new(%{
+        operation: :update,
+        relation: :selecto_temporal_write,
+        assignments: [%{field: :read_on, value: {:literal, "2026-10-29"}}],
+        predicate: {:eq, {:field, :read_on}, {:literal, "2026-10-28"}},
+        expected_cardinality: {:exactly, 1},
+        metadata: %{field_types: %{"read_on" => "date"}}
+      })
+
+    assert {:ok, %{affected_rows: 1}} = Adapter.execute_write_unsafe(connection, update)
+
+    assert {:ok, %{rows: [[~D[2026-10-29]]]}} =
+             Adapter.execute(connection, "SELECT read_on FROM selecto_temporal_write", [], [])
+  end
+
   defp assert_write_fault(connection, write, :execution_failed) do
     assert {:error,
             %Error{
