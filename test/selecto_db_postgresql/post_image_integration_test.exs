@@ -84,6 +84,58 @@ defmodule SelectoDBPostgreSQL.PostImageIntegrationTest do
   defp not_evaluable?(result),
     do: match?({:error, %Error{details: %{code: :query_rule_not_evaluable}}}, result)
 
+  test "composite post-image keys bind integer and text columns, including no returned rows", %{
+    connection: c
+  } do
+    exec!(
+      c,
+      "CREATE TABLE compound_key (tenant_id int NOT NULL, id int NOT NULL, token text NOT NULL, name text, UNIQUE (tenant_id, id, token))"
+    )
+
+    exec!(
+      c,
+      "INSERT INTO compound_key VALUES (7, 1, 'first', 'a'), (7, 2, 'second', 'b'), (8, 1, 'first', 'foreign')"
+    )
+
+    scope = {:eq, {:field, "tenant_id"}, {:literal, 7}}
+
+    command = fn predicate, expected ->
+      {:ok, value} =
+        Command.new(%{
+          operation: :update,
+          relation: "compound_key",
+          predicate: {:and, [scope, predicate]},
+          assignments: [%{field: "name", value: {:literal, "updated"}}],
+          expected_cardinality: {:exactly, expected},
+          metadata: %{post_image: %{predicate: scope, key: ["tenant_id", "id", "token"]}}
+        })
+
+      value
+    end
+
+    assert {:ok, %{affected_rows: 2}} =
+             Adapter.execute_write_unsafe(
+               c,
+               command.({:gt, {:field, "id"}, {:literal, 0}}, 2),
+               []
+             )
+
+    assert {:error, %Error{type: :cardinality_mismatch}} =
+             Adapter.execute_write_unsafe(
+               c,
+               command.({:eq, {:field, "id"}, {:literal, 999}}, 1),
+               []
+             )
+
+    assert {:ok, %{rows: [[7, 1, "updated"], [7, 2, "updated"], [8, 1, "foreign"]]}} =
+             Adapter.execute(
+               c,
+               "SELECT tenant_id, id, name FROM compound_key ORDER BY tenant_id, id",
+               [],
+               []
+             )
+  end
+
   test "an update that assigns the scoped column rolls back", %{connection: c} do
     assert violation?(Adapter.execute_write_unsafe(c, update([{"site", "S9"}], site("S1")), []))
     assert stored(c) == [[1, "T1", "S1", "a"]]

@@ -207,15 +207,13 @@ defmodule SelectoDBPostgreSQL.PostImage do
   defp untyped_text(list) when is_list(list), do: Enum.map(list, &untyped_text/1)
   defp untyped_text(value), do: value
 
-  # Single-column keys match `= ANY($n)`; composite keys a VALUES list.
+  # Direct row expressions let PostgreSQL infer each parameter from its key
+  # column. A VALUES subquery instead resolves unknown parameters as text.
   defp key_match([column], keys, first) do
     {"#{quote_identifier(column)} = ANY ($#{first})", [Enum.map(keys, &hd/1)]}
   end
 
-  defp key_match(columns, [], _first) do
-    {"(#{Enum.map_join(columns, ", ", &quote_identifier/1)}) IN (SELECT #{Enum.map_join(columns, ", ", fn _ -> "NULL" end)} WHERE false)",
-     []}
-  end
+  defp key_match(_columns, [], _first), do: {"false", []}
 
   defp key_match(columns, keys, first) do
     width = length(columns)
@@ -230,8 +228,7 @@ defmodule SelectoDBPostgreSQL.PostImage do
           end) <> ")"
       end)
 
-    {"(#{Enum.map_join(columns, ", ", &quote_identifier/1)}) IN (VALUES #{values})",
-     List.flatten(keys)}
+    {"(#{Enum.map_join(columns, ", ", &quote_identifier/1)}) IN (#{values})", List.flatten(keys)}
   end
 
   # tgtype bits: INSERT 4, UPDATE 16 (an upsert can fire either).
