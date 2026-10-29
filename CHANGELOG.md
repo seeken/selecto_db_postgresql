@@ -4,6 +4,10 @@ CHANGES
 Unreleased
 ----------
 
+- Composite post-image keys use direct row comparisons so PostgreSQL infers
+  each bound value from its key column. Empty returned key sets remain empty
+  without an untyped NULL subquery; counted writes retain cardinality errors.
+
 - A bound-scope INSERT, UPDATE or UPSERT without a post-image of its own (a
   graph descendant bound by an ancestor) runs the same contract as a
   bound-scope DELETE for its event: ROW EXCLUSIVE lock, statement-level
