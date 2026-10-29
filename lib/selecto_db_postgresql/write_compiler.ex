@@ -19,18 +19,30 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
 
   @spec compile(Command.t(), keyword()) ::
           {:ok, %{text: String.t(), params: [term()]}} | {:error, Error.t()}
-  def compile(%Command{operation: :insert} = command, opts), do: compile_insert(command, opts)
-  def compile(%Command{operation: :upsert} = command, opts), do: compile_upsert(command, opts)
-  def compile(%Command{operation: :update} = command, opts), do: compile_update(command, opts)
-  def compile(%Command{operation: :delete} = command, opts), do: compile_delete(command, opts)
+  def compile(%Command{} = command, opts) do
+    opts = Keyword.put(opts, :write_field_types, Map.get(command.metadata, :field_types, %{}))
 
-  def compile(%Command{operation: operation}, _opts) do
-    {:error,
-     Error.new(
-       :unsupported_operation,
-       "PostgreSQL adapter does not yet compile this write operation",
-       details: %{operation: operation}
-     )}
+    case command.operation do
+      :insert ->
+        compile_insert(command, opts)
+
+      :upsert ->
+        compile_upsert(command, opts)
+
+      :update ->
+        compile_update(command, opts)
+
+      :delete ->
+        compile_delete(command, opts)
+
+      operation ->
+        {:error,
+         Error.new(
+           :unsupported_operation,
+           "PostgreSQL adapter does not yet compile this write operation",
+           details: %{operation: operation}
+         )}
+    end
   end
 
   defp compile_insert(%Command{} = command, opts) do
@@ -145,7 +157,7 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     assignments
     |> Enum.reduce_while({:ok, [], 0}, fn %{field: field, value: value},
                                           {:ok, acc, next_offset} ->
-      case compile_value(value, opts, next_offset) do
+      case compile_field_value(field, value, opts, next_offset) do
         {:ok, %{text: text, params: params}} ->
           {:cont,
            {:ok,
@@ -267,7 +279,7 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
       when is_list(values) and values != [] do
     values
     |> Enum.reduce_while({:ok, [], [], offset}, fn value, {:ok, texts, params, next_offset} ->
-      case compile_value(value, opts, next_offset) do
+      case compile_field_value(field, value, opts, next_offset) do
         {:ok, compiled} ->
           {:cont,
            {:ok, [compiled.text | texts], params ++ compiled.params,
@@ -292,7 +304,7 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
 
   def compile_predicate({operator, {:field, field}, value}, opts, offset)
       when operator in [:eq, :neq, :gt, :gte, :lt, :lte] do
-    with {:ok, compiled_value} <- compile_value(value, opts, offset) do
+    with {:ok, compiled_value} <- compile_field_value(field, value, opts, offset) do
       operator_text = %{eq: "=", neq: "!=", gt: ">", gte: ">=", lt: "<", lte: "<="}[operator]
 
       {:ok,
@@ -342,6 +354,46 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
         error
     end
   end
+
+  defp compile_field_value(field, {:literal, value}, opts, offset) when is_binary(value) do
+    types = Keyword.get(opts, :write_field_types, %{})
+
+    type =
+      Enum.find_value(types, fn {key, type} ->
+        if to_string(key) == to_string(field), do: to_string(type)
+      end)
+
+    case temporal_value(type, value) do
+      {:ok, normalized} ->
+        compile_value({:literal, normalized}, opts, offset)
+
+      {:error, _} ->
+        {:error,
+         Error.new(:invalid_value, "invalid ISO temporal write value",
+           details: %{field: to_string(field), type: type}
+         )}
+    end
+  end
+
+  defp compile_field_value(_field, value, opts, offset), do: compile_value(value, opts, offset)
+
+  defp temporal_value("date", value), do: Date.from_iso8601(value)
+
+  defp temporal_value(type, value) when type in ["naive_datetime", "naive_datetime_usec"],
+    do: NaiveDateTime.from_iso8601(value)
+
+  defp temporal_value(type, value)
+       when type in ["utc_datetime", "utc_datetime_usec", "datetime", "timestamptz"] do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> {:ok, datetime}
+      other -> other
+    end
+  end
+
+  defp temporal_value(type, value) when type in ["time", "time_usec"],
+    do: Time.from_iso8601(value)
+
+  defp temporal_value(_type, value), do: {:ok, value}
 
   @doc false
   def compile_value(value, opts \\ [], offset \\ 0)
