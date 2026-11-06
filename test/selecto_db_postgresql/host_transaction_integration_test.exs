@@ -126,17 +126,134 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
              [["new"]]
   end
 
+  describe "a read keeps its relation locks to the host's end (R69)" do
+    setup ctx do
+      opts = Keyword.put(ConnectionOptions.options(), :pool_size, 1)
+      {:ok, other} = Adapter.connect(opts)
+      Process.unlink(other)
+      view = "selecto_host_v_#{System.unique_integer([:positive])}"
+      sql!(other, "SET lock_timeout = '150ms'")
+      sql!(other, "CREATE VIEW public.#{view} AS SELECT id, note FROM public.#{ctx.table}")
+
+      on_exit(fn ->
+        {:ok, d} = Adapter.connect(opts)
+        Adapter.execute(d, "DROP VIEW IF EXISTS public.#{view}", [], [])
+        GenServer.stop(d)
+      end)
+
+      %{other: other, view: view}
+    end
+
+    defp ddl_blocked?(other, table) do
+      statement =
+        "ALTER TABLE public.#{table} ADD COLUMN r69_#{System.unique_integer([:positive])} int"
+
+      match?(
+        {:error, %Postgrex.Error{postgres: %{code: :lock_not_available}}},
+        Adapter.execute(other, statement, [], [])
+      )
+    end
+
+    defp generated(conn, relation) do
+      Adapter.execute(conn, "SELECT id FROM #{relation}", [],
+        selecto_read: true,
+        selecto_generated: true,
+        selecto_qualified_relations: %{
+          SelectoDBPostgreSQL.RelationPath.path_key() => ["public"],
+          relation => ~s("public"."#{relation}")
+        }
+      )
+    end
+
+    test "generated reads, of a table and through a view", ctx do
+      for relation <- [ctx.table, ctx.view] do
+        {:ok, blocked?} =
+          Postgrex.transaction(ctx.connection, fn conn ->
+            assert {:ok, %{rows: [_, _]}} = generated(conn, relation)
+            ddl_blocked?(ctx.other, ctx.table)
+          end)
+
+        assert blocked?, relation
+      end
+    end
+
+    test "hand-built reads, of a table and through a view", ctx do
+      for relation <- [ctx.table, ctx.view] do
+        {:ok, blocked?} =
+          Postgrex.transaction(ctx.connection, fn conn ->
+            assert {:ok, %{rows: [_, _]}} =
+                     Adapter.execute(conn, "SELECT id FROM public.#{relation}", [],
+                       selecto_read: true
+                     )
+
+            ddl_blocked?(ctx.other, ctx.table)
+          end)
+
+        assert blocked?, relation
+      end
+    end
+
+    test "text that writes is not planned for a write lock, and refuses", ctx do
+      {:ok, locks} =
+        Postgrex.transaction(ctx.connection, fn conn ->
+          assert {:error, %{details: %{reason: :read_only_read}}} =
+                   Adapter.execute(
+                     conn,
+                     "WITH d AS (DELETE FROM public.#{ctx.table} RETURNING id) SELECT * FROM d",
+                     [],
+                     selecto_read: true
+                   )
+
+          Postgrex.query!(
+            conn,
+            "SELECT mode FROM pg_locks WHERE pid = pg_backend_pid() AND relation = 'public.#{ctx.table}'::regclass",
+            []
+          ).rows
+        end)
+
+      assert locks == []
+    end
+
+    test "a relation that cannot be read leaves the host's transaction alive", ctx do
+      {:ok, rows} =
+        Postgrex.transaction(ctx.connection, fn conn ->
+          assert {:error, %Postgrex.Error{postgres: %{code: :undefined_table}}} =
+                   Adapter.execute(conn, "SELECT 1 FROM public.selecto_no_such", [],
+                     selecto_read: true
+                   )
+
+          Postgrex.query!(conn, "SELECT 1", []).rows
+        end)
+
+      assert rows == [[1]]
+    end
+
+    test "a lock timeout taking them stands, and the host's transaction lives", ctx do
+      sql!(ctx.other, "BEGIN")
+      sql!(ctx.other, "LOCK TABLE public.#{ctx.table} IN ACCESS EXCLUSIVE MODE")
+
+      {:ok, rows} =
+        Postgrex.transaction(ctx.connection, fn conn ->
+          Postgrex.query!(conn, "SET LOCAL lock_timeout = '100ms'", [])
+
+          assert {:error, %Postgrex.Error{postgres: %{code: :lock_not_available}}} =
+                   generated(conn, ctx.table)
+
+          Postgrex.query!(conn, "SELECT 1", []).rows
+        end)
+
+      sql!(ctx.other, "ROLLBACK")
+      assert rows == [[1]]
+    end
+  end
+
   test "a stream refuses inside the host's transaction, which goes on", ctx do
     c = ctx.connection
     [[backend]] = sql!(c, "SELECT pg_backend_pid()")
     sql!(c, "BEGIN")
 
-    {:ok, stream} =
-      Adapter.stream(c, "SELECT id FROM public.#{ctx.table}", [], selecto_read: true)
-
-    assert_raise RuntimeError, ~r/cannot stream inside the host's transaction/, fn ->
-      Enum.to_list(stream)
-    end
+    assert {:error, %Selecto.Error{details: %{reason: :stream_in_transaction}}} =
+             Adapter.stream(c, "SELECT id FROM public.#{ctx.table}", [], selecto_read: true)
 
     sql!(c, "INSERT INTO public.#{ctx.table} VALUES (9, 't1', 'host')")
     assert sql!(c, "SELECT pg_backend_pid()") == [[backend]]
@@ -228,12 +345,12 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
     end
 
     defp enc_stream(c, table) do
-      {:ok, stream} =
-        Adapter.stream(c, "SELECT id, note FROM public.#{table} WHERE org = $1", ["café"],
-          selecto_read: true
-        )
-
-      Enum.to_list(stream)
+      with {:ok, stream} <-
+             Adapter.stream(c, "SELECT id, note FROM public.#{table} WHERE org = $1", ["café"],
+               selecto_read: true
+             ) do
+        Enum.to_list(stream)
+      end
     end
 
     defp notes(c, table), do: sql!(c, "SELECT note FROM public.#{table} ORDER BY id")
@@ -251,7 +368,7 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       sql!(c, "SELECT pg_catalog.set_config('client_encoding', 'LATIN1', false)")
 
       assert {:error, %{details: %{reason: :client_encoding}}} = enc_read(c, ctx.enc)
-      assert_raise RuntimeError, ~r/client_encoding/, fn -> enc_stream(c, ctx.enc) end
+      assert {:error, %{details: %{reason: :client_encoding}}} = enc_stream(c, ctx.enc)
       assert {:error, %{details: %{reason: :client_encoding}}} = enc_write(c, ctx.enc, "w")
 
       sql!(c, "SELECT pg_catalog.set_config('client_encoding', 'UTF8', false)")
@@ -268,7 +385,7 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       Process.unlink(c)
 
       assert {:error, %{details: %{reason: :client_encoding}}} = enc_read(c, ctx.enc)
-      assert_raise RuntimeError, ~r/client_encoding/, fn -> enc_stream(c, ctx.enc) end
+      assert {:error, %{details: %{reason: :client_encoding}}} = enc_stream(c, ctx.enc)
       assert {:error, %{details: %{reason: :client_encoding}}} = enc_write(c, ctx.enc, "w")
       GenServer.stop(c)
     end
@@ -343,12 +460,13 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       assert {:ok, %{rows: [["CTE"]]}} =
                Adapter.execute(ctx.connection, search, [], selecto_read: true)
 
-      # CYCLE's USING reads as a relation position: refused, never the table.
+      # Hand-built text is the server's to read (R68): its CTE, never the table.
       cycle =
         "WITH RECURSIVE #{body} CYCLE n SET is_c USING p, #{r} AS (SELECT 'CTE' AS v) " <>
           "SELECT v FROM #{r}"
 
-      assert {:error, _} = Adapter.execute(ctx.connection, cycle, [], selecto_read: true)
+      assert {:ok, %{rows: [["CTE"]]}} =
+               Adapter.execute(ctx.connection, cycle, [], selecto_read: true)
     end
 
     test "a WITH list that cannot be read refuses, with no extension type", ctx do

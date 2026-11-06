@@ -331,8 +331,7 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
       |> Selecto.select(["id", "note"])
       |> Selecto.execute_stream()
 
-    assert {:ok, rows} = stream
-    assert_raise RuntimeError, ~r/changed the session/, fn -> Enum.to_list(rows) end
+    assert read_code(stream) == :session_state_changed
     assert rows!(c, "SELECT pg_catalog.current_setting('search_path')") == [[schema]]
   end
 

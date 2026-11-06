@@ -101,12 +101,18 @@ defmodule SelectoDBPostgreSQL.UnnamedStatementTest do
         assert DBConnection.run(c, &DBConnection.status/1) == :idle
       end
 
-      for sql <- ["COMMIT", "ROLLBACK", "BEGIN", "SAVEPOINT q", "SELECT 1; SELECT 2"] do
-        assert {:error, %{details: %{reason: :sql_unqualifiable}}} =
+      for sql <- ["COMMIT", "ROLLBACK", "BEGIN", "SAVEPOINT q"] do
+        assert {:error, %{details: %{reason: :hand_built_not_a_read}}} =
                  Adapter.execute(c, sql, [], selecto_read: true)
 
         assert DBConnection.run(c, &DBConnection.status/1) == :idle
       end
+
+      # One statement is the extended protocol's own rule.
+      assert {:error, %Postgrex.Error{postgres: %{code: :syntax_error}}} =
+               Adapter.execute(c, "SELECT 1; SELECT 2", [], selecto_read: true)
+
+      assert DBConnection.run(c, &DBConnection.status/1) == :idle
 
       assert {:ok, %{rows: [[1]]}} = Adapter.execute(c, "SELECT 1;", [], selecto_read: true)
     end

@@ -570,8 +570,18 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
 
       assert %{rows: [["after"]]} = exec!(c, "SELECT note FROM #{schema}.ro")
 
-      # A row lock cannot be taken read-only: such a read stays writable.
+      # A generated row lock cannot be taken read-only: such a read stays writable.
       assert {:ok, %{rows: [[1]]}} =
+               Adapter.execute(c, "SELECT id FROM #{schema}.ro FOR SHARE", [],
+                 selecto_read: true,
+                 selecto_generated: true,
+                 selecto_qualified_relations: %{
+                   SelectoDBPostgreSQL.RelationPath.path_key() => ["public"]
+                 }
+               )
+
+      # Hand-built text always is read-only: only that stops it writing.
+      assert {:error, %{details: %{reason: :read_only_read}}} =
                Adapter.execute(c, "SELECT id FROM #{schema}.ro FOR SHARE", [], selecto_read: true)
     after
       exec!(c, "DROP SCHEMA #{schema} CASCADE")

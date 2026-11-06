@@ -4,9 +4,21 @@ CHANGES
 Unreleased
 ----------
 
-- Text is hand-built unless Selecto's executor stamped it `selecto_generated`.
-  A rewrite of hand-built text that PostgreSQL cannot parse refuses
-  `:sql_unprovable`.
+- Hand-built reads run exactly as written (R68): no qualification, rewriting or
+  catalog proof, and `:sql_unprovable` and the statement size bound on them are
+  gone. Text is hand-built unless Selecto's executor stamped it
+  `selecto_generated`, and a compile carrying raw text keeps only its domain's
+  relation names. It must be a read by its first word
+  (`:hand_built_not_a_read`) and always runs READ ONLY, so hand-built writes,
+  `FOR UPDATE` included, refuse `:read_only_read`. A relation or function that
+  does not resolve is the driver's error, not a Selecto refusal.
+- A read in a host transaction takes its relation locks before its savepoint, so
+  they last to the host's commit, for tables and views alike (R69).
+- `stream/4` of a Selecto read opens at the call: a refusal or a failed first
+  fetch is returned, not raised on enumeration. A stream left unenumerated gives
+  its connection back after `:receive_timeout`.
+- A write whose RELEASE SAVEPOINT fails goes back to the savepoint, or reports the
+  connection broken (R70).
 - Generated SQL: citext against `websearch_to_tsquery` and the like resolves to
   pg_catalog's text `@@`; a column through a `SELECT *` CTE (materialized-path
   joins) keeps its type; `upper(citext)` and two bare literals under NULLIF are
@@ -15,17 +27,14 @@ Unreleased
   is what the caller is told, never `relation_unresolved` or
   `session_state_unavailable`.
 
-- Hand-built SQL and raw text inside a generated read are no longer typed: one
-  touching an extension type through a cast, subscript, COALESCE, CASE, GREATEST,
-  LEAST, NULLIF, subquery or set operation refuses `:sql_unprovable`; builders
-  mark any statement carrying text they did not generate, and it counts as
-  hand-built whole. CTE names are read from tokens, SEARCH and CYCLE included,
-  and a WITH list that cannot be read refuses, on every statement. NULLIF's
-  result is coerced to the type its equality took; a volatile first operand of
-  NULLIF or a simple CASE refuses `:volatile_operand`. Hand-built text beyond
-  2 MiB or 50,000 tokens refuses `:statement_too_large`, as does anything
-  rendering past 4 MiB or eight times its size. CASE, COALESCE, GREATEST and
-  LEAST take PostgreSQL's common type where it can be named.
+- Builders mark any statement carrying text they did not generate, and it counts
+  as hand-built whole. CTE names are read from tokens, SEARCH and CYCLE included,
+  and a WITH list that cannot be read refuses, on every generated statement.
+  NULLIF's result is coerced to the type its equality took; a volatile first
+  operand of NULLIF or a simple CASE refuses `:volatile_operand`. Anything
+  rendering past 4 MiB or eight times its size refuses `:statement_too_large`.
+  CASE, COALESCE, GREATEST and LEAST take PostgreSQL's common type where it can
+  be named.
   client_encoding is read by `pg_client_encoding()`, so UNICODE counts as UTF8.
 - Every statement runs unnamed, whatever the configuration (R63): code a
   statement reaches could DEALLOCATE and PREPARE a named one, and the driver

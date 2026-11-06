@@ -268,11 +268,9 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   WHERE c.castcontext #{@op} 'i'
   """
 
-  # M6: a hard limit on hand-built text, refused typed. A generated statement
-  # has its filters bounded where they compile, and what renders is bounded
-  # relative to what came in: rewrites write some operands twice.
-  @max_statement_bytes 2_097_152
-  @max_statement_tokens 50_000
+  # A generated statement has its filters bounded where they compile, and what
+  # renders is bounded relative to what came in: rewrites write some operands
+  # twice.
   @max_rendered_bytes 4_194_304
 
   @doc false
@@ -289,19 +287,12 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     execute = standing(execute)
 
     try do
-      hand_built? = Keyword.get(opts, :hand_built) == true
-      tokens = if hand_built?, do: sized_tokens(sql), else: Qualify.tokenize(sql)
+      tokens = Qualify.tokenize(sql)
       opts = Keyword.put(opts, :bytes, byte_size(sql))
       one_statement!(tokens)
       if Keyword.get(opts, :read) == true, do: read_statement!(tokens)
 
       cond do
-        Keyword.get(opts, :hand_built) == true and not Qualify.rewrite?(tokens) ->
-          with {:ok, facts} <- facts(execute, tokens) do
-            Qualify.prove!(tokens, facts)
-            {:ok, sql}
-          end
-
         Qualify.rewrite?(tokens) ->
           rewrite(execute, tokens, opts)
 
@@ -327,30 +318,52 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   end
 
   @doc """
-  `:ok`, or the typed refusal of a statement beyond the bound: checked before
-  a read spends anything on it.
+  `:ok` when hand-built text is a read by its first word (SELECT, WITH, VALUES,
+  TABLE, past comments and opening parentheses), or the typed refusal (R68).
+
+  This is all Selecto asks of hand-built text. Nothing else here reads it: the
+  statement runs as written, in a READ ONLY transaction that refuses what it
+  would write. The word is what stops COMMIT or ROLLBACK ending that
+  transaction; the driver's extended protocol takes one statement, so nothing
+  can follow it. Comments nest, as they do on the server.
   """
-  def bounded(sql) do
-    _tokens = sql |> IO.iodata_to_binary() |> sized_tokens()
-    :ok
-  catch
-    {:qualify_refuse, :statement_too_large, message} -> refuse(:statement_too_large, message)
-    {:qualify_refuse, _reason, _message} -> :ok
+  def hand_built_read(sql) do
+    word = sql |> IO.iodata_to_binary() |> first_word()
+
+    if word != nil and String.upcase(word) in ~w(SELECT WITH VALUES TABLE),
+      do: :ok,
+      else: refuse(:hand_built_not_a_read, "hand-built SQL on a read path must be a read")
   end
 
-  defp sized_tokens(sql) do
-    if byte_size(sql) > @max_statement_bytes, do: too_large!()
-    tokens = Qualify.tokenize(sql)
-    if length(tokens) > @max_statement_tokens, do: too_large!()
-    tokens
+  defp first_word(<<c, rest::binary>>) when c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v, ?(],
+    do: first_word(rest)
+
+  defp first_word(<<"--", rest::binary>>) do
+    case :binary.match(rest, ["\n", "\r"]) do
+      {at, 1} -> rest |> binary_part(at, byte_size(rest) - at) |> first_word()
+      :nomatch -> nil
+    end
   end
 
-  defp too_large!,
-    do:
-      throw(
-        {:qualify_refuse, :statement_too_large,
-         "a statement beyond the size Selecto will qualify; split it"}
-      )
+  defp first_word(<<"/*", rest::binary>>) do
+    case past_comment(rest, 1) do
+      nil -> nil
+      tail -> first_word(tail)
+    end
+  end
+
+  defp first_word(text) do
+    case Regex.run(~r/\A[A-Za-z]+(?![A-Za-z0-9_$])/, text) do
+      [word] -> word
+      nil -> nil
+    end
+  end
+
+  defp past_comment(rest, 0), do: rest
+  defp past_comment(<<>>, _depth), do: nil
+  defp past_comment(<<"/*", rest::binary>>, depth), do: past_comment(rest, depth + 1)
+  defp past_comment(<<"*/", rest::binary>>, depth), do: past_comment(rest, depth - 1)
+  defp past_comment(<<_c, rest::binary>>, depth), do: past_comment(rest, depth)
 
   # Only the last token may be a semicolon: Selecto generates one statement,
   # and what follows a semicolon would run past every check of the first.
@@ -374,7 +387,6 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   defp rewrite(execute, tokens, opts) do
     with {:ok, facts} <- facts(execute, tokens) do
       facts = Map.put(facts, :declared_functions, Keyword.get(opts, :declared_functions, []))
-      if Keyword.get(opts, :hand_built) == true, do: Qualify.prove!(tokens, facts)
 
       facts =
         Map.put(facts, :max_rendered, max(@max_rendered_bytes, 8 * Keyword.fetch!(opts, :bytes)))

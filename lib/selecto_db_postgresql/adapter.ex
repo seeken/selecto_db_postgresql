@@ -320,15 +320,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # entry point that skipped prepare_read) resolves the relations its own
   # text names, with the same rules.
   defp qualify_read(connection, query, opts) do
-    with :ok <- hand_built_bound(query, opts) do
-      resolve_read(connection, query, opts)
-    else
-      {:error, %Error{} = error} -> {:error, read_refusal(error)}
-    end
+    if hand_built?(opts),
+      do: hand_built_read(connection, query, opts),
+      else: generated_read(query, opts)
   end
-
-  defp hand_built_bound(query, opts),
-    do: if(hand_built?(opts), do: ExplicitSQL.bounded(query), else: :ok)
 
   # Text is hand-built unless Selecto's executor stamped it generated: the
   # compile saw no mark, and it named the statement's relations.
@@ -338,43 +333,72 @@ defmodule SelectoDBPostgreSQL.Adapter do
       not is_map(Keyword.get(opts, :selecto_qualified_relations))
   end
 
-  defp resolve_read(connection, query, opts) do
-    relations =
-      case Keyword.get(opts, :selecto_qualified_relations) do
-        relations when is_map(relations) ->
-          {:ok, relations}
+  defp generated_read(query, opts) do
+    case RelationPath.qualify(query, Keyword.fetch!(opts, :selecto_qualified_relations)) do
+      {:ok, query} -> {:ok, query, Keyword.put(opts, :selecto_hand_built, false)}
+      {:error, %Error{} = error} -> {:error, read_refusal(error)}
+    end
+  end
 
-        _ ->
-          # R42 FINAL: hand-built SQL refuses while any temp relation exists,
-          # unless it names pg_temp itself.
-          with {:ok, relations} <- resolve_all(connection, RelationPath.names(query)) do
-            if RelationPath.hand_built_allowed?(relations, IO.iodata_to_binary(query)),
-              do: {:ok, relations},
-              else:
-                {:error,
-                 Error.new(
-                   :query_enforcement,
-                   "PostgreSQL refuses a statement without a relation list while temporary relations exist",
-                   details: %{
-                     code: :query_rule_not_evaluable,
-                     reason: :temporary_relations,
-                     adapter: :postgresql
-                   }
-                 )}
-          end
-      end
-
-    hand_built? = hand_built?(opts)
-
-    with {:ok, relations} <- relations,
-         {:ok, query} <- RelationPath.qualify(query, relations) do
+  # R68: hand-built text runs exactly as written. Nothing types, proves or
+  # rewrites it, so its answers are the driver's; it runs in a READ ONLY
+  # transaction that refuses what it would write, under the session pin and
+  # guards every read has. A compile carrying raw text keeps the names its
+  # domain gave its relations (a domain's `source_schema` is not in the text),
+  # and nothing else of it changes.
+  defp hand_built_read(connection, query, opts) do
+    with :ok <- ExplicitSQL.hand_built_read(query),
+         {:ok, query, relations} <- hand_built_relations(connection, query, opts) do
       {:ok, query,
        opts
        |> Keyword.put(:selecto_qualified_relations, relations)
-       |> Keyword.put(:selecto_hand_built, hand_built?)}
+       |> Keyword.put(:selecto_hand_built, true)}
     else
       {:error, %Error{} = error} -> {:error, read_refusal(error)}
       {:error, _} = error -> error
+    end
+  end
+
+  defp hand_built_relations(connection, query, opts) do
+    case Keyword.get(opts, :selecto_qualified_relations) do
+      relations when is_map(relations) ->
+        with {:ok, query} <- RelationPath.qualify(query, relations) do
+          {:ok, query, relations}
+        end
+
+      _no_list ->
+        with {:ok, relations} <- session_relations(connection, query) do
+          {:ok, query, relations}
+        end
+    end
+  end
+
+  # R42 FINAL: with no relation list, the session's temporary relations and
+  # search_path are what could give this text another answer than the driver's.
+  defp session_relations(connection, query) do
+    names = RelationPath.names(query)
+
+    with_checkout(connection, fn guard, in_transaction? ->
+      RelationPath.session(guard, names, in_transaction?)
+    end)
+    |> case do
+      {:ok, relations} ->
+        if RelationPath.hand_built_allowed?(relations, IO.iodata_to_binary(query)),
+          do: {:ok, relations},
+          else:
+            {:error,
+             Error.new(
+               :query_enforcement,
+               "PostgreSQL refuses a statement without a relation list while temporary relations exist",
+               details: %{
+                 code: :query_rule_not_evaluable,
+                 reason: :temporary_relations,
+                 adapter: :postgresql
+               }
+             )}
+
+      other ->
+        other
     end
   end
 
@@ -654,11 +678,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # failure or a refusal rolls back every setting the statement changed.
   #
   # A read is READ ONLY (transaction_read_only pinned with the rest), so a
-  # function it reaches cannot write through it; a row-locking read cannot
-  # be. In a host transaction the setting outlives RELEASE, so a read-only
+  # function it reaches cannot write through it; a generated row-locking read
+  # cannot be. Hand-built text always is: only that stops it writing, so the
+  # read_only_reads setting does not reach it. In a host transaction the setting outlives RELEASE, so a read-only
   # savepoint always ends by ROLLBACK TO: it changed nothing to keep.
   defp run_guarded_read(execute, guard, in_transaction?, query, params, plan) do
-    read_only? = read_only?(query)
+    read_only? = plan.hand_built or read_only?(query)
 
     {open, close, undo} =
       if in_transaction? do
@@ -675,38 +700,114 @@ defmodule SelectoDBPostgreSQL.Adapter do
     close = Enum.map(close, &SessionGuard.control/1)
     undo = Enum.map(undo, &SessionGuard.control/1)
 
-    case guard.(open, []) do
-      {:ok, _} ->
-        with {:ok, before, pinned} <-
-               read_step(
-                 SessionGuard.open_read(guard, normalize_query(query), plan.path,
-                   read_only: read_only?
-                 )
-               ),
-             :ok <- read_step(RelationPath.qualified(query)),
-             {:ok, query} <-
-               read_step(
-                 ExplicitSQL.prepare(guard, query,
-                   read: true,
-                   isolation: pinned.isolation,
-                   declared_functions: plan.declared_functions,
-                   hand_built: plan.hand_built
-                 )
-               ),
-             {:ok, result} <- read_result(execute.(plan.prefix <> query, params), plan.hand_built),
-             :ok <- read_step(SessionGuard.close(guard, before, pinned)),
-             :ok <- run_all(guard, close) do
-          {:ok, result}
-        else
-          error ->
-            # The original stands: a read kept nothing, and what failed it
-            # (a timeout) is why the undo cannot run either.
-            _ = run_all(guard, undo)
-            error
-        end
+    with :ok <- hold_relations(guard, in_transaction? and read_only?, query, params, plan),
+         {:ok, _} <- guard.(open, []) do
+      with {:ok, before, pinned} <-
+             read_step(
+               SessionGuard.open_read(guard, normalize_query(query), plan.path,
+                 read_only: read_only?
+               )
+             ),
+           {:ok, query} <- read_statement(guard, query, pinned, plan),
+           {:ok, result} <- read_result(execute.(plan.prefix <> query, params), plan.hand_built),
+           :ok <- read_step(SessionGuard.close(guard, before, pinned)),
+           :ok <- run_all(guard, close) do
+        {:ok, result}
+      else
+        error ->
+          # The original stands: a read kept nothing, and what failed it
+          # (a timeout) is why the undo cannot run either.
+          _ = run_all(guard, undo)
+          error
+      end
+    end
+  end
 
-      {:error, _} = error ->
-        error
+  # The text a read sends: hand-built text as written (R68), generated text
+  # with every relation qualified and every operator and function explicit.
+  defp read_statement(_guard, query, _pinned, %{hand_built: true, prefix: prefix}) do
+    text = IO.iodata_to_binary(query)
+    _ = SQLRecorder.host(prefix <> text)
+    {:ok, text}
+  end
+
+  defp read_statement(guard, query, pinned, plan) do
+    with :ok <- read_step(RelationPath.qualified(query)) do
+      read_step(
+        ExplicitSQL.prepare(guard, query,
+          read: true,
+          isolation: pinned.isolation,
+          declared_functions: plan.declared_functions
+        )
+      )
+    end
+  end
+
+  # R69: a read-only read in a host transaction ends by ROLLBACK TO, which
+  # releases what it locked, so a concurrent ALTER or DROP could slip in before
+  # the host's next statement. The relations it reads are locked here, before
+  # its savepoint, so they stay locked to the host's commit, as the host's own
+  # SELECT would hold them. Parsing is what takes them, views' base relations
+  # included: LIMIT 0 runs nothing a view calls, and hand-built text is planned
+  # and not run. Not text that says it writes: EXPLAIN would lock it for writing
+  # and the read is about to refuse. This is also the transaction's first
+  # snapshot, before any read-only mode (R66(a)).
+  #
+  # A relation that is missing or not readable is the read's to report, so a
+  # savepoint of its own keeps that from the host. Anything else, a cancel or a
+  # lock timeout, stands.
+  defp hold_relations(_guard, false, _query, _params, _plan), do: :ok
+
+  defp hold_relations(guard, true, query, params, plan) do
+    case hold_statement(query, params, plan) do
+      nil ->
+        :ok
+
+      {sql, params} ->
+        name = "selecto_hold_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
+
+        with {:ok, _} <- guard.(SessionGuard.control("SAVEPOINT " <> name), []) do
+          held = guard.(sql, params)
+          release = SessionGuard.control("RELEASE SAVEPOINT " <> name)
+          undo = [SessionGuard.control("ROLLBACK TO SAVEPOINT " <> name), release]
+
+          case held do
+            {:ok, _} ->
+              with {:ok, _} <- guard.(release, []), do: :ok
+
+            {:error, %Postgrex.Error{postgres: %{pg_code: "42" <> _}}} ->
+              run_all(guard, undo)
+
+            {:error, _} = error ->
+              _ = run_all(guard, undo)
+              error
+          end
+        end
+    end
+  end
+
+  defp hold_statement(query, params, %{hand_built: true}) do
+    text = IO.iodata_to_binary(query)
+
+    unless RelationPath.names_write?(text) do
+      {SQLRecorder.host("EXPLAIN (COSTS OFF) " <> text), params}
+    end
+  end
+
+  defp hold_statement(query, _params, _plan) do
+    case RelationPath.qualified_refs(query) do
+      [] ->
+        nil
+
+      relations ->
+        selects =
+          relations
+          |> Enum.with_index()
+          |> Enum.map_join(", ", fn {relation, index} ->
+            "(SELECT 1 FROM #{relation} LIMIT 0) AS selecto_guard_hold_#{index}"
+          end)
+
+        {"SELECT " <> selects, []}
     end
   end
 
@@ -723,34 +824,27 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp read_only_setting_valid?,
     do: Application.get_env(:selecto_db_postgresql, :read_only_reads, true) in [true, false]
 
-  # Text that cannot be read as SQL refuses later, in ExplicitSQL.
+  # Text that cannot be read as SQL refuses later, in ExplicitSQL. Hand-built
+  # text never gets here: it is always read-only, its writes refuse by that.
   defp row_lock?(query) do
     query |> SelectoDBPostgreSQL.Qualify.tokenize() |> SelectoDBPostgreSQL.Qualify.row_lock?()
   catch
     {:qualify_refuse, _reason, _message} -> false
   end
 
-  # No operator or function for the operands (an extension type without a
-  # member for that operator): typed, like every other refusal of this step.
-  # Hand-built text a rewrite could not keep valid: typed, like the rest.
-  defp read_result({:error, %Postgrex.Error{postgres: %{code: :syntax_error}}}, true),
-    do: {:error, read_refusal(unwritable())}
-
-  defp read_result(result, _hand_built?), do: read_result(result)
-
-  defp read_result({:error, %Postgrex.Error{postgres: %{code: :undefined_function}}}),
-    do: {:error, read_refusal(no_operator())}
-
-  defp read_result({:error, %Postgrex.Error{postgres: %{code: :read_only_sql_transaction}}}),
+  # A read that wrote refuses, typed. Whatever else hand-built text fails with
+  # is the driver's answer, as written.
+  defp read_result({:error, %Postgrex.Error{postgres: %{code: :read_only_sql_transaction}}}, _),
     do: {:error, read_refusal(read_wrote())}
 
-  defp read_result(result), do: result
+  defp read_result(result, true), do: result
 
-  defp unwritable do
-    Error.new(:query_enforcement, "PostgreSQL refuses hand-built SQL it cannot prove",
-      details: %{code: :query_rule_not_evaluable, reason: :sql_unprovable, adapter: :postgresql}
-    )
-  end
+  # No operator or function for the operands (an extension type without a
+  # member for that operator): typed, like every other refusal of this step.
+  defp read_result({:error, %Postgrex.Error{postgres: %{code: :undefined_function}}}, false),
+    do: {:error, read_refusal(no_operator())}
+
+  defp read_result(result, false), do: result
 
   defp read_wrote do
     Error.new(:query_enforcement, "PostgreSQL refuses a read that tried to write",
@@ -2601,20 +2695,20 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp open_stream({:pool, pool_ref}, query, params, opts) do
     case resolve_stream_pool_connection(pool_ref) do
-      {:ok, pool_conn} -> {:ok, build_postgrex_cursor_stream(pool_conn, query, params, opts)}
+      {:ok, pool_conn} -> build_postgrex_cursor_stream(pool_conn, query, params, opts)
       {:error, details} -> {:error, {:invalid_stream_pool, details}}
     end
   end
 
   defp open_stream(conn, query, params, opts) when is_pid(conn) do
     if Process.alive?(conn),
-      do: {:ok, build_postgrex_cursor_stream(conn, query, params, opts)},
+      do: build_postgrex_cursor_stream(conn, query, params, opts),
       else: {:error, {:invalid_connection, conn}}
   end
 
   defp open_stream(conn, query, params, opts) when is_atom(conn) and not is_nil(conn) do
     if valid_named_connection?(conn),
-      do: {:ok, build_postgrex_cursor_stream(conn, query, params, opts)},
+      do: build_postgrex_cursor_stream(conn, query, params, opts),
       else: {:error, {:invalid_connection, conn}}
   end
 
@@ -3776,7 +3870,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
     )
   end
 
-  defp with_savepoint(query, fun) do
+  @doc false
+  # R70: a write reported failed must not stay in the host's transaction. A
+  # failed RELEASE goes back to the savepoint like any other failed write; if
+  # that fails too, the transaction is marked broken.
+  def with_savepoint(query, fun) do
     name = "selecto_write_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
 
     case query.("SAVEPOINT #{name}") do
@@ -3792,21 +3890,28 @@ defmodule SelectoDBPostgreSQL.Adapter do
         case result do
           {:ok, _} = ok ->
             case query.("RELEASE SAVEPOINT #{name}") do
-              {:ok, _} -> ok
-              {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
+              {:ok, _} ->
+                ok
+
+              {:error, reason} ->
+                undo_savepoint(query, name, {:error, write_error(:transaction_failed, reason)})
             end
 
           error ->
-            with {:ok, _} <- query.("ROLLBACK TO SAVEPOINT #{name}"),
-                 {:ok, _} <- query.("RELEASE SAVEPOINT #{name}") do
-              error
-            else
-              _failed -> broken(error)
-            end
+            undo_savepoint(query, name, error)
         end
 
       {:error, reason} ->
         {:error, write_error(:transaction_failed, reason)}
+    end
+  end
+
+  defp undo_savepoint(query, name, error) do
+    with {:ok, _} <- query.("ROLLBACK TO SAVEPOINT #{name}"),
+         {:ok, _} <- query.("RELEASE SAVEPOINT #{name}") do
+      error
+    else
+      _failed -> broken(error)
     end
   end
 
@@ -4048,6 +4153,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
     }
   end
 
+  # As read_statement/4 for a read.
+  defp stream_statement(_check, query, _pinned, true, _opts),
+    do: {:ok, SQLRecorder.host(query)}
+
+  defp stream_statement(check, query, pinned, false, opts) do
+    with :ok <- RelationPath.qualified(query) do
+      ExplicitSQL.prepare(check, query,
+        isolation: pinned.isolation,
+        declared_functions: Keyword.get(opts, :selecto_declared_functions, [])
+      )
+    end
+  end
+
   defp build_postgrex_cursor_stream(conn, query, params, opts) do
     query = normalize_query(query)
     max_rows = Keyword.get(opts, :max_rows, 500)
@@ -4076,16 +4194,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
           # is compared with the pin expected in place.
           {before, pinned, query} =
             if guarded? do
-              with :ok <- RelationPath.qualified(query),
-                   {:ok, before} <- SessionGuard.check(check, query),
+              hand_built? = Keyword.get(opts, :selecto_hand_built, false)
+
+              with {:ok, before} <- SessionGuard.check(check, query),
                    {:ok, pinned} <-
-                     SessionGuard.pin(check, read_path(opts), read_only: read_only?(query)),
-                   {:ok, prepared} <-
-                     ExplicitSQL.prepare(check, query,
-                       isolation: pinned.isolation,
-                       declared_functions: Keyword.get(opts, :selecto_declared_functions, []),
-                       hand_built: Keyword.get(opts, :selecto_hand_built, false)
-                     ) do
+                     SessionGuard.pin(check, read_path(opts),
+                       read_only: hand_built? or read_only?(query)
+                     ),
+                   {:ok, prepared} <- stream_statement(check, query, pinned, hand_built?, opts) do
                 {before, pinned, prepared}
               else
                 error -> refuse.(error)
@@ -4109,17 +4225,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
             end)
           rescue
             error in Postgrex.Error ->
-              cond do
-                match?(%{postgres: %{code: :read_only_sql_transaction}}, error) ->
-                  refuse.({:error, read_wrote()})
-
-                match?(%{postgres: %{code: :syntax_error}}, error) and
-                    Keyword.get(opts, :selecto_hand_built, false) ->
-                  refuse.({:error, unwritable()})
-
-                true ->
-                  reraise(error, __STACKTRACE__)
-              end
+              if match?(%{postgres: %{code: :read_only_sql_transaction}}, error),
+                do: refuse.({:error, read_wrote()}),
+                else: reraise(error, __STACKTRACE__)
           end
 
           if guarded? do
@@ -4131,69 +4239,131 @@ defmodule SelectoDBPostgreSQL.Adapter do
         end)
       end)
 
-    Stream.resource(
-      fn ->
-        parent = self()
-        ref = make_ref()
+    # A Selecto read opens at the call, so a refusal, or a failure of the first
+    # fetch, is what the call returns. A host's own stream stays lazy.
+    at_call? =
+      Keyword.get(opts, :selecto_session_guard) == true and
+        not Keyword.has_key?(opts, :stream_producer)
 
-        task =
-          Selecto.TaskSupervisor.async(fn ->
-            run_stream_producer(parent, ref, producer)
-          end)
+    open = fn ->
+      parent = self()
+      ref = make_ref()
+      unstarted = if at_call?, do: receive_timeout, else: :infinity
 
-        %{task: task, ref: ref, monitor_ref: task.ref, awaiting_ack?: false}
-      end,
-      fn state ->
-        state = acknowledge_stream_chunk(state)
-        ref = state.ref
-        monitor_ref = state.monitor_ref
+      task =
+        Selecto.TaskSupervisor.async(fn ->
+          run_stream_producer(parent, ref, producer, unstarted)
+        end)
 
-        receive do
-          {^ref, {:chunk, rows, columns}} ->
-            stream_rows = Enum.map(rows, &{&1, columns || []})
-            {stream_rows, %{state | awaiting_ack?: true}}
+      %{task: task, ref: ref, monitor_ref: task.ref, awaiting_ack?: false, pending: nil}
+    end
 
-          {^ref, {:done, {:ok, _}}} ->
-            {:halt, state}
+    resource = fn start ->
+      Stream.resource(
+        start,
+        &next_stream_rows(&1, receive_timeout),
+        &stop_stream_producer(&1, queue_timeout)
+      )
+    end
 
-          {^ref, {:done, {:error, %Selecto.Error{} = refusal}}} ->
-            raise Selecto.Error.to_exception(refusal)
+    if at_call? do
+      state = open.()
 
-          {^ref, {:done, {:error, reason}}} ->
-            raise "PostgreSQL stream transaction failed: #{inspect(reason)}"
+      case first_stream_rows(state, receive_timeout) do
+        {:rows, rows, state} ->
+          {:ok, resource.(fn -> %{state | pending: rows} end)}
 
-          {^ref, {:producer_failed, reason}} ->
-            raise "PostgreSQL stream producer failed: #{inspect(reason)}"
+        {:halt, state} ->
+          stop_stream_producer(state, queue_timeout)
+          {:ok, []}
 
-          {^monitor_ref, _reply} ->
-            {:halt, state}
-
-          {:DOWN, ^monitor_ref, :process, _pid, :normal} ->
-            {:halt, state}
-
-          {:DOWN, ^monitor_ref, :process, _pid, reason} ->
-            raise "PostgreSQL stream producer failed: #{inspect(reason)}"
-        after
-          receive_timeout ->
-            raise "Timed out waiting for streamed rows after #{receive_timeout}ms"
-        end
-      end,
-      fn state ->
-        stop_stream_producer(state, queue_timeout)
+        {:error, reason, state} ->
+          stop_stream_producer(state, queue_timeout)
+          {:error, reason}
       end
-    )
+    else
+      {:ok, resource.(open)}
+    end
   end
 
-  defp run_stream_producer(parent, ref, producer) do
+  defp next_stream_rows(%{pending: rows} = state, _timeout) when is_list(rows) do
+    send(state.task.pid, {state.ref, :enumerating})
+    {rows, %{state | pending: nil, awaiting_ack?: true}}
+  end
+
+  defp next_stream_rows(state, timeout) do
+    case receive_stream_rows(state, timeout) do
+      {:rows, rows, state} -> {rows, %{state | awaiting_ack?: true}}
+      {:halt, state} -> {:halt, state}
+      {:error, %Selecto.Error{} = refusal, _state} -> raise Selecto.Error.to_exception(refusal)
+      {:error, reason, _state} -> raise stream_failure(reason)
+    end
+  end
+
+  # A cursor's first results can be empty: the call waits for rows or an end.
+  defp first_stream_rows(state, timeout) do
+    case receive_stream_rows(state, timeout) do
+      {:rows, [], state} -> first_stream_rows(%{state | awaiting_ack?: true}, timeout)
+      {:rows, rows, state} -> {:rows, rows, state}
+      other -> other
+    end
+  end
+
+  defp receive_stream_rows(state, timeout) do
+    state = acknowledge_stream_chunk(state)
+    ref = state.ref
+    monitor_ref = state.monitor_ref
+
+    receive do
+      {^ref, {:chunk, rows, columns}} ->
+        {:rows, Enum.map(rows, &{&1, columns || []}), state}
+
+      {^ref, {:done, {:ok, _}}} ->
+        {:halt, state}
+
+      {^ref, {:done, {:error, reason}}} ->
+        {:error, reason, state}
+
+      {^ref, {:producer_failed, reason}} ->
+        {:error, {:stream_producer, reason}, state}
+
+      {^monitor_ref, _reply} ->
+        {:halt, state}
+
+      {:DOWN, ^monitor_ref, :process, _pid, :normal} ->
+        {:halt, state}
+
+      {:DOWN, ^monitor_ref, :process, _pid, reason} ->
+        {:error, {:stream_producer, reason}, state}
+    after
+      timeout -> {:error, {:stream_timeout, timeout}, state}
+    end
+  end
+
+  defp stream_failure({:stream_timeout, timeout}),
+    do: RuntimeError.exception("Timed out waiting for streamed rows after #{timeout}ms")
+
+  defp stream_failure({:stream_producer, reason}),
+    do: RuntimeError.exception("PostgreSQL stream producer failed: #{inspect(reason)}")
+
+  defp stream_failure(reason),
+    do: RuntimeError.exception("PostgreSQL stream transaction failed: #{inspect(reason)}")
+
+  # `unstarted`: how long a stream opened at the call may go unenumerated before
+  # it gives its connection back.
+  defp run_stream_producer(parent, ref, producer, unstarted) do
     parent_monitor_ref = Process.monitor(parent)
 
     tx_result =
       try do
         producer.(fn rows, columns ->
           send(parent, {ref, {:chunk, rows, columns}})
-          await_stream_ack(parent, parent_monitor_ref, ref)
+          await_stream_ack(parent, parent_monitor_ref, ref, unstarted)
         end)
       rescue
+        exception in Postgrex.Error ->
+          {:error, exception}
+
         exception ->
           {:producer_failed, {:exception, exception.__struct__, Exception.message(exception)}}
       catch
@@ -4213,16 +4383,21 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp await_stream_ack(parent, parent_monitor_ref, ref) do
+  defp await_stream_ack(parent, parent_monitor_ref, ref, timeout) do
     receive do
       {^ref, :ack} ->
         :ok
+
+      {^ref, :enumerating} ->
+        await_stream_ack(parent, parent_monitor_ref, ref, :infinity)
 
       {^ref, :cancel} ->
         throw({:selecto_stream_cancelled, ref})
 
       {:DOWN, ^parent_monitor_ref, :process, ^parent, _reason} ->
         throw({:selecto_stream_cancelled, ref})
+    after
+      timeout -> raise "PostgreSQL stream was not enumerated within #{timeout}ms"
     end
   end
 

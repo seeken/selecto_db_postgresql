@@ -75,13 +75,38 @@ defmodule SelectoDBPostgreSQL.ReadSettingsIntegrationTest do
       GenServer.stop(d)
     end)
 
-    {:ok, stream} =
-      Adapter.stream(c, "SELECT pg_catalog.nextval('public.#{sequence}')", [], selecto_read: true)
+    # At the call: the refusal itself, with no driver error dumped into it.
+    assert {:error,
+            %Selecto.Error{
+              message: "PostgreSQL refuses a read that tried to write",
+              details: %{reason: :read_only_read}
+            }} =
+             Adapter.stream(c, "SELECT pg_catalog.nextval('public.#{sequence}')", [],
+               selecto_read: true
+             )
+  end
 
-    # Selecto.Error.to_exception/1's form: the refusal's own message, with no
-    # driver error dumped into it.
-    assert_raise(RuntimeError, "PostgreSQL refuses a read that tried to write", fn ->
-      Enum.to_list(stream)
-    end)
+  test "a stream that fails opening returns the driver's error at the call" do
+    {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
+    Process.unlink(c)
+
+    assert {:error, %Postgrex.Error{postgres: %{code: :undefined_table}}} =
+             Adapter.stream(c, "SELECT 1 FROM public.selecto_no_such_table", [],
+               selecto_read: true
+             )
+
+    assert {:ok, []} =
+             Adapter.stream(c, "SELECT 1 WHERE false", [], selecto_read: true)
+
+    assert {:ok, stream} = Adapter.stream(c, "SELECT 1", [], selecto_read: true)
+    assert [{[1], ["?column?"]}] = Enum.to_list(stream)
+
+    # A stream opened and left gives its connection back.
+    assert {:ok, _left} =
+             Adapter.stream(c, "SELECT 1", [], selecto_read: true, receive_timeout: 50)
+
+    Process.sleep(100)
+    assert {:ok, %{rows: [[1]]}} = Adapter.execute(c, "SELECT 1", [], selecto_read: true)
+    GenServer.stop(c)
   end
 end
