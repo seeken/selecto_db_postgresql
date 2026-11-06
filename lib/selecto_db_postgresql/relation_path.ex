@@ -124,9 +124,11 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   # R46 FINAL-2: per column of each resolved relation, the schema whose
   # operators compare it and the operators' argument type: a domain's base
   # type (domains over domains followed), text for varchar, the type itself
-  # otherwise; pg_catalog's operators for built-in, enum, range,
-  # multirange, composite and array types, the type's own schema only for
-  # a member of an extension (citext; R47: pg_depend deptype 'e').
+  # otherwise; pg_catalog's operators for built-in, enum, range, multirange
+  # and array types and a user's composite, the type's own schema only for a
+  # member of an extension (citext, a composite like topogeometry, whose
+  # implicit casts leave PostgreSQL no unique operator; R47: pg_depend
+  # deptype 'e').
   @types_sql """
   WITH RECURSIVE selecto_rel(name, qualified) AS (
     SELECT * FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), pg_catalog.unnest($2::pg_catalog.text[]))
@@ -146,7 +148,7 @@ defmodule SelectoDBPostgreSQL.RelationPath do
          b.name AS selecto_guard_type_relation,
          b.attname AS selecto_guard_type_column,
          CASE WHEN n.oid OPERATOR(pg_catalog.=) CAST(11 AS pg_catalog.oid)
-                OR t.typtype OPERATOR(pg_catalog.=) ANY (ARRAY['e', 'r', 'm', 'c']::pg_catalog."char"[])
+                OR t.typtype OPERATOR(pg_catalog.=) ANY (ARRAY['e', 'r', 'm']::pg_catalog."char"[])
                 OR t.typcategory OPERATOR(pg_catalog.=) 'A'
                 OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
                   WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)

@@ -409,9 +409,15 @@ another schema's relation, function or operator of the same name. So:
   pg_catalog string type, which compares as text as PostgreSQL does. Any other
   pair refuses in Selecto, not at the server: an implicit cast could make it
   resolve and compare the wrong thing (box3d `=` by area, geometry as text).
-- **Functions.** A non-member beside an extension's own functions leaves the
-  call ambiguous (`:function_ambiguous`), whatever the arguments favour. A
-  keyword followed by `(` that is no syntax is a function (hstore's `delete`).
+- **Functions.** Selecto does not reimplement overload resolution. A function
+  outside pg_catalog is named only as the exact match for its arguments' known
+  types or the sole candidate that can take them, and no argument is cast to a
+  type it lacks; anything else is `:function_ambiguous`, as is a non-member
+  beside an extension's own functions. A function no extension owns, bare or
+  schema-qualified, refuses (`:function_not_member`) unless the domain declares
+  it as a UDF. A word before `(` is a function unless its position proves syntax
+  (hstore's `delete`, `cube(x, y)`; `GROUP BY CUBE (x, y)` is syntax), and
+  `U&"..."` identifiers are decoded first.
 - **Reads cannot write.** A Selecto read runs with `transaction_read_only`
   pinned on, so a function or planted operator it reaches cannot write through
   it; in a host transaction its savepoint ends by ROLLBACK TO, which restores

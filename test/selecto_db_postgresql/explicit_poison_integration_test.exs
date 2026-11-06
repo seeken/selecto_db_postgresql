@@ -480,8 +480,6 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
      "SELECT s.id FROM (SELECT id, ci c FROM items) s WHERE s.c = 'MIXED' ORDER BY s.id"},
     {"citext aggregate in HAVING",
      "SELECT id FROM items WHERE org = 't1' GROUP BY id HAVING max(ci) = 'MIXED' ORDER BY id"},
-    {"citext overload", "SELECT replace(ci, 'M', 'z') FROM items WHERE id = 3"},
-    {"citext regexp overload", "SELECT regexp_replace(ci, 'MIX', 'z') FROM items WHERE id = 3"},
     {"pg_catalog SRF in FROM", "SELECT g FROM generate_series(1, 3) AS g"},
     {"pg_catalog SRF in the select list", "SELECT unnest(tags) FROM items WHERE id = 1"},
     {"function beside a citext overload", "SELECT x FROM regexp_split_to_table('a,b', ',') AS x"},
@@ -530,8 +528,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     {"string continuation", "SELECT id FROM items WHERE vc = 'alp'\n 'ha'"},
     {"overloaded extension function",
      "SELECT encode(digest(name, 'sha1'), 'hex') FROM items WHERE id = 1"},
-    {"overloaded extension function on literals", "SELECT hstore('a', '1')::text"},
-    {"extension function result's operator", "SELECT hstore('a', '1') -> 'a'"},
+    {"extension function result's operator", "SELECT hstore('a'::text, '1'::text) -> 'a'"},
     # M3: citext answered natively, or refused (the next test).
     {"ALL over a citext array",
      "SELECT id FROM items WHERE ci <> ALL(ARRAY['MIXED']::ext.citext[]) ORDER BY id"},
@@ -585,6 +582,46 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
   defp summary({:ok, %{rows: rows}}), do: rows
   defp summary({:error, %{details: details} = error}), do: {details[:reason], error.message}
   defp summary(other), do: other
+
+  test "citext overloads answer natively; with a plant in reach they refuse (R58, R62)", %{
+    opts: opts
+  } do
+    {:ok, c} = Adapter.connect(opts)
+
+    assert %{rows: [["zixed"]]} =
+             guarded_rows(c, "SELECT replace(ci, 'M', 'z') FROM items WHERE id = 3")
+
+    assert %{rows: [["zed"]]} =
+             guarded_rows(c, "SELECT regexp_replace(ci, 'MIX', 'z') FROM items WHERE id = 3")
+
+    # Two overloads an untyped pair could take: PostgreSQL's choice, not ours.
+    assert {:error, %{details: %{reason: :function_ambiguous}}} =
+             Adapter.execute(c, "SELECT hstore('a', '1')::text", [], selecto_read: true)
+
+    GenServer.stop(c)
+
+    {:ok, admin} = Adapter.connect(opts)
+    for sql <- plants(), do: exec!(admin, sql)
+
+    try do
+      {:ok, c} = Adapter.connect(opts)
+
+      assert {:error, %{details: %{reason: :function_ambiguous}}} =
+               Adapter.execute(c, "SELECT replace(ci, 'M', 'z') FROM items WHERE id = 3", [],
+                 selecto_read: true
+               )
+
+      GenServer.stop(c)
+    after
+      remove_plants(admin)
+      GenServer.stop(admin)
+    end
+  end
+
+  defp guarded_rows(c, sql) do
+    {:ok, result} = Adapter.execute(c, sql, [], selecto_read: true)
+    result
+  end
 
   test "an expression that may be citext refuses against an untyped value (R49c)", %{opts: opts} do
     {:ok, c} = Adapter.connect(opts)
@@ -642,6 +679,50 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       GenServer.stop(c)
     after
       exec!(admin, "DROP SCHEMA offpath CASCADE")
+      GenServer.stop(admin)
+    end
+  end
+
+  test "a plant under a keyword or U& name never answers (R58, R60)", %{opts: opts} do
+    {:ok, admin} = Adapter.connect(opts)
+    forged = "RETURNS text LANGUAGE sql AS $$ SELECT 'FORGED'::text $$"
+
+    for sql <- [
+          "CREATE FUNCTION public.explain(int) #{forged}",
+          "CREATE FUNCTION public.cube(int, int) #{forged}",
+          "CREATE FUNCTION public.lower(varchar) #{forged}"
+        ],
+        do: exec!(admin, sql)
+
+    try do
+      {:ok, c} = Adapter.connect(opts)
+      read = &Adapter.execute(c, &1, [], selecto_read: true)
+
+      for sql <- [
+            "SELECT explain(n) FROM items",
+            "SELECT cube(n, n) FROM items",
+            "SELECT public.cube(n, n) FROM items",
+            ~s|SELECT U&"cube"(n, n) FROM items|
+          ] do
+        assert {:error, %{details: %{reason: :function_not_member}}} = read.(sql)
+      end
+
+      assert {:ok, %{rows: [["alpha"]]}} =
+               read.(~s|SELECT U&"lower"(vc) FROM items WHERE id = 1|)
+
+      assert {:ok, %{rows: rows}} =
+               read.("SELECT n, count(*) FROM items GROUP BY CUBE (n) ORDER BY n")
+
+      assert length(rows) == 5
+      GenServer.stop(c)
+    after
+      for sql <- [
+            "DROP FUNCTION public.explain(int)",
+            "DROP FUNCTION public.cube(int, int)",
+            "DROP FUNCTION public.lower(varchar)"
+          ],
+          do: exec!(admin, sql)
+
       GenServer.stop(admin)
     end
   end

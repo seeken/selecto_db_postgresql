@@ -62,25 +62,20 @@ defmodule SelectoDBPostgreSQL.Qualify do
   # These return a type of their own; the others take their arguments'.
   @known_result ~w(EXISTS EXTRACT TRIM SUBSTRING POSITION OVERLAY NORMALIZE GROUPING MERGE_ACTION)
 
-  # Words of @keywords a "(" follows as syntax. Any other keyword before a "("
-  # is a function of that name (hstore's delete, pg_catalog's left): R60.
-  @paren_syntax ~w(AND OR NOT IN IS EXISTS ANY ALL SOME ARRAY ROW VALUES CAST EXTRACT TRIM
-                   SUBSTRING POSITION OVERLAY COALESCE GREATEST LEAST CASE WHEN THEN ELSE END
-                   OVER FILTER WITHIN SELECT FROM WHERE JOIN ON USING AS INTO SET RETURNING WITH
-                   RECURSIVE LATERAL UNION INTERSECT EXCEPT ORDER BY GROUP HAVING LIMIT OFFSET
-                   DISTINCT CONFLICT ROWS GROUPING SETS ROLLUP CUBE FOR ONLY TABLE NULLIF
-                   PARTITION LIKE ILIKE BETWEEN SIMILAR TO VARIADIC ESCAPE OPERATOR ZONE NORMALIZE
-                   MERGE_ACTION EXPLAIN INTERVAL ASC DESC AT COLLATE NATURAL INNER OUTER FULL
-                   CROSS MATERIALIZED RANGE GROUPS DO NOTHING NO)
-
-  @function_words @keywords |> MapSet.to_list() |> Enum.reject(&(&1 in @paren_syntax))
+  # Words the grammar never takes as a function name (reserved and col_name
+  # keywords). Every other word before "(" is a function unless its position
+  # proves syntax (R60; keyword_call?/4).
+  @never_function ~w(AND OR NOT IN EXISTS ANY ALL SOME ARRAY ROW VALUES CAST EXTRACT TRIM
+                     SUBSTRING POSITION OVERLAY COALESCE GREATEST LEAST CASE WHEN THEN ELSE END
+                     SELECT FROM WHERE ON USING AS INTO RETURNING WITH LATERAL UNION INTERSECT
+                     EXCEPT ORDER GROUP HAVING LIMIT OFFSET DISTINCT GROUPING FOR ONLY TABLE
+                     NULLIF BETWEEN TO VARIADIC NORMALIZE MERGE_ACTION INTERVAL ASC DESC COLLATE DO
+                     FETCH DEFAULT LEADING TRAILING BOTH PLACING SYMMETRIC WINDOW OPERATOR)
 
   # Words of @keywords PostgreSQL does not reserve.
   @soft_words ~w(KEY MODE FIRST LAST NEXT ZONE SHARE SKIP LOCKED HOLD TIES OTHERS RANGE ROWS GROUPS)
 
-  # As quote_ident spells them, and as a cast's text does.
-  @string_types ~w(pg_catalog.text pg_catalog.varchar pg_catalog.bpchar pg_catalog.name) ++
-                  [~s|pg_catalog."varchar"|, ~s|pg_catalog."char"|]
+  @string_types ~w(pg_catalog.text pg_catalog.varchar pg_catalog.bpchar pg_catalog.name pg_catalog.char)
 
   @comparison ~w(< > = <= >= <> !=)
 
@@ -144,10 +139,11 @@ defmodule SelectoDBPostgreSQL.Qualify do
     scan(tail, [{:str, <<u, ?&, ?'>> <> text <> escape} | acc])
   end
 
+  # Decoded here, so a name is the same name however it is spelled.
   defp scan(<<u, ?&, ?", rest::binary>>, acc) when u in [?U, ?u] do
     {text, tail} = take_quoted(rest, ?", [])
     {escape, tail} = uescape(tail)
-    scan(tail, [{:uid, <<u, ?&, ?">> <> text <> escape} | acc])
+    scan(tail, [{:qid, decode_unicode_identifier(text, escape)} | acc])
   end
 
   defp scan(<<prefix, ?', rest::binary>>, acc) when prefix in [?E, ?e] do
@@ -214,6 +210,26 @@ defmodule SelectoDBPostgreSQL.Qualify do
       nil ->
         {"", tail}
     end
+  end
+
+  defp decode_unicode_identifier(text, clause) do
+    escape =
+      case Regex.run(~r/'(.)'\z/, clause) do
+        [_, character] -> character
+        nil -> "\\"
+      end
+
+    e = Regex.escape(escape)
+    body = binary_part(text, 0, byte_size(text) - 1) |> String.replace("\"\"", "\"")
+
+    decoded =
+      Regex.replace(~r/#{e}(?:#{e}|\+([0-9a-fA-F]{6})|([0-9a-fA-F]{4}))/u, body, fn
+        _match, "", "" -> escape
+        _match, long, "" -> <<String.to_integer(long, 16)::utf8>>
+        _match, "", short -> <<String.to_integer(short, 16)::utf8>>
+      end)
+
+    quote_name(decoded)
   end
 
   defp scan_dollar(sql, rest, acc) do
@@ -439,10 +455,33 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
   defp assignment_target?(_acc), do: false
 
-  # SET after UPDATE and its relation: an alias named set is no list.
-  defp update_set?(at, k) do
-    upper(at.(k - 1)) != "AS" and
-      Enum.any?(max(k - 8, 0)..(k - 1)//1, &(upper(at.(&1)) == "UPDATE"))
+  # SET after UPDATE and its relation (or DO/THEN UPDATE): nothing but names
+  # between them. `SELECT update, set = 1` and an alias named set are no list.
+  defp update_set?(at, k), do: upper(at.(k - 1)) != "AS" and update_before?(at, k - 1)
+
+  defp update_before?(at, k) do
+    case at.(k) do
+      nil -> false
+      {:id, _} = token -> update_word?(at, k, token)
+      {:qid, _} -> update_before?(at, k - 1)
+      {:punct, "."} -> update_before?(at, k - 1)
+      _ -> false
+    end
+  end
+
+  defp update_word?(at, k, token) do
+    case upper(token) do
+      "UPDATE" -> at.(k - 1) == nil or upper(at.(k - 1)) in ~w(DO THEN) or statement_start?(at, k)
+      word when word in ["AS", "ONLY"] -> update_before?(at, k - 1)
+      word -> if word in ~w(SELECT FROM WHERE), do: false, else: update_before?(at, k - 1)
+    end
+  end
+
+  defp statement_start?(at, k) do
+    previous = at.(k - 1)
+
+    previous in [{:punct, "("}, {:punct, ";"}] or upper(previous) == "AS" or
+      previous == {:punct, ")"}
   end
 
   defp star_position?(run), do: run == [] or List.last(run).kind == :op
@@ -601,22 +640,34 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
       {%{kind: :atom, sql: sql}, head, st}
     else
-      {terms, st} = in_terms(st, left, operand, [])
+      op_name = if negate and single_element?(st, at + 1), do: "<>", else: "="
+      {terms, st} = in_terms(st, left, operand, op_name, [])
       st = expect(st, ")")
       sql = "(" <> Enum.join(terms, " OR ") <> ")"
-      sql = if negate, do: "(NOT #{sql})", else: sql
+      sql = if negate and op_name == "=", do: "(NOT #{sql})", else: sql
       {%{kind: :atom, sql: sql}, head, st}
     end
   end
 
-  defp in_terms(st, left, operand, acc) do
+  # x NOT IN (a) is x <> a to PostgreSQL's parser: the same operator here.
+  defp single_element?(st, open) do
+    close = close_index(st, open)
+
+    close != nil and
+      not Enum.any?(
+        (open + 1)..(close - 1)//1,
+        &(tok(st, &1) == {:punct, ","} and depth_zero?(st, open, &1))
+      )
+  end
+
+  defp in_terms(st, left, operand, op_name, acc) do
     {element, st} = read_run(st)
     {right, st} = render(st, element)
-    {op, cast, st} = op_sql(st, %{kind: :op, op: "="}, operand, element)
+    {op, cast, st} = op_sql(st, %{kind: :op, op: op_name}, operand, element)
     term = "((#{left_cast(left, cast)}) #{op} (#{right_cast(right, cast)}))"
 
     if punct?(st, st.pos, ","),
-      do: in_terms(advance(st), left, operand, [term | acc]),
+      do: in_terms(advance(st), left, operand, op_name, [term | acc]),
       else: {Enum.reverse([term | acc]), st}
   end
 
@@ -747,7 +798,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
       nil ->
         {nil, st}
 
-      {kind, value} when kind in [:num, :str, :param, :uid] ->
+      {kind, value} when kind in [:num, :str, :param] ->
         postfix(advance(st), %{sql: value}, mark)
 
       {:op, _} ->
@@ -822,7 +873,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
             position_atom(st, mark)
 
           # left(x, 2) and delete(h, k) are calls; LEFT JOIN is not.
-          keyword_call?(tok(st, st.pos - 1), token, tok(st, st.pos + 1), merge?(st)) ->
+          MapSet.member?(@keywords, up) and keyword_call?(&tok(st, &1), st.pos, merge?(st)) ->
             name_atom(st, mark)
 
           up in @call_keywords and call_open?(st, up) ->
@@ -858,12 +909,92 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
   defp merge?(st), do: upper(tok(st, 0)) == "MERGE"
 
-  defp keyword_call?(previous, token, next, merge?) do
+  defp keyword_call?(at, k, merge?) do
+    token = at.(k)
+    previous = at.(k - 1)
     up = upper(token)
+    before = upper(previous)
 
-    next == {:punct, "("} and up in @function_words and
-      not (up in ~w(FIRST NEXT) and upper(previous) == "FETCH") and
-      not (up == "INSERT" and merge?)
+    at.(k + 1) == {:punct, "("} and up not in @never_function and
+      case up do
+        "EXPLAIN" ->
+          previous not in [nil, {:punct, ";"}]
+
+        "BY" ->
+          before not in ~w(ORDER GROUP PARTITION)
+
+        "SET" ->
+          not update_set?(at, k)
+
+        "SETS" ->
+          before != "GROUPING"
+
+        w when w in ["CUBE", "ROLLUP"] ->
+          not group_clause?(at, k - 1, 0)
+
+        "CONFLICT" ->
+          before != "ON"
+
+        "MATERIALIZED" ->
+          before not in ~w(AS NOT)
+
+        "ZONE" ->
+          before != "TIME"
+
+        "RECURSIVE" ->
+          before != "WITH"
+
+        w when w in ["FIRST", "NEXT"] ->
+          before != "FETCH"
+
+        "INSERT" ->
+          not merge?
+
+        w when w in ~w(LIKE ILIKE SIMILAR IS JOIN OVER FILTER WITHIN ESCAPE) ->
+          not operand_end?(previous)
+
+        _ ->
+          true
+      end
+  end
+
+  # What ends an operand or a relation: an infix word follows it.
+  defp operand_end?({kind, _}) when kind in [:qid, :str, :num, :param], do: true
+  defp operand_end?({:punct, p}), do: p in [")", "]"]
+
+  defp operand_end?({:id, _} = token),
+    do:
+      not keyword_token?(token) or
+        upper(token) in ~w(LEFT RIGHT FULL INNER OUTER CROSS NATURAL NOT)
+
+  defp operand_end?(_token), do: false
+
+  # Whether position k sits in a GROUP BY list, through grouping sets.
+  defp group_clause?(at, k, depth) do
+    case at.(k) do
+      nil ->
+        false
+
+      {:punct, ")"} ->
+        group_clause?(at, k - 1, depth + 1)
+
+      {:punct, "("} when depth > 0 ->
+        group_clause?(at, k - 1, depth - 1)
+
+      {:punct, "("} ->
+        (upper(at.(k - 1)) in ~w(SETS CUBE ROLLUP) or at.(k - 1) in [{:punct, "("}, {:punct, ","}]) and
+          group_clause?(at, k - 1, 0)
+
+      {:id, _} = token when depth == 0 ->
+        case upper(token) do
+          "BY" -> upper(at.(k - 1)) == "GROUP"
+          up when up in ~w(SELECT FROM WHERE HAVING ORDER ON) -> false
+          _ -> group_clause?(at, k - 1, depth)
+        end
+
+      _ ->
+        group_clause?(at, k - 1, depth)
+    end
   end
 
   defp call_open?(st, "ARRAY"),
@@ -989,24 +1120,38 @@ defmodule SelectoDBPostgreSQL.Qualify do
       else: %{known: true, type: builtin_type(tokens)}
   end
 
-  # A cast's catalog name, when it is a string type's spelling.
+  @type_names %{
+    "int" => "int4",
+    "integer" => "int4",
+    "smallint" => "int2",
+    "bigint" => "int8",
+    "boolean" => "bool",
+    "real" => "float4",
+    "double precision" => "float8",
+    "decimal" => "numeric",
+    "character varying" => "varchar",
+    "character" => "bpchar",
+    "char" => "bpchar",
+    "timestamp with time zone" => "timestamptz",
+    "timestamp without time zone" => "timestamp",
+    "time with time zone" => "timetz",
+    "time without time zone" => "time"
+  }
+
+  # A cast's catalog name: pg_catalog.text, pg_catalog._text for text[].
   defp builtin_type(tokens) do
-    case tokens |> render_type() |> String.downcase() |> String.replace(~r/\s*\(.*\)\z/, "") do
-      name when name in ["text", "pg_catalog.text"] ->
-        "pg_catalog.text"
+    rendered =
+      tokens
+      |> render_type()
+      |> String.downcase()
+      |> String.replace("\"", "")
+      |> String.replace(~r/\s*\(.*?\)/, "")
+      |> String.replace(~r/\Apg_catalog\./, "")
 
-      name when name in ["varchar", "pg_catalog.varchar", "character varying"] ->
-        "pg_catalog.varchar"
-
-      name when name in ["bpchar", "pg_catalog.bpchar", "char", "character"] ->
-        "pg_catalog.bpchar"
-
-      name when name in ["name", "pg_catalog.name"] ->
-        "pg_catalog.name"
-
-      other ->
-        other
-    end
+    array? = String.ends_with?(rendered, "[]")
+    name = String.replace_suffix(rendered, "[]", "")
+    name = Map.get(@type_names, name, name)
+    "pg_catalog." <> if(array?, do: "_" <> name, else: name)
   end
 
   defp open_type?(tokens) do
@@ -1047,6 +1192,14 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
       _ ->
         nil
+    end
+  end
+
+  defp cast_entry(st, [name | array])
+       when elem(name, 0) in [:id, :qid] and array in [[], [{:punct, "["}, {:punct, "]"}]] do
+    case st.facts |> Map.get(:casts, %{}) |> Map.get(unquote_name(name)) do
+      %{type: _} = entry -> entry
+      _ -> nil
     end
   end
 
@@ -1299,14 +1452,14 @@ defmodule SelectoDBPostgreSQL.Qualify do
     st = %{st | pos: close + 1}
     previous = tok(st, here - 1)
     refuse_open_extension_call(st, names, args, mark)
-    from? = upper(previous) in ~w(FROM JOIN LATERAL) or previous == {:punct, ","}
+    upper_previous = upper(previous)
 
     {call, st} =
       case names do
         [name] ->
           bare_call(st, name, args)
 
-        [schema, name] when from? ->
+        [schema, name] when upper_previous != "INTO" ->
           if unquote_name(schema) == "pg_catalog",
             do: {plain_call(names, args), st},
             else: {schema_call(st, schema, name, args), st}
@@ -1324,10 +1477,13 @@ defmodule SelectoDBPostgreSQL.Qualify do
   # may choose the extension's function. Refused, never pg_catalog's (R49c).
   defp refuse_open_extension_call(%{scopes: nil}, _names, _args, _mark), do: :ok
 
-  defp refuse_open_extension_call(st, [name], [%{lone: lone} | _], mark)
-       when is_nil(lone) or is_map_key(lone, :refs) do
+  defp refuse_open_extension_call(st, [name], args, mark) do
     key = unquote_name(name)
-    typed? = lone != nil and match?(%{entry: _}, class_of(st, lone))
+
+    typed? =
+      Enum.all?(args, fn %{lone: lone} ->
+        lone != nil and not Map.has_key?(class_of(st, lone), :unknown)
+      end)
 
     open? =
       st.refs
@@ -1364,24 +1520,30 @@ defmodule SelectoDBPostgreSQL.Qualify do
     other = Enum.reject(candidates, &(&1.schema == "pg_catalog"))
     count = length(args)
 
-    extension = extension_function(st, args, key)
-
-    cond do
-      extension != nil ->
-        {extension_call(st, name, args, extension), st}
-
-      catalog != [] and (reach(catalog, count) != [] or reach(other, count) == []) ->
-        known = not info.polymorphic
-
-        {%{
-           sql: "pg_catalog.#{text(name)}(#{join_args(args)})",
-           known: known,
-           type: catalog_result(reach(catalog, count))
-         }, st}
-
-      true ->
-        {candidate_call(st, key, candidates, args), st}
+    # pg_catalog's answers, whatever is planted beside it, unless an argument
+    # is of an extension type: then the extension's own overload may be the
+    # exact match, as for PostgreSQL.
+    if catalog != [] and
+         (reach(other, count) == [] or
+            (reach(catalog, count) != [] and not extension_argument?(st, args))) do
+      {catalog_call(name, args, info, reach(catalog, count)), st}
+    else
+      {candidate_call(st, name, key, candidates, args, info), st}
     end
+  end
+
+  defp catalog_call(name, args, info, candidates) do
+    %{
+      sql: "pg_catalog.#{text(name)}(#{join_args(args)})",
+      known: not info.polymorphic,
+      type: catalog_result(candidates)
+    }
+  end
+
+  defp extension_argument?(st, args) do
+    Enum.any?(args, fn %{lone: atom} ->
+      atom != nil and Map.has_key?(class_of(st, atom), :entry)
+    end)
   end
 
   defp catalog_result(candidates) do
@@ -1391,10 +1553,14 @@ defmodule SelectoDBPostgreSQL.Qualify do
     end
   end
 
+  # R58: spelled out, a function outside pg_catalog is verified like a bare
+  # one, among its schema's candidates; a non-member is named only when the
+  # domain declared it (a UDF's sql_name).
   defp schema_call(st, schema, name, args) do
     key = {unquote_name(schema), unquote_name(name)}
     info = Map.get(Map.get(st.facts, :functions, %{}), key)
-    candidate_call(st, elem(key, 1), (info && info.candidates) || [], args)
+    candidates = (info && info.candidates) || []
+    candidate_call(st, name, elem(key, 1), candidates, args, info)
   end
 
   defp reach(candidates, count) do
@@ -1403,18 +1569,14 @@ defmodule SelectoDBPostgreSQL.Qualify do
     end)
   end
 
-  # The candidates this call's argument count can reach (as PostgreSQL
-  # filters them first). An
-  # installed extension's own function over one of its own types is dropped
-  # while another candidate remains (untyped arguments resolve to that one:
-  # citext's regexp_split_to_table); alone, it is the candidate (hstore's
-  # each). Every remaining candidate pg_catalog's: the call is
-  # pg_catalog-qualified. Exactly one other: its schema, with each argument
-  # cast to its declared type (R50). Overloads of one extension (digest,
-  # hstore, ST_DWithin): that extension's schema, every argument its
-  # overloads agree on cast, PostgreSQL choosing among members only; anything
-  # else beside them refuses. Else refused.
-  defp candidate_call(st, name, candidates, args) do
+  # R62: Selecto does not reimplement PostgreSQL's overload resolution. A
+  # candidate that cannot take the arguments does not count. Of the rest, a
+  # non-member beside an extension's member is ambiguous (R58); with no member
+  # left, pg_catalog's is the call; otherwise one is named only as the exact
+  # match for the arguments' known types, or as the sole candidate left.
+  # Anything else refuses.
+  defp candidate_call(st, name, key, candidates, args, info) do
+    facts = Enum.map(args, &argument_fact(st, &1))
     count = length(args)
     reached = reach(candidates, count)
 
@@ -1422,112 +1584,136 @@ defmodule SelectoDBPostgreSQL.Qualify do
       do:
         refuse(
           :function_not_found,
-          "a function the statement calls (#{name}) was not found in the pinned schemas"
+          "a function the statement calls (#{key}) was not found in the pinned schemas"
         )
 
-    plain = Enum.reject(reached, & &1.member)
-    reached = narrow_members(name, reached, plain)
-    catalog? = Enum.all?(reached, &(&1.schema == "pg_catalog"))
+    possible = Enum.filter(reached, &accepts?(st, &1, facts))
 
-    # Only among one extension's own overloads (R58): a non-member beside
-    # members stays ambiguous, whatever the arguments favour.
-    reached =
-      if one_extension?(reached), do: narrow_by_arguments(reached, st, args), else: reached
+    if possible == [],
+      do: refuse(:function_not_found, "no function #{key} takes these arguments")
+
+    plain = Enum.filter(possible, &(&1.schema != "pg_catalog" and is_nil(&1.extension)))
+    owned = Enum.filter(possible, &(not is_nil(&1.extension)))
+    catalog = Enum.filter(possible, &(&1.schema == "pg_catalog"))
 
     cond do
-      catalog? ->
-        %{sql: "pg_catalog.#{quote_name(name)}(#{join_args(args)})", known: true}
+      plain != [] and owned != [] ->
+        ambiguous()
 
-      length(reached) == 1 ->
-        [info] = reached
-        cast = cast_arguments(info, args)
+      # Nothing a schema could hold outranks pg_catalog beside no member.
+      catalog != [] and owned == [] ->
+        catalog_call(name, args, info, catalog)
 
-        Map.put(
-          result_facts(st, reached),
-          :sql,
-          "#{quote_name(info.schema)}.#{quote_name(name)}(#{Enum.join(cast, ", ")})"
-        )
+      # R58, R60: a function no extension owns runs only if the domain
+      # declared it, and a schema-qualified declaration names that schema's
+      # function alone. Its name in a pinned schema proves nothing.
+      plain != [] ->
+        case declared_candidates(st, key, plain) do
+          [] ->
+            refuse(
+              :function_not_member,
+              "a function outside pg_catalog is no extension's and no domain's"
+            )
 
-      one_extension?(reached) ->
-        [info | _] = reached
-
-        Map.put(
-          result_facts(st, reached),
-          :sql,
-          "#{quote_name(info.schema)}.#{quote_name(name)}(#{Enum.join(agreed_casts(reached, args), ", ")})"
-        )
+          declared ->
+            declared |> exact_or_sole(facts) |> named_call(st, key, args, facts, name, info)
+        end
 
       true ->
-        ambiguous()
+        possible |> exact_or_sole(facts) |> named_call(st, key, args, facts, name, info)
     end
   end
 
-  defp narrow_by_arguments(candidates, st, args) do
-    args
-    |> Enum.with_index()
-    |> Enum.reduce(candidates, fn {arg, index}, kept ->
-      type =
-        case arg.lone && class_of(st, arg.lone) do
-          %{entry: %{type: type}} -> type
-          _ -> nil
-        end
+  defp declared_candidates(st, key, candidates) do
+    declared = Map.get(st.facts, :declared_functions, [])
 
-      narrowed = if type, do: Enum.filter(kept, &(Enum.at(&1.args, index) == type)), else: []
-      if narrowed == [], do: kept, else: narrowed
-    end)
+    if key in declared,
+      do: candidates,
+      else: Enum.filter(candidates, &("#{&1.schema}.#{key}" in declared))
   end
 
-  defp one_extension?(candidates) do
-    extensions = candidates |> Enum.map(&{&1.extension, &1.schema}) |> Enum.uniq()
-    match?([{extension, _schema}] when extension != nil, extensions)
+  defp named_call(%{schema: "pg_catalog"} = _info, _st, _key, args, _facts, name, info),
+    do: catalog_call(name, args, info, [])
+
+  defp named_call(candidate, st, key, args, facts, _name, _info) do
+    cast = cast_arguments(candidate, args, facts)
+    sql = "#{quote_name(candidate.schema)}.#{quote_name(key)}(#{Enum.join(cast, ", ")})"
+    Map.put(result_facts(st, [candidate]), :sql, sql)
   end
 
-  defp agreed_casts(candidates, args) do
-    args
-    |> Enum.with_index()
-    |> Enum.map(fn {arg, index} ->
-      case candidates |> Enum.map(&Enum.at(&1.args, index)) |> Enum.uniq() do
-        [type] when is_binary(type) -> "#{arg.prefix}CAST((#{arg.sql}) AS #{type})"
-        _ -> arg.prefix <> arg.sql
-      end
-    end)
-  end
+  defp exact_or_sole(possible, facts) do
+    typed? = Enum.any?(facts, &match?({:type, _}, &1))
 
-  # What the candidates return says of the call's type.
-  defp result_facts(st, candidates) do
-    case candidates |> Enum.map(&Map.get(&1, :ret)) |> Enum.uniq() do
-      [nil] ->
-        %{known: true}
+    exact =
+      if typed?,
+        do: Enum.filter(possible, &exact?(&1, facts)),
+        else: []
 
-      ["pg_catalog." <> _] ->
-        %{known: true}
-
-      [type] when is_binary(type) ->
-        case cast_entry(st, type_tokens(type)) do
-          %{} = entry -> %{entry: entry}
-          nil -> %{unknown: st.scopes != nil, known: st.scopes == nil}
-        end
-
-      _several ->
-        %{unknown: st.scopes != nil, known: st.scopes == nil}
+    case {exact, possible} do
+      {[one], _} -> one
+      {[], [one]} -> one
+      _ -> ambiguous()
     end
   end
 
-  defp type_tokens(type), do: tokenize(type)
+  defp exact?(candidate, facts) do
+    facts
+    |> Enum.with_index()
+    |> Enum.all?(fn
+      {{:type, type}, index} -> plain_type(declared_at(candidate, index)) == plain_type(type)
+      _untyped_or_open -> true
+    end)
+  end
 
-  defp narrow_members(_name, reached, plain) when plain == [] or length(plain) == length(reached),
-    do: reached
+  defp accepts?(st, candidate, facts) do
+    facts
+    |> Enum.with_index()
+    |> Enum.all?(fn
+      {{:type, type}, index} -> converts?(st, type, declared_at(candidate, index))
+      _untyped_or_open -> true
+    end)
+  end
 
-  # The extension's own functions are dropped only beside pg_catalog's or
-  # other members of that same extension: beside anything else, which could
-  # be a plant in a writable pinned schema, the call is ambiguous.
-  defp narrow_members(_name, reached, plain) do
-    own = reached |> Enum.filter(& &1.member) |> MapSet.new(& &1.extension)
+  defp converts?(_st, _type, nil), do: true
 
-    if Enum.any?(plain, &(&1.schema != "pg_catalog" and not MapSet.member?(own, &1.extension))),
-      do: ambiguous()
+  defp converts?(st, type, declared) do
+    type = plain_type(type)
+    declared = plain_type(declared)
 
-    plain
+    type == declared or pseudo?(declared) or
+      MapSet.member?(Map.get(st.facts, :implicit, MapSet.new()), {type, declared})
+  end
+
+  # quote_ident quotes some type names: compared without the quotes.
+  defp plain_type(nil), do: nil
+  defp plain_type(type), do: String.replace(type, "\"", "")
+
+  defp pseudo?(declared) do
+    declared = plain_type(declared)
+
+    String.starts_with?(declared, "pg_catalog.any") or
+      declared in ["pg_catalog.record", "pg_catalog.cstring"]
+  end
+
+  defp declared_at(candidate, index) do
+    case Enum.at(candidate.args, index) do
+      nil -> Map.get(candidate, :variadic)
+      type when index == length(candidate.args) - 1 -> Map.get(candidate, :variadic) || type
+      type -> type
+    end
+  end
+
+  # What an argument's type is known to be: {:type, name}, :untyped (a bare
+  # parameter or literal) or :open (an expression, a number).
+  defp argument_fact(st, %{lone: nil}) when is_map(st), do: :open
+
+  defp argument_fact(st, %{lone: atom}) do
+    case class_of(st, atom) do
+      %{untyped: true} -> :untyped
+      %{entry: %{type: type}} -> {:type, type}
+      %{type: type} when is_binary(type) -> {:type, type}
+      _open -> :open
+    end
   end
 
   defp ambiguous,
@@ -1537,96 +1723,63 @@ defmodule SelectoDBPostgreSQL.Qualify do
         "a function the statement calls must resolve to exactly one function in the pinned schemas"
       )
 
-  defp cast_arguments(%{variadic: variadic} = info, args) when is_binary(variadic) do
-    if Regex.match?(~r/(?:\A|\.)"?any"?\z/, variadic),
+  # An argument is cast to its declared type only when that is its type, or
+  # it is untyped. Nothing is cast to fit a candidate.
+  defp cast_arguments(candidate, args, facts) do
+    if Regex.match?(~r/(?:\A|\.)"?any"?\z/, candidate.variadic || ""),
       do: refuse(:function_not_castable, ~s(a function the statement calls takes VARIADIC "any"))
 
-    fixed = length(info.args) - 1
-    {head, tail} = Enum.split(args, fixed)
+    fixed = if candidate.variadic, do: length(candidate.args) - 1, else: length(candidate.args)
+
+    {head, tail} = args |> Enum.zip(facts) |> Enum.with_index() |> Enum.split(fixed)
 
     casts =
-      head
-      |> Enum.zip(info.args)
-      |> Enum.map(fn {arg, type} -> "CAST((#{arg.sql}) AS #{type})" end)
+      Enum.map(head, fn {pair, index} -> cast_argument(pair, Enum.at(candidate.args, index)) end)
 
     if tail == [] do
       casts
     else
-      elements = Enum.map_join(tail, ", ", &"CAST((#{&1.sql}) AS #{variadic})")
+      elements =
+        Enum.map_join(tail, ", ", fn {pair, _index} -> cast_argument(pair, candidate.variadic) end)
+
       casts ++ ["VARIADIC ARRAY[#{elements}]"]
     end
   end
 
-  defp cast_arguments(info, args) do
-    args
-    |> Enum.zip(info.args)
-    |> Enum.map(fn {arg, type} -> "CAST((#{arg.sql}) AS #{type})" end)
-  end
+  # What the candidates return says of the call's type.
+  defp result_facts(st, candidates) do
+    case candidates |> Enum.map(&Map.get(&1, :ret)) |> Enum.uniq() do
+      [nil] ->
+        %{known: true}
 
-  # R49c: a function the extension of its first argument's type defines for
-  # that type (citext's max and min, its replace and regexp_* overloads)
-  # resolves in the extension's schema, as PostgreSQL resolves it: when the
-  # other arguments are untyped or of that type too. Its result keeps the
-  # type when it returns it.
-  defp extension_function(_st, [], _name), do: nil
+      ["pg_catalog." <> _ = type] ->
+        %{known: true, type: type}
 
-  defp extension_function(%{scopes: nil}, _args, _name), do: nil
+      [type] when is_binary(type) ->
+        case cast_entry(st, tokenize(type)) do
+          %{} = entry -> %{entry: entry}
+          nil -> %{unknown: st.scopes != nil, known: st.scopes == nil}
+        end
 
-  defp extension_function(st, [%{lone: first} | rest] = args, name) when is_map(first) do
-    with %{entry: entry} <- class_of(st, first),
-         overloads when is_list(overloads) <- Map.get(entry.fns, name),
-         [_ | _] = fitting <-
-           Enum.filter(overloads, fn function ->
-             function.nargs == length(args) and
-               rest
-               |> Enum.zip(tl(function.args))
-               |> Enum.all?(fn {arg, declared} ->
-                 extension_argument?(st, arg, declared, entry)
-               end)
-           end) do
-      %{function: best_overload(fitting, rest, st), entry: entry}
-    else
-      _ -> nil
+      _several ->
+        %{unknown: st.scopes != nil, known: st.scopes == nil}
     end
   end
 
-  defp extension_function(_st, _args, _name), do: nil
+  defp cast_argument({arg, :open}, _declared), do: arg.prefix <> arg.sql
 
-  # An argument of a known type picks its overload, an untyped one text's, as
-  # PostgreSQL prefers: delete(hstore, varchar) is delete(hstore, text).
-  defp best_overload(fitting, rest, st) do
-    Enum.max_by(fitting, fn function ->
-      rest
-      |> Enum.zip(tl(function.args))
-      |> Enum.count(fn {%{lone: atom}, declared} ->
-        type = if atom, do: class_of(st, atom)[:type]
-        declared == type or declared == "pg_catalog.text"
-      end)
-    end)
+  # An argument of another type stays as written: the server's implicit cast,
+  # never ours (R62).
+  defp cast_argument({arg, {:type, type}}, declared) do
+    if plain_type(type) == plain_type(declared) and not pseudo?(declared),
+      do: "#{arg.prefix}CAST((#{arg.sql}) AS #{declared})",
+      else: arg.prefix <> arg.sql
   end
 
-  # A parameter of the member type takes an untyped value or that type; any
-  # other parameter whatever is not an extension's.
-  defp extension_argument?(st, %{lone: atom}, declared, entry) do
-    class = if atom, do: class_of(st, atom), else: %{}
-
-    if declared == entry.type do
-      class[:untyped] == true or match?(%{entry: %{type: type}} when type == entry.type, class)
-    else
-      not Map.has_key?(class, :entry) and not Map.has_key?(class, :unknown)
-    end
-  end
-
-  defp extension_call(_st, name, args, %{function: function, entry: entry}) do
-    # R50: each argument cast to the declared type, so no aggregate or
-    # function planted beside it over a domain can be chosen.
-    cast =
-      args
-      |> Enum.zip(function.args)
-      |> Enum.map_join(", ", fn {arg, type} -> "#{arg.prefix}CAST((#{arg.sql}) AS #{type})" end)
-
-    sql = "#{quote_name(function.schema)}.#{text(name)}(#{cast})"
-    if function.self, do: %{sql: sql, entry: entry}, else: %{sql: sql, known: true}
+  defp cast_argument({arg, _fact}, declared) do
+    if pseudo?(declared),
+      do: arg.prefix <> arg.sql,
+      else: "#{arg.prefix}CAST((#{arg.sql}) AS #{declared})"
   end
 
   # FILTER (WHERE ...) / OVER (...) / WITHIN GROUP (...) follow a call.
@@ -2013,7 +2166,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
   defp string_fallback?(_left, _right), do: false
 
   defp plain_string?(%{entry: _}), do: false
-  defp plain_string?(%{type: type}) when is_binary(type), do: type in @string_types
+  defp plain_string?(%{type: type}) when is_binary(type), do: plain_type(type) in @string_types
   defp plain_string?(_class), do: true
 
   defp member_operator(name, %{entry: l}, %{entry: r}) do
@@ -2981,8 +3134,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
       chain_end == k and call_name?(last, at, k, previous) ->
         %{acc | functions: MapSet.put(acc.functions, name)}
 
-      chain_end == k + 2 and from? and
-          unquote_name(at.(k)) != "pg_catalog" ->
+      chain_end == k + 2 and unquote_name(at.(k)) != "pg_catalog" ->
         %{acc | named: MapSet.put(acc.named, {unquote_name(at.(k)), unquote_name(last)})}
 
       true ->
@@ -2995,7 +3147,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
     keyword? =
       (MapSet.member?(@keywords, up) or MapSet.member?(@constants, up)) and
-        not keyword_call?(previous, token, at.(k + 1), upper(at.(0)) == "MERGE")
+        not keyword_call?(at, k, upper(at.(0)) == "MERGE")
 
     not keyword? and not alias_position?(previous) and not cte_column_list?(at, k)
   end
@@ -3031,6 +3183,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
   # CAST(x AS "schema"."type") to a type outside pg_catalog.
   defp require_cast(acc, at, k) do
     with true <- upper(at.(k - 1)) == "AS" or at.(k - 1) == {:punct, "::"},
+         :qualified <- bare_cast(at, k),
          {:punct, "."} <- at.(k + 1),
          true <- name_token?(at.(k + 2)),
          schema = unquote_name(at.(k)),
@@ -3038,7 +3191,23 @@ defmodule SelectoDBPostgreSQL.Qualify do
       key = schema <> "." <> unquote_name(at.(k + 2))
       %{acc | casts: Map.put(acc.casts, key, "#{text(at.(k))}.#{text(at.(k + 2))}")}
     else
+      {:bare, name, spelled} -> %{acc | casts: Map.put(acc.casts, name, spelled)}
       _ -> acc
+    end
+  end
+
+  # x::geography: a bare type name that is no built-in resolves by the pin.
+  defp bare_cast(at, k) do
+    token = at.(k)
+    name = unquote_name(token)
+
+    cast? = at.(k - 1) == {:punct, "::"} or at.(k + 1) == {:punct, ")"}
+
+    if at.(k + 1) != {:punct, "."} and cast? and
+         not MapSet.member?(@builtin_type, name) and not String.starts_with?(name, "reg") do
+      {:bare, name, text(token)}
+    else
+      :qualified
     end
   end
 
@@ -3049,12 +3218,33 @@ defmodule SelectoDBPostgreSQL.Qualify do
   SHARE, FOR KEY SHARE), read from its tokens: a string, quoted alias or
   comment that says so does not.
   """
-  def row_lock?([{:id, _} = token | rest]) do
-    (upper(token) == "FOR" and lock_strength?(rest)) or row_lock?(rest)
+  def row_lock?(tokens), do: row_lock?(tokens, nil, [:query])
+
+  # FOR is a lock only in a query's own level: substring(a FOR share) is not.
+  defp row_lock?([], _previous, _frames), do: false
+
+  defp row_lock?([{:punct, "("} = token | rest], previous, frames) do
+    kind =
+      if upper(List.first(rest)) in ~w(SELECT WITH VALUES) or List.first(rest) == {:punct, "("},
+        do: :query,
+        else: :call
+
+    kind =
+      if match?({:id, _}, previous) and
+           upper(previous) not in ~w(AS FROM JOIN IN EXISTS ANY ALL SOME LATERAL UNION INTERSECT EXCEPT) and
+           kind == :call, do: :call, else: kind
+
+    row_lock?(rest, token, [kind | frames])
   end
 
-  def row_lock?([_token | rest]), do: row_lock?(rest)
-  def row_lock?([]), do: false
+  defp row_lock?([{:punct, ")"} = token | rest], _previous, [_ | [_ | _] = frames]),
+    do: row_lock?(rest, token, frames)
+
+  defp row_lock?([{:id, _} = token | rest], _previous, [:query | _] = frames) do
+    (upper(token) == "FOR" and lock_strength?(rest)) or row_lock?(rest, token, frames)
+  end
+
+  defp row_lock?([token | rest], _previous, frames), do: row_lock?(rest, token, frames)
 
   defp lock_strength?([first | rest]) do
     case {upper(first), Enum.map(Enum.take(rest, 2), &upper/1)} do
@@ -3072,7 +3262,26 @@ defmodule SelectoDBPostgreSQL.Qualify do
   `lint/1` finds, or an operator named outside pg_catalog, which is verified
   rather than trusted.
   """
-  def rewrite?(tokens), do: lint(tokens) != [] or foreign_operator?(tokens)
+  def rewrite?(tokens),
+    do: lint(tokens) != [] or foreign_operator?(tokens) or foreign_call?(tokens)
+
+  # A schema-qualified call outside pg_catalog (R58). A relation's column list
+  # is no call: INSERT INTO s.t (cols), and an alias's.
+  defp foreign_call?(tokens) do
+    at = at_fun(tokens)
+
+    Enum.any?(0..(length(tokens) - 1)//1, fn k ->
+      name_token?(at.(k)) and at.(k + 1) == {:punct, "."} and name_token?(at.(k + 2)) and
+        at.(k + 3) == {:punct, "("} and at.(k - 1) != {:punct, "."} and
+        unquote_name(at.(k)) != "pg_catalog" and upper(at.(k - 1)) not in ~w(INTO UPDATE MERGE)
+    end)
+  end
+
+  defp at_fun(tokens) do
+    toks = List.to_tuple(tokens)
+    count = tuple_size(toks)
+    fn i -> if i >= 0 and i < count, do: elem(toks, i) end
+  end
 
   defp foreign_operator?([{:id, _} = token, {:punct, "("}, schema, {:punct, "."} | rest] = tokens) do
     if upper(token) == "OPERATOR" and name_token?(schema),

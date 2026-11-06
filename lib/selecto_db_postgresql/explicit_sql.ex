@@ -256,6 +256,17 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   JOIN pg_catalog.pg_namespace n ON n.oid #{@op} o.oprnamespace
   """
 
+  @implicit_sql """
+  SELECT #{"pg_catalog.concat(pg_catalog.quote_ident(CAST(sn.nspname AS pg_catalog.text)), '.', " <> "pg_catalog.quote_ident(CAST(st.typname AS pg_catalog.text)))"} AS selecto_guard_cast_source,
+         #{"pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.', " <> "pg_catalog.quote_ident(CAST(tt.typname AS pg_catalog.text)))"} AS selecto_guard_cast_target
+  FROM pg_catalog.pg_cast c
+  JOIN pg_catalog.pg_type st ON st.oid #{@op} c.castsource
+  JOIN pg_catalog.pg_namespace sn ON sn.oid #{@op} st.typnamespace
+  JOIN pg_catalog.pg_type tt ON tt.oid #{@op} c.casttarget
+  JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} tt.typnamespace
+  WHERE c.castcontext #{@op} 'i'
+  """
+
   @doc false
   def lookup_statements, do: [@probe_sql, @relations_sql, @relations_rowsets_sql, @casts_sql]
 
@@ -272,7 +283,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
       tokens = Qualify.tokenize(sql)
 
       cond do
-        Qualify.rewrite?(tokens) -> rewrite(execute, tokens)
+        Qualify.rewrite?(tokens) -> rewrite(execute, tokens, opts)
         verify? -> with {:ok, _} <- facts(execute, tokens), do: {:ok, sql}
         true -> {:ok, sql}
       end
@@ -281,8 +292,10 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     end
   end
 
-  defp rewrite(execute, tokens) do
+  defp rewrite(execute, tokens, opts) do
     with {:ok, facts} <- facts(execute, tokens) do
+      facts = Map.put(facts, :declared_functions, Keyword.get(opts, :declared_functions, []))
+
       case Qualify.qualify(tokens, facts) do
         {:ok, sql} ->
           case Qualify.lint(sql) do
@@ -312,14 +325,41 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
         functions = functions(candidates)
         required = Map.update!(required, :casts, &Map.merge(&1, result_types(functions)))
 
-        if not extension_types and isolation == "read committed" do
-          {:ok, %{functions: functions, extension: false}}
-        else
-          relation_facts(execute, tokens, required, functions, extension_types, isolation)
+        with {:ok, facts} <-
+               (if not extension_types and isolation == "read committed" do
+                  {:ok, %{functions: functions, extension: false}}
+                else
+                  relation_facts(execute, tokens, required, functions, extension_types, isolation)
+                end) do
+          overload_facts(execute, facts, functions)
         end
 
       _other ->
         unavailable()
+    end
+  end
+
+  # A function outside pg_catalog is chosen by its arguments' types (R62):
+  # the query scopes are needed, and the implicit casts that say what a
+  # candidate can take.
+  defp overload_facts(execute, facts, functions) do
+    outside? =
+      Enum.any?(functions, fn {_key, info} ->
+        Enum.any?(info.candidates, &(&1.schema != "pg_catalog"))
+      end)
+
+    if outside? do
+      case execute.(@implicit_sql, []) do
+        {:ok, %{rows: rows}} when is_list(rows) ->
+          plain = &String.replace(&1, "\"", "")
+          implicit = MapSet.new(rows, fn [source, target] -> {plain.(source), plain.(target)} end)
+          {:ok, facts |> Map.put(:extension, true) |> Map.put(:implicit, implicit)}
+
+        _other ->
+          unavailable()
+      end
+    else
+      {:ok, facts}
     end
   end
 
