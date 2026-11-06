@@ -321,9 +321,8 @@ another schema's relation, function or operator of the same name. So:
   startup, for example `parameters: [search_path: "app"]`). A name that
   does not resolve, or a lookup that cannot run, refuses; and the exact
   text every Selecto read, stream, write or candidate load executes must
-  name each relation schema-qualified, so no unqualified statement runs. A
-  Selecto read that reaches the adapter without prepared relations resolves
-  the names in its own text the same way.
+  name each relation schema-qualified, so no unqualified statement runs.
+  Hand-built reads are the exception, below.
 - A CTE or query member named like a real relation is scoped: in a leading
   non-recursive `WITH`, its own body and the bodies before it read the real
   (qualified) relation, the later bodies and the main query the CTE. A
@@ -399,15 +398,22 @@ another schema's relation, function or operator of the same name. So:
   pg_catalog string type, which compares as text as PostgreSQL does. Any other
   pair refuses in Selecto, not at the server: an implicit cast could make it
   resolve and compare the wrong thing (box3d `=` by area, geometry as text).
-- **Hand-built SQL.** Selecto guards what it generates. Hand-written SQL, and raw
-  text such as `raw_sql_filter` inside a generated read, may compare extension
-  types directly; anything it cannot prove (casts, subscripts, COALESCE, CASE,
-  GREATEST, LEAST, NULLIF, subqueries, set operations) refuses `:sql_unprovable`
-  when the statement touches an extension type. A statement is generated only when Selecto's executor stamped it
-  (`selecto_generated`); text with no stamp is hand-built, and a generated
-  statement that carries any such text, a custom column's `select:` or an `{:exists, sql}`
-  say, counts as hand-built as a whole. Every statement is still parsed for its
-  CTE names and the rest of the checks.
+- **Hand-built SQL.** Hand-built reads run exactly as written: no qualification,
+  no rewriting, no catalog proof, so their answers are the driver's. A statement
+  is generated only when Selecto's executor stamped it (`selecto_generated`);
+  text with no stamp is hand-built, and a generated statement that carries any
+  such text, a custom column's `select:`, a `raw_sql_filter`, a `{:ref, text}` or
+  an `{:exists, sql}` say, is hand-built as a whole. Of those, a compile keeps the
+  schema-qualified names its domain gave its relations, and nothing else changes.
+  Hand-built text must be a read by its first word (SELECT, WITH, VALUES, TABLE,
+  or `reason: :hand_built_not_a_read`) and always runs READ ONLY, whatever
+  `read_only_reads` says, so what it would write refuses
+  (`reason: :read_only_read`, SQLSTATE 25006), `FOR UPDATE` and `FOR SHARE`
+  included. The session pin and guards stay: with no relation list the text
+  refuses while the session holds temporary relations, a name this session's
+  search_path gives a relation other than the pin's refuses
+  (`reason: :relation_ambiguous`), and anything else the driver says stands as
+  the driver says it.
 - **Deployment.** No untrusted role may have CREATE on a schema the application
   reaches, and hosts schema-qualify functions in their triggers, views and
   policies: code already running as the application role is outside what these
@@ -427,7 +433,13 @@ another schema's relation, function or operator of the same name. So:
   the host's setting. A read that takes row locks (`FOR UPDATE`, `FOR SHARE`)
   stays writable, since PostgreSQL refuses those read-only. A host function
   that writes (or `nextval`) in a domain view or custom column therefore
-  refuses in a read (`reason: :read_only_read`).
+  refuses in a read (`reason: :read_only_read`). None of this costs the host its
+  transaction: before the savepoint a read takes the relation locks the host's
+  own SELECT would hold to its commit, through a view to its base tables too, and
+  with them the transaction's first snapshot. A hand-built statement is planned
+  for that, and text that says INSERT, UPDATE, DELETE or MERGE is not, since it
+  is about to refuse. A relation only a function a view calls reaches is locked
+  only for the read.
   `config :selecto_db_postgresql, read_only_reads: false` turns this off.
 - **EXPLAIN is a read.** `Selecto.explain/2`, `explain_analyze/2` and
   `QueryAnalyzer` run through the same qualification, pin and session checks,

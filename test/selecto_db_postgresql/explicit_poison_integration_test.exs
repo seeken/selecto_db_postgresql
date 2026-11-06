@@ -549,43 +549,27 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     {"text against citext", "SELECT id FROM items WHERE name = ci ORDER BY id"}
   ]
 
-  test "hand-built reads answer as natively, under plants", %{opts: opts} do
+  test "hand-built reads answer as natively (R68)", %{opts: opts} do
     {:ok, setup} = Adapter.connect(opts)
     exec!(setup, "CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA ext")
     GenServer.stop(setup)
 
     {:ok, c} = Adapter.connect(opts)
-    native = for {label, sql} <- @reads, into: %{}, do: {label, exec!(c, sql).rows}
-    GenServer.stop(c)
 
-    {:ok, admin} = Adapter.connect(opts)
-    for sql <- plants(), do: exec!(admin, sql)
-
-    try do
-      {:ok, c} = Adapter.connect(opts)
-
-      different =
-        for {label, sql} <- @reads,
-            result = Adapter.execute(c, sql, [], selecto_read: true),
-            not match?({:ok, %{rows: rows}} when rows == :erlang.map_get(label, native), result),
-            not match?({:error, %{details: %{reason: :sql_unprovable}}}, result),
-            do: {label, native[label], summary(result)}
-
-      GenServer.stop(c)
-      assert different == []
-    after
-      remove_plants(admin)
-      GenServer.stop(admin)
+    for {label, sql} <- @reads do
+      assert {:ok, %{rows: native}} = Adapter.execute(c, sql, [], [])
+      assert {:ok, %{rows: ^native}} = Adapter.execute(c, sql, [], selecto_read: true), label
     end
+
+    GenServer.stop(c)
   end
 
-  # The qualifier's own route, what Selecto generates: hand-built text refuses
-  # these forms.
-  defp typed(c, sql) do
-    relations = %{
-      SelectoDBPostgreSQL.RelationPath.path_key() => ["public", "ext"],
-      "items" => ~s("public"."items")
-    }
+  # The qualifier's own route, what Selecto generates: hand-built text runs as
+  # written.
+  defp typed(c, sql, tables \\ ["items"]) do
+    relations =
+      Map.new(tables, &{&1, ~s("public"."#{&1}")})
+      |> Map.put(SelectoDBPostgreSQL.RelationPath.path_key(), ["public", "ext"])
 
     Adapter.execute(c, sql, [],
       selecto_read: true,
@@ -622,9 +606,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       {:ok, c} = Adapter.connect(opts)
 
       assert {:error, %{details: %{reason: :function_ambiguous}}} =
-               Adapter.execute(c, "SELECT replace(ci, 'M', 'z') FROM items WHERE id = 3", [],
-                 selecto_read: true
-               )
+               typed(c, "SELECT replace(ci, 'M', 'z') FROM items WHERE id = 3")
 
       GenServer.stop(c)
     after
@@ -695,6 +677,10 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       {:ok, c} = Adapter.connect(opts)
 
       assert {:error, %{details: %{reason: :function_not_found}}} =
+               typed(c, "SELECT only_there(name) FROM items")
+
+      # Hand-built text gets the driver's own answer under the pin.
+      assert {:error, %Postgrex.Error{postgres: %{code: :undefined_function}}} =
                Adapter.execute(c, "SELECT only_there(name) FROM items", [], selecto_read: true)
 
       GenServer.stop(c)
@@ -807,47 +793,80 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     GenServer.stop(c)
   end
 
-  test "hand-built SQL touching an extension type refuses what it cannot prove", %{opts: opts} do
+  test "hand-built SQL touching an extension type runs as written (R68)", %{opts: opts} do
+    {:ok, c} = Adapter.connect(opts)
+
+    statements =
+      for where <- [
+            "ci::text = 'x'",
+            "CAST(ci AS text) = 'x'",
+            "COALESCE(ci, 'x') = 'x'",
+            "NULLIF(ci, 'x') = 'x'",
+            "GREATEST(ci, 'x') = 'x'",
+            "LEAST(ci, 'x') = 'x'",
+            "CASE WHEN id > 0 THEN ci END = 'x'",
+            "ci = (SELECT 'x')",
+            "id IN (SELECT id FROM items WHERE ci = 'x')",
+            "('MIXED') = ci",
+            "ci = 'MIXED'",
+            "ci = 'ABC' COLLATE \"C\"",
+            "(ci, org) <> ('MIXED', 't1')"
+          ] do
+        "SELECT id FROM items WHERE #{where} ORDER BY id"
+      end ++
+        [
+          "SELECT ci FROM items UNION SELECT ci FROM items ORDER BY 1",
+          "WITH q AS (SELECT ci FROM items) SELECT ci FROM q ORDER BY 1",
+          "SELECT (ARRAY[ci])[1] FROM items ORDER BY 1",
+          "SELECT (SELECT 1)::int FROM cats WHERE id = 10"
+        ]
+
+    for sql <- statements do
+      assert {:ok, %{rows: native}} = Adapter.execute(c, sql, [], [])
+      assert {:ok, %{rows: ^native}} = Adapter.execute(c, sql, [], selecto_read: true), sql
+    end
+
+    GenServer.stop(c)
+  end
+
+  test "hand-built text must be a read, and its writes refuse (R68)", %{opts: opts} do
     {:ok, c} = Adapter.connect(opts)
     read = &Adapter.execute(c, &1, [], selecto_read: true)
 
-    for where <- [
-          "ci::text = 'x'",
-          "CAST(ci AS text) = 'x'",
-          "COALESCE(ci, 'x') = 'x'",
-          "NULLIF(ci, 'x') = 'x'",
-          "GREATEST(ci, 'x') = 'x'",
-          "LEAST(ci, 'x') = 'x'",
-          "CASE WHEN id > 0 THEN ci END = 'x'",
-          "ci = (SELECT 'x')",
-          "id IN (SELECT id FROM items WHERE ci = 'x')"
+    for sql <- [
+          "COMMIT",
+          "ROLLBACK",
+          "DELETE FROM items",
+          "SET search_path = ext",
+          "EXPLAIN SELECT 1",
+          "/* SELECT */ COMMIT",
+          "-- SELECT\nCOMMIT",
+          "/* /* */ SELECT */ COMMIT",
+          "(COMMIT)",
+          "SELECTED",
+          "",
+          "/* never closed"
         ] do
-      assert {:error, %{details: %{reason: :sql_unprovable}}} =
-               read.("SELECT id FROM items WHERE #{where}"),
-             where
+      assert {:error, %{details: %{reason: :hand_built_not_a_read}}} = read.(sql), sql
     end
+
+    # Comments nest on the server: a word inside one is no first word.
+    assert {:ok, %{rows: [[1]]}} = read.("/* /* a */ b */ -- c\n ((SELECT 1))")
+    assert {:ok, %{rows: [[";"]]}} = read.("SELECT ';'")
 
     for sql <- [
-          "SELECT ci FROM items UNION SELECT ci FROM items",
-          "WITH q AS (SELECT ci FROM items) SELECT ci FROM q",
-          "SELECT (ARRAY[ci])[1] FROM items"
+          "WITH d AS (DELETE FROM items RETURNING id) SELECT id FROM d",
+          "SELECT id FROM items FOR UPDATE",
+          "SELECT id INTO TEMP selecto_into FROM items"
         ] do
-      assert {:error, %{details: %{reason: :sql_unprovable}}} = read.(sql), sql
+      assert {:error, %{details: %{reason: :read_only_read}}} = read.(sql), sql
     end
 
-    assert {:ok, %{rows: [[1], [3], [5]]}} =
-             read.("SELECT id FROM items WHERE ('MIXED') = ci ORDER BY id")
+    # One statement is the driver's rule: nothing can follow the read.
+    assert {:error, %Postgrex.Error{postgres: %{code: :syntax_error}}} =
+             read.("SELECT 1; DELETE FROM items")
 
-    # Direct comparisons are proved; a statement with no extension type is free.
-    assert {:ok, %{rows: [[1], [3], [5]]}} =
-             read.("SELECT id FROM items WHERE ci = 'MIXED' ORDER BY id")
-
-    assert {:ok, %{rows: [[2]]}} =
-             read.(
-               "SELECT id FROM items WHERE CASE WHEN n > 6 THEN COALESCE(name, 'x') END = 'SECRET'"
-             )
-
-    assert {:ok, %{rows: [[1]]}} = read.("SELECT (SELECT 1)::int FROM cats WHERE id = 10")
+    assert %{rows: [[4]]} = exec!(c, "SELECT count(*) FROM items")
     GenServer.stop(c)
   end
 
@@ -892,55 +911,98 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
              SelectoDBPostgreSQL.RelationPath.resolve(other, ["t"], false)
   end
 
+  test "a failed RELEASE SAVEPOINT undoes the write (R70)" do
+    released = fn sql, answers ->
+      if String.starts_with?(sql, "RELEASE"),
+        do: Agent.get_and_update(answers, fn [a | rest] -> {a, rest} end),
+        else: {:ok, :sent}
+    end
+
+    failed = {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}}
+
+    # The savepoint goes, and the write is reported failed.
+    {:ok, answers} = Agent.start_link(fn -> [failed, {:ok, :released}] end)
+    sent = :ets.new(:sent, [:public, :ordered_set])
+
+    query = fn sql ->
+      :ets.insert(sent, {System.unique_integer([:monotonic]), sql})
+      released.(sql, answers)
+    end
+
+    assert {:error, %{type: :transaction_failed}} =
+             Adapter.with_savepoint(query, fn -> {:ok, :written} end)
+
+    assert [{_, "SAVEPOINT " <> name}, {_, "RELEASE " <> _}, {_, rollback}, {_, _release}] =
+             :ets.tab2list(sent)
+
+    assert rollback == "ROLLBACK TO SAVEPOINT " <> name
+
+    # The undo fails as well: the caller is told the connection is broken.
+    undo_fails = fn sql ->
+      if String.starts_with?(sql, "SAVEPOINT"), do: {:ok, :sent}, else: failed
+    end
+
+    assert {:error, %{details: %{connection_broken: true}}} =
+             Adapter.with_savepoint(undo_fails, fn -> {:ok, :written} end)
+  end
+
   test "text without the executor's stamp is hand-built, whatever it is passed with", %{
     opts: opts
   } do
     {:ok, c} = Adapter.connect(opts)
-    sql = "SELECT id FROM public.items WHERE COALESCE(ci, 'x') = 'MIXED' ORDER BY id"
+    sql = "SELECT id FROM public.items WHERE (ci, org) = ('MIXED', 't1') ORDER BY id"
     relations = %{SelectoDBPostgreSQL.RelationPath.path_key() => ["public", "ext"]}
     read = &Adapter.execute(c, sql, [], [selecto_read: true] ++ &1)
 
-    assert {:error, %{details: %{reason: :sql_unprovable}}} =
-             read.(selecto_qualified_relations: relations)
+    assert {:ok, %{rows: rows}} = Adapter.execute(c, sql, [], [])
+    assert {:ok, %{rows: ^rows}} = read.(selecto_qualified_relations: relations)
+    assert {:ok, %{rows: ^rows}} = read.(selecto_generated: true)
 
-    assert {:ok, %{rows: [[1], [3], [5]]}} =
+    assert {:error, %{details: %{reason: :operand_type_unknown}}} =
              read.(selecto_generated: true, selecto_qualified_relations: relations)
 
     GenServer.stop(c)
   end
 
-  test "raw SQL in a generated read touching an extension type refuses", %{opts: opts} do
+  test "raw SQL in a generated read runs as written, the rest of it as compiled (R68)", %{
+    opts: opts
+  } do
     {:ok, c} = Adapter.connect(opts)
 
     raw = fn filter ->
       c |> base(domain()) |> Selecto.select(["id"]) |> Selecto.filter(filter) |> run()
     end
 
-    assert {:refused, :sql_unprovable} = raw.({:raw_sql_filter, ["ci::text = 'x'"]})
-    assert {:refused, :sql_unprovable} = raw.({:raw_sql_filter, ["COALESCE(ci, 'x') = 'x'"]})
-
-    assert {:refused, :sql_unprovable} =
-             raw.({"ci", {:subquery, :in, "SELECT code FROM codes", []}})
-
-    assert {:refused, :sql_unprovable} = raw.({:exists, "SELECT 1 FROM items x WHERE x.ci = 'a'"})
-
-    # The whole statement counts, and it reads no extension column.
-    plain = fn filter ->
-      c |> base(domain()) |> Selecto.select(["id", "n"]) |> Selecto.filter(filter) |> run()
+    native = fn where ->
+      exec!(c, "SELECT id FROM items WHERE org = 't1' AND #{where} ORDER BY id").rows
+      |> Enum.sort()
     end
 
-    refute match?({:refused, _}, plain.({:raw_sql_filter, ["n > 6"]}))
+    sorted = fn {:ok, rows} -> Enum.sort(rows) end
+
+    assert sorted.(raw.({:raw_sql_filter, ["ci::text = 'MIXED'"]})) ==
+             native.("ci::text = 'MIXED'")
+
+    assert sorted.(raw.({:raw_sql_filter, ["COALESCE(ci, 'x') = 'mixed'"]})) ==
+             native.("COALESCE(ci, 'x') = 'mixed'")
+
+    assert sorted.(raw.({:exists, "SELECT 1 FROM items x WHERE x.ci = 'mixed'"})) ==
+             native.("EXISTS (SELECT 1 FROM items x WHERE x.ci = 'mixed')")
+
+    assert {:ok, _} = raw.({"ci", {:subquery, :in, "SELECT code FROM codes", []}})
     GenServer.stop(c)
   end
 
-  test "custom_sql templates are read after substitution (M3)", %{opts: opts} do
+  test "custom_sql templates run as written (M3, R68)", %{opts: opts} do
     {:ok, c} = Adapter.connect(opts)
     read = fn selector -> c |> base(domain()) |> Selecto.select(["id", selector]) |> run() end
 
-    refute match?({:refused, _}, read.({:custom_sql, "upper({{f}})", %{"f" => "name"}}))
+    assert {:ok, rows} = read.({:custom_sql, "upper({{f}})", %{"f" => "name"}})
+    assert length(rows) == 3
 
-    assert {:refused, :sql_unprovable} =
-             read.({:custom_sql, "COALESCE({{f}}, 'x')", %{"f" => "ci"}})
+    assert {:ok, rows} = read.({:custom_sql, "COALESCE({{f}}, 'x')", %{"f" => "ci"}})
+    native = exec!(c, "SELECT id, COALESCE(ci, 'x') FROM items WHERE org = 't1'").rows
+    assert Enum.sort(rows) == Enum.sort(native)
 
     GenServer.stop(c)
   end
@@ -1010,12 +1072,13 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       assert micros < 30_000_000
     end
 
+    # Hand-built text is the server's to bound, and it answers.
     for sql <- [
-          "SELECT id FROM items WHERE #{wide}",
+          "SELECT id FROM items WHERE #{wide} ORDER BY id",
           "SELECT id FROM items WHERE name = '#{String.duplicate("a", 3_000_000)}'"
         ] do
-      assert {:error, %{details: %{reason: :statement_too_large}}} =
-               Adapter.execute(c, sql, [], selecto_read: true)
+      assert {:ok, %{rows: rows}} = Adapter.execute(c, sql, [], [])
+      assert {:ok, %{rows: ^rows}} = Adapter.execute(c, sql, [], selecto_read: true)
     end
 
     GenServer.stop(c)
@@ -1034,7 +1097,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
 
     try do
       {:ok, c} = Adapter.connect(opts)
-      read = &Adapter.execute(c, &1, [], selecto_read: true)
+      read = &typed(c, &1)
 
       for sql <- [
             "SELECT explain(n) FROM items",
@@ -1083,14 +1146,10 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       {:ok, c} = Adapter.connect(opts)
 
       assert {:ok, %{rows: [[1]]}} =
-               Adapter.execute(c, "SELECT id FROM deep16t WHERE k = 'mix'", [],
-                 selecto_read: true
-               )
+               typed(c, "SELECT id FROM deep16t WHERE k = 'mix'", ["deep16t"])
 
       assert {:error, %{details: %{reason: :domain_chain_too_deep}}} =
-               Adapter.execute(c, "SELECT id FROM deep17t WHERE k = 'mix'", [],
-                 selecto_read: true
-               )
+               typed(c, "SELECT id FROM deep17t WHERE k = 'mix'", ["deep17t"])
 
       GenServer.stop(c)
     after
@@ -1168,7 +1227,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
         end)
       end
 
-      read = &Adapter.execute(&1, &2, [], selecto_read: true)
+      read = &typed(&1, &2, ["rr"])
 
       # Nothing changed: the read runs.
       in_snapshot.(fn conn ->

@@ -85,10 +85,6 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
   @max_rendered_bytes 4_194_304
 
-  # What hand-built SQL may not touch an extension type through (user ruling
-  # 2026-11-06): the typer proves direct comparisons, no more.
-  @unprovable ~w(CASE COALESCE NULLIF GREATEST LEAST CAST UNION INTERSECT EXCEPT VALUES)
-
   @boolean_op ~w(= <> != < > <= >= ~~ ~~* !~~ !~~* ~ ~* !~ !~* @> <@ && ^@ ? ?| ?& @? @@)
 
   @system_column ~w(tableoid ctid xmin xmax cmin cmax)
@@ -111,64 +107,6 @@ defmodule SelectoDBPostgreSQL.Qualify do
   @op_chars ~c"+-*/<>=~!@#%^&|`?"
 
   # ---- Tokens ------------------------------------------------------------
-
-  @doc """
-  Refuses hand-built SQL that touches an extension type through anything the
-  qualifier cannot prove: casts, subscripts, COALESCE, CASE, GREATEST, LEAST,
-  NULLIF, subqueries, set operations. A statement that touches none keeps
-  working. Selecto guards what it generates; a refusal here is acceptable, a
-  guess is not.
-  """
-  def prove!(tokens, facts) do
-    if touches_extension?(tokens, facts) and unprovable?(tokens), do: unproved!()
-    :ok
-  end
-
-  defp unproved!,
-    do:
-      refuse(
-        :sql_unprovable,
-        "hand-built SQL touches an extension type through something Selecto cannot prove"
-      )
-
-  defp touches_extension?(tokens, facts) do
-    columns = extension_columns(facts)
-
-    Enum.any?(tokens, fn
-      {kind, _} = token when kind in [:id, :qid] -> MapSet.member?(columns, unquote_name(token))
-      {:op, "*"} -> MapSet.size(columns) > 0
-      _other -> false
-    end) or map_size(Map.get(facts, :casts, %{})) > 0 or outside_catalog?(facts)
-  end
-
-  defp extension_columns(facts) do
-    for {_relation, columns} <- Map.get(facts, :relations, %{}),
-        {name, entry} <- columns,
-        extension?(entry) or entry[:unknown] == true or is_map(entry[:elem]),
-        into: MapSet.new(),
-        do: name
-  end
-
-  defp outside_catalog?(facts) do
-    facts
-    |> Map.get(:functions, %{})
-    |> Enum.any?(fn {_key, info} -> Enum.any?(info.candidates, &(&1.schema != "pg_catalog")) end)
-  end
-
-  defp unprovable?(tokens) do
-    {found?, _previous, count} =
-      Enum.reduce(tokens, {false, nil, 0}, fn token, {found?, previous, count} ->
-        up = upper(token)
-
-        found? =
-          found? or up in @unprovable or up == "WITH" or token == {:punct, "::"} or
-            (token == {:punct, "["} and upper(previous) != "ARRAY")
-
-        {found?, token, if(up == "SELECT", do: count + 1, else: count)}
-      end)
-
-    found? or count > 1
-  end
 
   @doc "A name token as PostgreSQL folds it: U& decoded, bare names in lower case."
   def folded_name({kind, _} = token) when kind in [:id, :qid], do: unquote_name(token)
