@@ -74,7 +74,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
                THEN 'polymorphic' ELSE '' END,
              (SELECT #{@quoted_argument} FROM pg_catalog.pg_type t
               JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} t.typnamespace
-              WHERE t.oid #{@op} p.prorettype))
+              WHERE t.oid #{@op} p.prorettype),
+             CAST(p.provolatile AS pg_catalog.text))
            FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), pg_catalog.unnest($2::pg_catalog.text[])) AS k(sch, name)
            JOIN pg_catalog.pg_proc p ON CAST(p.proname AS pg_catalog.text) #{@op} k.name
            JOIN pg_catalog.pg_namespace n ON n.oid #{@op} p.pronamespace
@@ -267,6 +268,11 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   WHERE c.castcontext #{@op} 'i'
   """
 
+  # M6: the qualifier's cost grows faster than a statement, and the read's
+  # timeout does not bound CPU: a hard limit, refused typed.
+  @max_statement_bytes 2_097_152
+  @max_statement_tokens 50_000
+
   @doc false
   def lookup_statements, do: [@probe_sql, @relations_sql, @relations_rowsets_sql, @casts_sql]
 
@@ -280,19 +286,56 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     verify? = Keyword.get(opts, :isolation) not in [nil, "read committed"]
 
     try do
-      tokens = Qualify.tokenize(sql)
+      tokens = sized_tokens(sql)
       one_statement!(tokens)
       if Keyword.get(opts, :read) == true, do: read_statement!(tokens)
 
       cond do
-        Qualify.rewrite?(tokens) -> rewrite(execute, tokens, opts)
-        verify? -> with {:ok, _} <- facts(execute, tokens), do: {:ok, sql}
-        true -> {:ok, sql}
+        Keyword.get(opts, :hand_built) == true and not Qualify.rewrite?(tokens) ->
+          with {:ok, facts} <- facts(execute, tokens) do
+            Qualify.prove!(tokens, facts)
+            {:ok, sql}
+          end
+
+        Qualify.rewrite?(tokens) ->
+          rewrite(execute, tokens, opts)
+
+        verify? ->
+          with {:ok, _} <- facts(execute, tokens), do: {:ok, sql}
+
+        true ->
+          {:ok, sql}
       end
     catch
       {:qualify_refuse, reason, message} -> refuse(reason, message)
     end
   end
+
+  @doc """
+  `:ok`, or the typed refusal of a statement beyond the bound: checked before
+  a read spends anything on it.
+  """
+  def bounded(sql) do
+    _tokens = sql |> IO.iodata_to_binary() |> sized_tokens()
+    :ok
+  catch
+    {:qualify_refuse, :statement_too_large, message} -> refuse(:statement_too_large, message)
+    {:qualify_refuse, _reason, _message} -> :ok
+  end
+
+  defp sized_tokens(sql) do
+    if byte_size(sql) > @max_statement_bytes, do: too_large!()
+    tokens = Qualify.tokenize(sql)
+    if length(tokens) > @max_statement_tokens, do: too_large!()
+    tokens
+  end
+
+  defp too_large!,
+    do:
+      throw(
+        {:qualify_refuse, :statement_too_large,
+         "a statement beyond the size Selecto will qualify; split it"}
+      )
 
   # Only the last token may be a semicolon: Selecto generates one statement,
   # and what follows a semicolon would run past every check of the first.
@@ -316,6 +359,10 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   defp rewrite(execute, tokens, opts) do
     with {:ok, facts} <- facts(execute, tokens) do
       facts = Map.put(facts, :declared_functions, Keyword.get(opts, :declared_functions, []))
+      if Keyword.get(opts, :hand_built) == true, do: Qualify.prove!(tokens, facts)
+
+      for text <- Keyword.get(opts, :raw_fragments, []),
+          do: Qualify.prove_fragment!(Qualify.tokenize(text), facts)
 
       case Qualify.qualify(tokens, facts) do
         {:ok, sql} ->
@@ -397,7 +444,20 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
 
   defp functions(candidates) do
     Enum.reduce(candidates, %{}, fn row, acc ->
-      [sch, name, schema, nargs, defaults, args, variadic, member, extension, polymorphic, ret] =
+      [
+        sch,
+        name,
+        schema,
+        nargs,
+        defaults,
+        args,
+        variadic,
+        member,
+        extension,
+        polymorphic,
+        ret,
+        vol
+      ] =
         String.split(row, <<31>>)
 
       key = if sch == "", do: name, else: {sch, name}
@@ -410,7 +470,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
         variadic: if(variadic == "", do: nil, else: variadic),
         member: member == "member",
         extension: if(extension == "", do: nil, else: extension),
-        ret: ret
+        ret: ret,
+        volatile: vol == "v"
       }
 
       polymorphic? = polymorphic == "polymorphic" and schema == "pg_catalog"

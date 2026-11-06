@@ -4,6 +4,14 @@ CHANGES
 Unreleased
 ----------
 
+- Hand-built SQL and raw text inside a generated read are no longer typed: one
+  touching an extension type through a cast, subscript, COALESCE, CASE, GREATEST,
+  LEAST, NULLIF, subquery or set operation refuses `:sql_unprovable`. With no
+  extension type it runs as before. CTE names are read from tokens. NULLIF's
+  result is coerced to the type its equality took; a volatile first operand of
+  NULLIF or a simple CASE refuses `:volatile_operand`. A statement beyond 2 MiB,
+  50,000 tokens or 4 MiB rendered refuses `:statement_too_large`.
+  client_encoding is read by `pg_client_encoding()`, so UNICODE counts as UTF8.
 - Every statement runs unnamed, whatever the configuration (R63): code a
   statement reaches could DEALLOCATE and PREPARE a named one, and the driver
   bound the replacement. The `statement_cache` setting is removed. Transaction

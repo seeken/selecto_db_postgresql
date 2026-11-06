@@ -189,8 +189,15 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
                   "FROM pg_catalog.pg_type t WHERE t.typnamespace OPERATOR(pg_catalog.=) #{@temp}), 'end') " <>
                   "AS selecto_guard_session"
 
-  @setting_columns Enum.map_join(Enum.with_index(@settings), ", ", fn {name, index} ->
-                     "pg_catalog.current_setting('#{name}') AS selecto_guard_setting_#{index}"
+  # client_encoding by its canonical name: the setting keeps a spelling like
+  # UNICODE, which is UTF8.
+  @setting_columns Enum.map_join(Enum.with_index(@settings), ", ", fn
+                     {"client_encoding", index} ->
+                       "CAST(pg_catalog.pg_client_encoding() AS pg_catalog.text) " <>
+                         "AS selecto_guard_setting_#{index}"
+
+                     {name, index} ->
+                       "pg_catalog.current_setting('#{name}') AS selecto_guard_setting_#{index}"
                    end)
 
   # A read leaves the deferrable triggers out (R61): only writes refuse on
