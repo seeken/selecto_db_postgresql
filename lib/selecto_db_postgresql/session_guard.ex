@@ -273,7 +273,8 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   setting to its reset value for the rest of the current transaction
   (set_config(..., true)), in one statement; run only inside Selecto's own
   transaction or savepoint, after the snapshot it is compared with. Returns
-  `{:ok, pinned}`, each setting's value as the server normalised it.
+  `{:ok, pinned}`, each setting's value as the server normalised it, and
+  `:isolation`, the transaction's level (R49a).
   """
   def pin(execute, path) do
     names = ["search_path" | @pinned]
@@ -288,13 +289,17 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
         "AS selecto_guard_pin_0, " <>
         Enum.map_join(Enum.with_index(@pinned, 1), ", ", fn {name, index} ->
           "pg_catalog.set_config('#{name}', #{reset.(name)}, true) AS selecto_guard_pin_#{index}"
-        end)
+        end) <>
+        ", pg_catalog.current_setting('transaction_isolation') AS selecto_guard_pin_isolation"
 
     # An unreadable reset value (NULL, or an error) fails closed.
     case execute.(sql, [path]) do
-      {:ok, %{rows: [values]}} when length(values) == length(names) ->
+      {:ok, %{rows: [values]}} when length(values) == length(names) + 1 ->
+        {values, [isolation]} = Enum.split(values, length(names))
+
         if Enum.all?(values, &is_binary/1),
-          do: {:ok, Map.new(Enum.zip(names, values))},
+          do:
+            {:ok, values |> then(&Map.new(Enum.zip(names, &1))) |> Map.put(:isolation, isolation)},
           else: unavailable()
 
       _other ->
@@ -308,6 +313,7 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   still in place, so a statement that switched one in between refuses.
   """
   def unpin(execute, pinned, %{settings: settings}) do
+    pinned = Map.delete(pinned, :isolation)
     names = Map.keys(pinned) |> Enum.sort()
     count = length(names)
 

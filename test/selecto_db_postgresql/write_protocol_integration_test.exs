@@ -60,7 +60,7 @@ defmodule SelectoDBPostgreSQL.WriteProtocolIntegrationTest do
     {:ok, insert} =
       Command.new(%{
         operation: :insert,
-        relation: :selecto_temporal_write,
+        relation: "pg_temp.selecto_temporal_write",
         assignments: [
           %{field: :id, value: {:literal, 1}},
           %{field: :read_on, value: {:literal, "2026-10-28"}},
@@ -74,7 +74,7 @@ defmodule SelectoDBPostgreSQL.WriteProtocolIntegrationTest do
     {:ok, update} =
       Command.new(%{
         operation: :update,
-        relation: :selecto_temporal_write,
+        relation: "pg_temp.selecto_temporal_write",
         assignments: [%{field: :read_on, value: {:literal, "2026-10-29"}}],
         predicate: {:eq, {:field, :read_on}, {:literal, "2026-10-28"}},
         expected_cardinality: {:exactly, 1},

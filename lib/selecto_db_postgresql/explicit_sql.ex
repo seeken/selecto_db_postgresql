@@ -1,418 +1,578 @@
 defmodule SelectoDBPostgreSQL.ExplicitSQL do
   @moduledoc false
 
-  # R46 FINAL-2 / R47: the last step before a Selecto statement reaches
-  # PostgreSQL. Every function it calls without a schema is qualified with
-  # the schema PostgreSQL would choose under the pinned search_path, so a
-  # same-named function in another schema with a closer argument match
-  # (public.lower(varchar)) can never be chosen: pg_catalog's when it has
-  # one, else the first pinned schema that defines it (an extension's own
-  # schema). The statement is then refused (`bare_operator`) if a
-  # comparison or pattern operator is still written bare (outside
-  # OPERATOR(...)) or a function stays unqualified: no Selecto statement
-  # runs by name-based operator or function lookup. Builders that still
-  # write plain comparisons (tagging, hierarchy, OLAP, enhanced joins,
-  # subfilters) are refused on PostgreSQL this way.
+  # R46 FINAL-2 / R47 / R49 / R50: the last step before a Selecto statement
+  # reaches PostgreSQL. A statement that already names every operator and
+  # function runs as it is (no catalog read); any other goes through
+  # SelectoDBPostgreSQL.Qualify with the catalog facts it needs, read here
+  # under the statement's own pin: the candidates of each function it calls
+  # among the pinned schemas (a temp schema never), and, when an extension
+  # type exists in the database, what each column of each relation it reads
+  # has of an extension member type: its operators and functions, always
+  # pg_depend members of the type's own extension, never a user object
+  # beside them. The result is linted again: nothing runs by name-based
+  # operator or function lookup, and a statement that cannot be made
+  # explicit refuses, typed.
+  #
+  # R49a: under REPEATABLE READ or SERIALIZABLE the catalog is read at the
+  # transaction's snapshot while the statement plans against the current
+  # catalog, so the types of the columns a statement names are read again
+  # through the parser (pg_typeof((NULL::relation).column)); a difference
+  # refuses.
 
-  alias SelectoDBPostgreSQL.RelationPath.Scanner
   alias Selecto.Write.Error
+  alias SelectoDBPostgreSQL.Qualify
 
-  # Words followed by "(" that are SQL syntax, not function calls.
-  @syntax ~w(select from where and or not in exists any all some values array row cast coalesce
-             nullif greatest least extract overlay position substring trim over filter within
-             partition using on join lateral union intersect except as into table with recursive
-             when then else case end by group order having limit offset fetch for distinct only
-             rows range groups unnest_ordinality grouping sets cube rollup set returning conflict
-             do update insert delete merge matched default interval operator like ilike between
-             is null true false collate escape first last asc desc nulls window ordinality
-             materialized lock share nowait skip locked of key primary references check
-             constraint unique foreign xmlelement xmlforest xmlattributes json_object json_array
-             json_arrayagg json_objectagg normalize treat convert merge_action current_date
-             current_time current_timestamp localtime localtimestamp)
+  @op "OPERATOR(pg_catalog.=)"
+  @type_class "CAST('pg_catalog.pg_type' AS pg_catalog.regclass)"
+  @proc_class "CAST('pg_catalog.pg_proc' AS pg_catalog.regclass)"
+  @operator_class "CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)"
+  @any_result "CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray}' AS pg_catalog.regtype[])"
+  @any_argument "CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray,anyarray,anycompatiblearray}' AS pg_catalog.regtype[])"
 
-  @comparison ~w(= <> != < > <= >= ~~ !~~ ~~* !~~* ~ !~ ~* !~*)
-  @comparison_words ~w(like ilike in between similar)
+  @quoted_argument "pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.', " <>
+                     "pg_catalog.quote_ident(CAST(t.typname AS pg_catalog.text)))"
 
-  @lookup_sql """
-  SELECT r.name AS selecto_guard_function_name,
-         (SELECT CAST(n.nspname AS pg_catalog.text)
-          FROM pg_catalog.pg_proc p
-          JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
-          JOIN pg_catalog.unnest(pg_catalog.current_schemas(true)) WITH ORDINALITY AS s(nsp, ord)
-            ON s.nsp OPERATOR(pg_catalog.=) n.nspname
-          WHERE p.proname OPERATOR(pg_catalog.=) r.name
-            AND n.oid OPERATOR(pg_catalog.<>) pg_catalog.pg_my_temp_schema()
-          ORDER BY (n.oid OPERATOR(pg_catalog.=) CAST(11 AS pg_catalog.oid)) DESC, s.ord
-          LIMIT 1) AS selecto_guard_function_schema
-  FROM pg_catalog.unnest($1::pg_catalog.text[]) AS r(name)
+  @quoted_variadic "pg_catalog.concat(pg_catalog.quote_ident(CAST(vn.nspname AS pg_catalog.text)), '.', " <>
+                     "pg_catalog.quote_ident(CAST(vt.typname AS pg_catalog.text)))"
+
+  # Whether any extension-owned type exists, the isolation level and every
+  # candidate of the functions a statement calls: `$1` the schema a call
+  # names ('' for none), `$2` the names. A bare name looks in the pinned
+  # schemas only.
+  @probe_sql """
+  SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+           WHERE d.classid #{@op} #{@type_class} AND d.deptype #{@op} 'e')
+           AS selecto_guard_extension_types,
+         pg_catalog.current_setting('transaction_isolation') AS selecto_guard_isolation,
+         ARRAY(SELECT pg_catalog.concat_ws(pg_catalog.chr(31), k.sch, k.name,
+             CAST(n.nspname AS pg_catalog.text), p.pronargs, p.pronargdefaults,
+             pg_catalog.array_to_string(ARRAY(SELECT #{@quoted_argument}
+               FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) WITH ORDINALITY AS u(o, i)
+               JOIN pg_catalog.pg_type t ON t.oid #{@op} u.o
+               JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} t.typnamespace
+               ORDER BY u.i), pg_catalog.chr(30)),
+             COALESCE((SELECT #{@quoted_variadic}
+               FROM pg_catalog.pg_type vt
+               JOIN pg_catalog.pg_namespace vn ON vn.oid #{@op} vt.typnamespace
+               WHERE vt.oid #{@op} p.provariadic), ''),
+             CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend pd
+                 WHERE pd.classid #{@op} #{@proc_class} AND pd.objid #{@op} p.oid
+                   AND pd.deptype #{@op} 'e'
+                   AND EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) AS ua(t)
+                     JOIN pg_catalog.pg_depend td ON td.classid #{@op} #{@type_class}
+                       AND td.objid #{@op} ua.t AND td.deptype #{@op} 'e'
+                       AND td.refobjid #{@op} pd.refobjid))
+               THEN 'member' ELSE '' END,
+             COALESCE((SELECT CAST(pg_catalog.min(xd.refobjid) AS pg_catalog.text)
+               FROM pg_catalog.pg_depend xd
+               WHERE xd.classid #{@op} #{@proc_class} AND xd.objid #{@op} p.oid
+                 AND xd.deptype #{@op} 'e'), ''),
+             CASE WHEN CAST(p.prorettype AS pg_catalog.regtype) #{@op} ANY (#{@any_result})
+                    AND EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) AS a(t)
+                      WHERE CAST(a.t AS pg_catalog.regtype) #{@op} ANY (#{@any_argument}))
+               THEN 'polymorphic' ELSE '' END)
+           FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), pg_catalog.unnest($2::pg_catalog.text[])) AS k(sch, name)
+           JOIN pg_catalog.pg_proc p ON CAST(p.proname AS pg_catalog.text) #{@op} k.name
+           JOIN pg_catalog.pg_namespace n ON n.oid #{@op} p.pronamespace
+           WHERE p.prokind OPERATOR(pg_catalog.<>) 'p'
+             AND n.oid OPERATOR(pg_catalog.<>)
+                   COALESCE(pg_catalog.pg_my_temp_schema(), CAST(0 AS pg_catalog.oid))
+             AND CASE WHEN k.sch #{@op} ''
+                   THEN n.nspname #{@op} ANY (pg_catalog.current_schemas(true))
+                   ELSE CAST(n.nspname AS pg_catalog.text) #{@op} k.sch END)
+           AS selecto_guard_function_candidates
   """
+
+  # The domain-and-array walk of every column of the named relations (`$1`).
+  @columns_ctes """
+  a AS (SELECT r.rel, at.attname, at.atttypid
+    FROM pg_catalog.unnest($1::pg_catalog.text[]) AS r(rel)
+    JOIN pg_catalog.pg_attribute at ON at.attrelid #{@op} pg_catalog.to_regclass(r.rel)
+      AND at.attnum OPERATOR(pg_catalog.>) 0 AND NOT at.attisdropped),
+  c(rel, att, oid, depth, arr) AS (
+    SELECT a.rel, a.attname, a.atttypid, 0, false FROM a
+    UNION ALL
+    SELECT c.rel, c.att, CASE WHEN t.typtype #{@op} 'd' THEN t.typbasetype ELSE t.typelem END,
+      c.depth OPERATOR(pg_catalog.+) 1, c.arr OR t.typtype OPERATOR(pg_catalog.<>) 'd'
+    FROM c JOIN pg_catalog.pg_type t ON t.oid #{@op} c.oid
+    WHERE c.depth OPERATOR(pg_catalog.<) 16 AND (t.typtype #{@op} 'd' OR (NOT c.arr
+      AND t.typtype #{@op} 'b' AND t.typcategory #{@op} 'A'
+      AND t.typelem OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)
+      AND t.typlen OPERATOR(pg_catalog.<) 0))),
+  e AS (SELECT c.rel, c.att, c.arr, ty.oid, d.refobjid FROM c
+    JOIN pg_catalog.pg_type ty ON ty.oid #{@op} c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
+    JOIN pg_catalog.pg_depend d ON d.classid #{@op} #{@type_class}
+      AND d.objid #{@op} ty.oid AND d.deptype #{@op} 'e')
+  """
+
+  # Types an extension owns, domains over them and arrays of them, and each
+  # function a statement reads rows from (`$2`) with its output types.
+  @rowset_ctes """
+  , x(oid, depth) AS (
+    SELECT d.objid, 0 FROM pg_catalog.pg_depend d
+    WHERE d.classid #{@op} #{@type_class} AND d.deptype #{@op} 'e'
+    UNION ALL
+    SELECT t.oid, x.depth OPERATOR(pg_catalog.+) 1 FROM pg_catalog.pg_type t
+    JOIN x ON t.typbasetype #{@op} x.oid OR t.typelem #{@op} x.oid
+    WHERE x.depth OPERATOR(pg_catalog.<) 16),
+  f AS (SELECT p.oid, p.proname, CASE WHEN p.proallargtypes IS NULL THEN ARRAY[p.prorettype]
+      ELSE ARRAY(SELECT u.t FROM ROWS FROM (pg_catalog.unnest(p.proallargtypes), pg_catalog.unnest(p.proargmodes)) AS u(t, m)
+        WHERE u.m #{@op} ANY (CAST('{o,b,t}' AS pg_catalog."char"[]))) END AS outs
+    FROM pg_catalog.pg_proc p
+    WHERE CAST(p.proname AS pg_catalog.text) #{@op} ANY ($2::pg_catalog.text[]))
+  """
+
+  @none "CAST(NULL AS pg_catalog.text)"
+  @no_args "CAST(NULL AS pg_catalog.text[])"
+
+  @columns_rows """
+  SELECT 'col' AS selecto_guard_fact, CAST(a.rel AS pg_catalog.text) AS selecto_guard_fact_relation,
+    CAST(a.attname AS pg_catalog.text) AS selecto_guard_fact_column,
+    CAST(a.atttypid AS pg_catalog.text) AS selecto_guard_fact_name, #{@none} AS selecto_guard_fact_schema,
+    #{@no_args} AS selecto_guard_fact_arguments FROM a
+  UNION ALL
+  SELECT 'deep', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), #{@none}, #{@none}, #{@no_args}
+  FROM c JOIN pg_catalog.pg_type ty ON ty.oid #{@op} c.oid AND ty.typtype #{@op} 'd'
+  WHERE c.depth #{@op} 16
+  UNION ALL
+  SELECT CASE WHEN e.arr THEN 'eop' ELSE 'op' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
+    CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text), #{@no_args}
+  FROM e JOIN pg_catalog.pg_operator o ON o.oprleft #{@op} e.oid AND o.oprright #{@op} e.oid
+  JOIN pg_catalog.pg_depend od ON od.classid #{@op} #{@operator_class}
+    AND od.objid #{@op} o.oid AND od.deptype #{@op} 'e' AND od.refobjid #{@op} e.refobjid
+  JOIN pg_catalog.pg_namespace n ON n.oid #{@op} o.oprnamespace
+  WHERE o.oprnamespace #{@op} (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid #{@op} e.oid)
+  UNION ALL
+  SELECT CASE WHEN e.arr THEN 'etyp' ELSE 'typ' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
+    pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
+      pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))), #{@none}, #{@no_args}
+  FROM e JOIN pg_catalog.pg_type ty ON ty.oid #{@op} e.oid
+  JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} ty.typnamespace
+  UNION ALL
+  SELECT CASE WHEN e.arr THEN 'efn' ELSE 'fn' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
+    CAST(p.proname AS pg_catalog.text),
+    pg_catalog.concat(n.nspname, CASE WHEN p.prorettype #{@op} e.oid THEN '|self' ELSE '' END),
+    ARRAY(SELECT #{@quoted_argument}
+      FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) WITH ORDINALITY AS u(o, i)
+      JOIN pg_catalog.pg_type t ON t.oid #{@op} u.o
+      JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} t.typnamespace
+      ORDER BY u.i)
+  FROM e JOIN pg_catalog.pg_proc p ON p.pronargs OPERATOR(pg_catalog.>=) CAST(1 AS pg_catalog.int2)
+    AND p.proargtypes[0] #{@op} e.oid AND p.prokind OPERATOR(pg_catalog.<>) 'p'
+  JOIN pg_catalog.pg_depend pd ON pd.classid #{@op} #{@proc_class}
+    AND pd.objid #{@op} p.oid AND pd.deptype #{@op} 'e' AND pd.refobjid #{@op} e.refobjid
+  JOIN pg_catalog.pg_namespace n ON n.oid #{@op} p.pronamespace
+  WHERE p.pronamespace #{@op} (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid #{@op} e.oid)
+  """
+
+  @rowset_rows """
+  UNION ALL
+  SELECT 'fun', #{@none}, CAST(f.proname AS pg_catalog.text), #{@none},
+    CASE WHEN pg_catalog.bool_or(EXISTS (SELECT 1 FROM pg_catalog.unnest(f.outs) AS o(t)
+      JOIN pg_catalog.pg_type ot ON ot.oid #{@op} o.t
+      WHERE o.t #{@op} ANY (ARRAY(SELECT x.oid FROM x))
+        OR (ot.typtype #{@op} 'p' AND ot.oid OPERATOR(pg_catalog.<>) CAST('pg_catalog.record' AS pg_catalog.regtype)
+          AND EXISTS (SELECT 1 FROM x))
+        OR (ot.typtype #{@op} 'c' AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute ca
+          WHERE ca.attrelid #{@op} ot.typrelid AND ca.attnum OPERATOR(pg_catalog.>) 0 AND NOT ca.attisdropped
+            AND ca.atttypid #{@op} ANY (ARRAY(SELECT x.oid FROM x))))))
+      THEN 'unknown' ELSE 'known' END, #{@no_args}
+  FROM f GROUP BY f.proname
+  UNION ALL
+  SELECT CASE WHEN o.op IS NULL THEN 'fcol' ELSE 'fop' END, CAST(w.pos AS pg_catalog.text),
+    CAST(f.proname AS pg_catalog.text), o.op, o.schema, #{@no_args}
+  FROM f JOIN LATERAL (SELECT u.pos, u.t FROM pg_catalog.unnest(f.outs) WITH ORDINALITY AS u(t, pos)) AS w ON TRUE
+  JOIN pg_catalog.pg_type wt ON wt.oid #{@op} w.t
+  JOIN LATERAL (
+    SELECT #{@none} AS op, CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+        WHERE d.classid #{@op} #{@type_class} AND d.deptype #{@op} 'e' AND d.objid #{@op} w.t)
+        THEN pg_catalog.concat('ext:', pg_catalog.quote_ident(CAST((SELECT tn.nspname FROM pg_catalog.pg_namespace tn
+          WHERE tn.oid #{@op} wt.typnamespace) AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(wt.typname AS pg_catalog.text)))
+      WHEN w.t #{@op} ANY (ARRAY(SELECT x.oid FROM x)) OR wt.typtype #{@op} 'p'
+        OR wt.typtype #{@op} 'c' THEN 'unknown' ELSE 'known' END AS schema
+    UNION ALL
+    SELECT CAST(op.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
+    FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_operator op ON op.oprleft #{@op} w.t AND op.oprright #{@op} w.t
+    JOIN pg_catalog.pg_depend od ON od.classid #{@op} #{@operator_class}
+      AND od.objid #{@op} op.oid AND od.deptype #{@op} 'e' AND od.refobjid #{@op} d.refobjid
+    JOIN pg_catalog.pg_namespace n ON n.oid #{@op} op.oprnamespace
+    WHERE d.classid #{@op} #{@type_class} AND d.deptype #{@op} 'e' AND d.objid #{@op} w.t) AS o ON TRUE
+  WHERE (SELECT pg_catalog.count(*) FROM f g WHERE g.proname #{@op} f.proname) #{@op} CAST(1 AS pg_catalog.int8)
+  """
+
+  @relations_sql "WITH RECURSIVE\n" <> @columns_ctes <> @columns_rows
+
+  @relations_rowsets_sql "WITH RECURSIVE\n" <>
+                           @columns_ctes <> @rowset_ctes <> @columns_rows <> @rowset_rows
+
+  # A cast target's extension type (through any domain chain), its own
+  # operators and its qualified name: `$1` the keys, `$2` as spelled.
+  @casts_sql """
+  WITH RECURSIVE k(name, spelled) AS (
+    SELECT * FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), pg_catalog.unnest($2::pg_catalog.text[]))),
+  c(name, oid, depth) AS (
+    SELECT k.name, CAST(pg_catalog.to_regtype(k.spelled) AS pg_catalog.oid), 0 FROM k
+    UNION ALL
+    SELECT c.name, t.typbasetype, c.depth OPERATOR(pg_catalog.+) 1
+    FROM c JOIN pg_catalog.pg_type t ON t.oid #{@op} c.oid
+    WHERE t.typtype #{@op} 'd' AND c.depth OPERATOR(pg_catalog.<) 16),
+  e AS (SELECT c.name, ty.oid, ty.typnamespace, d.refobjid FROM c
+    JOIN pg_catalog.pg_type ty ON ty.oid #{@op} c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
+    JOIN pg_catalog.pg_depend d ON d.classid #{@op} #{@type_class}
+      AND d.objid #{@op} ty.oid AND d.deptype #{@op} 'e')
+  SELECT 'typ' AS selecto_guard_cast_fact, e.name AS selecto_guard_cast_key,
+    pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
+      pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))) AS selecto_guard_cast_name,
+    #{@none} AS selecto_guard_cast_schema
+  FROM e JOIN pg_catalog.pg_type ty ON ty.oid #{@op} e.oid
+  JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} ty.typnamespace
+  UNION ALL
+  SELECT 'op', e.name, CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
+  FROM e JOIN pg_catalog.pg_operator o ON o.oprleft #{@op} e.oid AND o.oprright #{@op} e.oid
+    AND o.oprnamespace #{@op} e.typnamespace
+  JOIN pg_catalog.pg_depend od ON od.classid #{@op} #{@operator_class}
+    AND od.objid #{@op} o.oid AND od.deptype #{@op} 'e' AND od.refobjid #{@op} e.refobjid
+  JOIN pg_catalog.pg_namespace n ON n.oid #{@op} o.oprnamespace
+  """
+
+  @doc false
+  def lookup_statements, do: [@probe_sql, @relations_sql, @relations_rowsets_sql, @casts_sql]
 
   @doc """
-  `{:ok, sql}` with every unqualified function call qualified (one lookup
-  through `execute` when there are any), or a typed refusal.
+  `{:ok, sql}` with every operator and function of `sql` explicit (read
+  through `execute` when it needs the catalog), or a typed refusal.
+  `isolation:` the transaction's level, when the caller knows it (R49a).
   """
-  def prepare(execute, sql) do
-    sql = sql |> IO.iodata_to_binary() |> explicit_simple_comparisons()
-    calls = function_calls(sql)
+  def prepare(execute, sql, opts \\ []) do
+    sql = IO.iodata_to_binary(sql)
+    verify? = Keyword.get(opts, :isolation) not in [nil, "read committed"]
 
-    with {:ok, sql} <- qualify(execute, sql, calls) do
-      case violations(sql) do
-        [] -> {:ok, sql}
-        found -> refuse(found)
+    try do
+      tokens = Qualify.tokenize(sql)
+
+      cond do
+        Qualify.lint(tokens) != [] -> rewrite(execute, tokens)
+        verify? -> with {:ok, _} <- facts(execute, tokens), do: {:ok, sql}
+        true -> {:ok, sql}
+      end
+    catch
+      {:qualify_refuse, reason, message} -> refuse(reason, message)
+    end
+  end
+
+  defp rewrite(execute, tokens) do
+    with {:ok, facts} <- facts(execute, tokens) do
+      case Qualify.qualify(tokens, facts) do
+        {:ok, sql} ->
+          case Qualify.lint(sql) do
+            [] ->
+              {:ok, sql}
+
+            found ->
+              refuse(
+                :bare_operator,
+                "a statement would resolve an operator or function by name",
+                found
+              )
+          end
+
+        {:error, reason, message} ->
+          refuse(reason, message)
       end
     end
   end
 
-  @doc false
-  # A bare comparison whose two operands are atoms (a dotted identifier, a
-  # parameter, a number, a string literal, TRUE/FALSE) has exactly one
-  # reading, so it is rewritten to pg_catalog's operator: the joins and
-  # depth bounds of recursive query members, a retarget's context
-  # correlation, built before the read's types are known. Anything else
-  # stays bare and is refused.
-  def explicit_simple_comparisons(sql) do
-    tokens = sql |> Scanner.tokenize() |> List.to_tuple()
-    count = tuple_size(tokens)
-    assign = assignment_indexes(tokens)
+  defp facts(execute, tokens) do
+    required = Qualify.requirements(tokens)
+    keys = Enum.map(required.functions, &{"", &1}) ++ MapSet.to_list(required.named)
 
-    edits =
-      for i <- 0..(count - 1)//1,
-          {:other, op, start} <- [elem(tokens, i)],
-          op in ~w(= <> != < > <= >=),
-          not MapSet.member?(assign, i),
-          left_atom?(tokens, i - 1),
-          right_atom?(tokens, i + 1),
-          do: {start, byte_size(op), pg_operator(op)}
+    case execute.(@probe_sql, [Enum.map(keys, &elem(&1, 0)), Enum.map(keys, &elem(&1, 1))]) do
+      {:ok, %{rows: [[extension_types, isolation, candidates]]}} ->
+        functions = functions(candidates)
 
-    edits
-    |> Enum.reverse()
-    |> Enum.reduce(sql, fn {start, length, op}, acc ->
-      binary_part(acc, 0, start) <>
-        "OPERATOR(pg_catalog." <>
-        op <>
-        ")" <>
-        binary_part(acc, start + length, byte_size(acc) - start - length)
+        if not extension_types and isolation == "read committed" do
+          {:ok, %{functions: functions, extension: false}}
+        else
+          relation_facts(execute, tokens, required, functions, extension_types, isolation)
+        end
+
+      _other ->
+        unavailable()
+    end
+  end
+
+  defp functions(candidates) do
+    Enum.reduce(candidates, %{}, fn row, acc ->
+      [sch, name, schema, nargs, defaults, args, variadic, member, extension, polymorphic] =
+        String.split(row, <<31>>)
+
+      key = if sch == "", do: name, else: {sch, name}
+
+      candidate = %{
+        schema: schema,
+        nargs: String.to_integer(nargs),
+        defaults: String.to_integer(defaults),
+        args: if(args == "", do: [], else: String.split(args, <<30>>)),
+        variadic: if(variadic == "", do: nil, else: variadic),
+        member: member == "member",
+        extension: if(extension == "", do: nil, else: extension)
+      }
+
+      polymorphic? = polymorphic == "polymorphic" and schema == "pg_catalog"
+
+      Map.update(acc, key, %{candidates: [candidate], polymorphic: polymorphic?}, fn info ->
+        %{
+          candidates: [candidate | info.candidates],
+          polymorphic: info.polymorphic or polymorphic?
+        }
+      end)
     end)
   end
 
-  defp pg_operator("!="), do: "<>"
-  defp pg_operator(op), do: op
+  defp relation_facts(execute, tokens, required, functions, extension_types, isolation) do
+    relations = MapSet.to_list(required.relations)
+    rowsets = MapSet.to_list(required.rowsets)
 
-  @tighter ~w(+ - * / % ^ || :: [ ])
+    {sql, params} =
+      if rowsets == [],
+        do: {@relations_sql, [relations]},
+        else: {@relations_rowsets_sql, [relations, rowsets]}
 
-  defp atom_token?({:word, word, _}),
-    do:
-      String.downcase(word) not in (@syntax -- ~w(true false null)) or
-        String.downcase(word) in ~w(true false)
-
-  defp atom_token?({:qident, _, _}), do: true
-
-  defp atom_token?({:other, text, _}),
-    do: Regex.match?(~r/\A(\$[0-9]+|[0-9][0-9.]*|'.*')\z/s, text)
-
-  defp atom_token?(_token), do: false
-
-  # The operand before index i ends at i: an atom chain (a.b."c") not
-  # itself preceded by a tighter-binding operator or a dot.
-  defp left_atom?(_tokens, i) when i < 0, do: false
-
-  defp left_atom?(tokens, i) do
-    with true <- atom_token?(elem(tokens, i)),
-         first when is_integer(first) <- chain_start(tokens, i) do
-      first == 0 or not tighter?(elem(tokens, first - 1))
-    else
-      _ -> false
-    end
-  end
-
-  defp chain_start(tokens, i) do
-    if i >= 2 and match?({:punct, ".", _}, elem(tokens, i - 1)) and
-         atom_token?(elem(tokens, i - 2)),
-       do: chain_start(tokens, i - 2),
-       else: i
-  end
-
-  defp right_atom?(tokens, i) when i >= tuple_size(tokens), do: false
-
-  defp right_atom?(tokens, i) do
-    with true <- atom_token?(elem(tokens, i)) do
-      last = chain_end(tokens, i)
-
-      last + 1 >= tuple_size(tokens) or
-        not (tighter?(elem(tokens, last + 1)) or match?({:punct, "(", _}, elem(tokens, last + 1)))
-    end
-  end
-
-  defp chain_end(tokens, i) do
-    if i + 2 < tuple_size(tokens) and match?({:punct, ".", _}, elem(tokens, i + 1)) and
-         atom_token?(elem(tokens, i + 2)),
-       do: chain_end(tokens, i + 2),
-       else: i
-  end
-
-  defp tighter?({:other, text, _}), do: text in @tighter
-  defp tighter?({:punct, ".", _}), do: true
-  defp tighter?(_), do: false
-
-  # Token indexes of "=" inside SET assignment lists.
-  defp assignment_indexes(tokens) do
-    {set, _mode} =
-      Enum.reduce(0..(tuple_size(tokens) - 1)//1, {MapSet.new(), nil}, fn i, {set, mode} ->
-        case elem(tokens, i) do
-          {:word, word, _} ->
-            lower = String.downcase(word)
-
-            cond do
-              lower == "set" -> {set, :assign}
-              lower in ~w(where from returning when) -> {set, nil}
-              true -> {set, mode}
-            end
-
-          {:other, "=", _} when mode == :assign ->
-            {MapSet.put(set, i), mode}
-
-          _ ->
-            {set, mode}
-        end
-      end)
-
-    set
-  end
-
-  @doc """
-  R48: Selecto's own guard and catalog SQL names every operator, not only
-  comparisons: any operator token outside OPERATOR(...) (casts, `*` and
-  array brackets aside) and any unqualified function.
-  """
-  def guard_violations(sql) do
-    sql = IO.iodata_to_binary(sql)
-
-    bare =
-      sql
-      |> Scanner.tokenize()
-      |> strip_operator_groups([])
-      |> Enum.filter(fn
-        {:other, text, _} ->
-          not Regex.match?(
-            ~r/\A(\$[0-9]+|[0-9][0-9.]*|'.*'|E'.*'|[\[\]:]+|\*|\$[A-Za-z_]*\$.*)\z/s,
-            text
-          )
-
-        {:word, word, _} ->
-          String.downcase(word) in @comparison_words
-
-        _ ->
-          false
-      end)
-      |> Enum.map(&{:operator, elem(&1, 1)})
-
-    lock_ok = Regex.match?(~r/\A\s*LOCK\s+TABLE\b/i, sql)
-    bare = if lock_ok, do: Enum.reject(bare, &(&1 == {:operator, "IN"})), else: bare
-
-    bare ++ Enum.map(function_calls(sql), &{:function, &1.name})
-  end
-
-  defp strip_operator_groups([], acc), do: Enum.reverse(acc)
-
-  defp strip_operator_groups([{:word, word, _}, {:punct, "(", _} | rest], acc)
-       when word in ["OPERATOR", "operator"],
-       do: strip_operator_groups(drop_group(rest, 1), acc)
-
-  defp strip_operator_groups([token | rest], acc), do: strip_operator_groups(rest, [token | acc])
-
-  @doc "Bare comparison operators and unqualified function calls left in `sql`."
-  def violations(sql) do
-    sql = IO.iodata_to_binary(sql)
-
-    Enum.map(bare_operators(sql), &{:operator, &1}) ++
-      Enum.map(function_calls(sql), &{:function, &1.name})
-  end
-
-  defp qualify(_execute, sql, []), do: {:ok, sql}
-
-  defp qualify(execute, sql, calls) do
-    names = calls |> Enum.map(&String.downcase(&1.name)) |> Enum.uniq()
-
-    case execute.(@lookup_sql, [names]) do
+    case execute.(sql, params) do
       {:ok, %{rows: rows}} when is_list(rows) ->
-        schemas = Map.new(rows, fn [name, schema] -> {name, schema} end)
+        with {:ok, decoded} <- decode(rows),
+             :ok <- verify_types(execute, tokens, decoded.types, isolation),
+             {:ok, casts} <- cast_facts(execute, required.casts, extension_types) do
+          {:ok,
+           %{
+             functions: functions,
+             relations: decoded.relations,
+             rowsets: decoded.rowsets,
+             casts: casts,
+             extension: decoded.extension or map_size(casts) > 0
+           }}
+        end
 
-        {:ok,
-         calls
-         |> Enum.reverse()
-         |> Enum.reduce(sql, fn call, acc ->
-           case Map.get(schemas, String.downcase(call.name)) do
-             nil ->
-               acc
-
-             schema ->
-               prefix =
-                 if schema == "pg_catalog",
-                   do: "pg_catalog.",
-                   else: quote_identifier(schema) <> "."
-
-               binary_part(acc, 0, call.start) <>
-                 prefix <> binary_part(acc, call.start, byte_size(acc) - call.start)
-           end
-         end)}
-
-      _ ->
-        refuse([:function_lookup_unavailable])
+      _other ->
+        unavailable()
     end
   end
 
-  @doc false
-  # Unqualified function calls: a bare word followed by "(", not SQL
-  # syntax, not after "." (qualified), AS/INTO/TABLE (a column list or
-  # type), and not a CTE's column list (name (cols) AS ( ... )).
-  def function_calls(sql) do
-    tokens = sql |> Scanner.tokenize() |> List.to_tuple()
-    count = tuple_size(tokens)
+  defp decode(rows) do
+    initial = %{relations: %{}, rowsets: %{}, types: %{}, extension: false}
 
-    for i <- 0..(count - 1)//1,
-        {:word, text, start} <- [elem(tokens, i)],
-        i + 1 < count,
-        match?({:punct, "(", _}, elem(tokens, i + 1)),
-        String.downcase(text) not in @syntax,
-        not after?(tokens, i, fn
-          {:punct, ".", _} -> true
-          {:word, word, _} -> String.downcase(word) in ~w(as into table)
-          _ -> false
-        end),
-        not column_list?(tokens, i + 1),
-        do: %{name: text, start: start}
+    rows
+    |> Enum.reduce_while(initial, fn row, acc ->
+      case decode_row(row, acc) do
+        :deep -> {:halt, :deep}
+        acc -> {:cont, acc}
+      end
+    end)
+    |> case do
+      :deep ->
+        refuse(
+          :domain_chain_too_deep,
+          "a column is a domain chain too deep to resolve its base type"
+        )
+
+      decoded ->
+        {:ok, %{decoded | rowsets: finish_rowsets(decoded.rowsets)}}
+    end
   end
 
-  @doc false
-  # Comparison and pattern operators written bare: outside OPERATOR(...),
-  # outside SET assignment lists and POSITION(a IN b).
-  def bare_operators(sql) do
-    sql |> Scanner.tokenize() |> scan_operators(%{mode: nil, depth: 0, skip: []}, [])
+  defp decode_row(["deep" | _], _acc), do: :deep
+
+  defp decode_row(["col", relation, column, oid, _, _], acc) do
+    acc
+    |> Map.update!(:types, fn types ->
+      Map.update(types, relation, %{column => oid}, &Map.put(&1, column, oid))
+    end)
+    |> update_column(relation, column, & &1)
   end
 
-  defp scan_operators([], _state, acc), do: Enum.reverse(acc)
+  defp decode_row(["fun", _, name, _, state, _], acc) do
+    state = if state == "known", do: :known, else: :unknown
 
-  # OPERATOR(schema.op): skipped whole.
-  defp scan_operators([{:word, word, _}, {:punct, "(", _} | rest], state, acc)
-       when word in ["OPERATOR", "operator", "Operator"] do
-    scan_operators(drop_group(rest, 1), state, acc)
+    rowset = acc.rowsets |> Map.get(name, %{cols: %{}}) |> Map.put(:state, state)
+
+    %{
+      acc
+      | extension: acc.extension or state == :unknown,
+        rowsets: Map.put(acc.rowsets, name, rowset)
+    }
   end
 
-  # POSITION(a IN b): IN is syntax.
-  defp scan_operators([{:word, word, _}, {:punct, "(", _} | rest], state, acc)
-       when word in ["POSITION", "position"] do
-    scan_operators(drop_group(rest, 1), state, acc)
+  defp decode_row(["fcol", position, name, _, state, _], acc) do
+    update_rowset_column(acc, name, position, fn entry ->
+      case state do
+        "unknown" -> %{entry | unknown: true}
+        "ext:" <> type -> %{entry | type: type}
+        _ -> entry
+      end
+    end)
   end
 
-  defp scan_operators([{:punct, "(", _} | rest], state, acc),
-    do:
-      scan_operators(
-        rest,
-        %{state | depth: state.depth + 1, skip: [state.mode | state.skip]},
-        acc
-      )
+  defp decode_row(["fop", position, name, op, schema, _], acc) do
+    update_rowset_column(acc, name, position, fn entry ->
+      %{entry | ops: Map.put(entry.ops, op, quote_identifier(schema))}
+    end)
+  end
 
-  defp scan_operators([{:punct, ")", _} | rest], state, acc) do
-    {mode, skip} =
-      case state.skip do
-        [mode | skip] -> {mode, skip}
-        [] -> {nil, []}
+  defp decode_row([kind, relation, column, name, schema, args], acc) do
+    element? = String.starts_with?(kind, "e")
+
+    update = fn entry ->
+      case String.trim_leading(kind, "e") do
+        "typ" -> %{entry | type: name}
+        "op" -> %{entry | ops: Map.put(entry.ops, name, quote_identifier(schema))}
+        "fn" -> %{entry | fns: put_function(entry.fns, name, schema, args)}
+      end
+    end
+
+    acc
+    |> Map.put(:extension, true)
+    |> update_column(relation, column, fn entry ->
+      if element?,
+        do: %{entry | elem: update.(entry.elem || new_entry())},
+        else: update.(entry)
+    end)
+  end
+
+  defp put_function(fns, name, schema, args) do
+    {schema, self?} =
+      case String.split(schema, "|self") do
+        [schema, ""] -> {schema, true}
+        _ -> {schema, false}
       end
 
-    scan_operators(rest, %{state | depth: max(state.depth - 1, 0), mode: mode, skip: skip}, acc)
+    function = %{schema: schema, self: self?, args: args, nargs: length(args)}
+    Map.update(fns, String.downcase(name), [function], &[function | &1])
   end
 
-  defp scan_operators([{:word, word, _} | rest], state, acc) do
-    lower = String.downcase(word)
+  defp new_entry, do: %{ops: %{}, fns: %{}, type: nil, elem: nil, unknown: false}
 
-    cond do
-      lower == "set" ->
-        scan_operators(rest, %{state | mode: :assign}, acc)
+  defp update_column(acc, relation, column, fun) do
+    key = relation_key(relation)
+    columns = Map.get(acc.relations, key, %{})
+    entry = fun.(Map.get(columns, String.downcase(column), new_entry()))
+    columns = Map.put(columns, String.downcase(column), entry)
+    %{acc | relations: Map.put(acc.relations, key, columns)}
+  end
 
-      # LOCK TABLE t IN ... MODE: IN is syntax.
-      lower == "lock" ->
-        scan_operators(rest, %{state | mode: :lock}, acc)
+  defp update_rowset_column(acc, name, position, fun) do
+    rowset = Map.get(acc.rowsets, name, %{cols: %{}})
+    index = String.to_integer(position)
+    entry = fun.(Map.get(rowset.cols, index, new_entry()))
+    rowset = %{rowset | cols: Map.put(rowset.cols, index, entry)}
+    %{acc | rowsets: Map.put(acc.rowsets, name, rowset)}
+  end
 
-      lower == "in" and state.mode == :lock ->
-        scan_operators(rest, state, acc)
+  defp finish_rowsets(rowsets) do
+    Map.new(rowsets, fn {name, rowset} ->
+      cols =
+        if map_size(rowset.cols) == 0,
+          do: nil,
+          else: rowset.cols |> Enum.sort() |> Enum.map(&elem(&1, 1))
 
-      lower in ~w(where from returning on when) ->
-        scan_operators(rest, %{state | mode: nil}, acc)
+      {name, %{state: Map.get(rowset, :state, :unknown), cols: cols}}
+    end)
+  end
 
-      lower == "is" and distinct_from?(rest) ->
-        scan_operators(rest, state, ["IS DISTINCT FROM" | acc])
+  # "schema"."relation" as written => the qualifier's schema.relation key.
+  defp relation_key(relation) do
+    relation
+    |> Qualify.tokenize()
+    |> Enum.reject(&(&1 == {:punct, "."}))
+    |> Enum.map_join(".", fn
+      {:qid, text} -> text |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")
+      {_kind, text} -> text
+    end)
+    |> String.downcase()
+  end
 
-      lower in @comparison_words ->
-        scan_operators(rest, state, [word | acc])
+  # R49a: what the catalog said at the snapshot against what the parser
+  # sees now, for the columns the statement names.
+  defp verify_types(_execute, _tokens, _types, "read committed"), do: :ok
 
-      true ->
-        scan_operators(rest, state, acc)
+  defp verify_types(execute, tokens, types, _isolation) do
+    named =
+      tokens
+      |> Enum.flat_map(fn
+        {:qid, text} -> [text |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")]
+        {:id, text} -> [String.downcase(text)]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    pairs =
+      for {relation, columns} <- Enum.sort(types),
+          {column, oid} <- Enum.sort(columns),
+          MapSet.member?(named, column),
+          do: {relation, column, oid}
+
+    if pairs == [] do
+      :ok
+    else
+      select =
+        Enum.map_join(pairs, ", ", fn {relation, column, _oid} ->
+          "CAST(pg_catalog.pg_typeof((CAST(NULL AS #{relation})).#{quote_identifier(column)}) AS pg_catalog.oid)"
+        end)
+
+      expected = Enum.map(pairs, fn {_, _, oid} -> String.to_integer(oid) end)
+
+      case execute.("SELECT ARRAY[#{select}] AS selecto_guard_column_types", []) do
+        {:ok, %{rows: [[^expected]]}} ->
+          :ok
+
+        _other ->
+          refuse(
+            :catalog_changed,
+            "a relation's column types changed after the transaction's snapshot; they cannot be read in this transaction"
+          )
+      end
     end
   end
 
-  defp scan_operators([{:other, text, _} | rest], state, acc) do
-    if text in @comparison and not (state.mode == :assign and text == "="),
-      do: scan_operators(rest, state, [text | acc]),
-      else: scan_operators(rest, state, acc)
-  end
+  defp cast_facts(_execute, casts, _extension_types) when map_size(casts) == 0, do: {:ok, %{}}
+  defp cast_facts(_execute, _casts, false), do: {:ok, %{}}
 
-  defp scan_operators([_token | rest], state, acc), do: scan_operators(rest, state, acc)
+  defp cast_facts(execute, casts, true) do
+    keys = casts |> Map.keys() |> Enum.sort()
 
-  # IS [NOT] DISTINCT FROM compares with "=" by name.
-  defp distinct_from?([{:word, a, _}, {:word, b, _} | _]),
-    do:
-      String.downcase(a) == "distinct" or
-        (String.downcase(a) == "not" and String.downcase(b) == "distinct")
+    case execute.(@casts_sql, [keys, Enum.map(keys, &Map.fetch!(casts, &1))]) do
+      {:ok, %{rows: rows}} when is_list(rows) ->
+        {:ok,
+         Enum.reduce(rows, %{}, fn
+           ["typ", key, name, _], acc ->
+             Map.update(acc, key, %{new_entry() | type: name}, &%{&1 | type: name})
 
-  defp distinct_from?(_rest), do: false
+           ["op", key, op, schema], acc ->
+             entry = Map.get(acc, key, new_entry())
+             Map.put(acc, key, %{entry | ops: Map.put(entry.ops, op, quote_identifier(schema))})
+         end)}
 
-  defp drop_group(tokens, 0), do: tokens
-  defp drop_group([], _depth), do: []
-  defp drop_group([{:punct, "(", _} | rest], depth), do: drop_group(rest, depth + 1)
-  defp drop_group([{:punct, ")", _} | rest], depth), do: drop_group(rest, depth - 1)
-  defp drop_group([_ | rest], depth), do: drop_group(rest, depth)
-
-  defp after?(_tokens, 0, _fun), do: false
-  defp after?(tokens, i, fun), do: fun.(elem(tokens, i - 1))
-
-  # name ( ... ) AS ( : a CTE's column list.
-  defp column_list?(tokens, open) do
-    case close_index(tokens, open + 1, 1) do
-      nil ->
-        false
-
-      close ->
-        close + 2 < tuple_size(tokens) and
-          match?({:word, _, _}, elem(tokens, close + 1)) and
-          String.downcase(elem(elem(tokens, close + 1), 1)) == "as" and
-          match?({:punct, "(", _}, elem(tokens, close + 2))
+      _other ->
+        unavailable()
     end
   end
 
-  defp close_index(tokens, i, _depth) when i >= tuple_size(tokens), do: nil
-
-  defp close_index(tokens, i, depth) do
-    case elem(tokens, i) do
-      {:punct, "(", _} -> close_index(tokens, i + 1, depth + 1)
-      {:punct, ")", _} when depth == 1 -> i
-      {:punct, ")", _} -> close_index(tokens, i + 1, depth - 1)
-      _ -> close_index(tokens, i + 1, depth)
-    end
-  end
+  @doc "Whatever in `sql` would still resolve through the session (R47, R48)."
+  def violations(sql), do: sql |> IO.iodata_to_binary() |> Qualify.lint()
 
   defp quote_identifier(name), do: "\"" <> String.replace(name, "\"", "\"\"") <> "\""
 
-  defp refuse(found),
-    do:
-      {:error,
-       Error.new(
-         :query_enforcement,
-         "PostgreSQL refuses a statement that would resolve an operator or function by name",
-         details: %{
-           code: :query_rule_not_evaluable,
-           reason: :bare_operator,
-           found: found |> Enum.take(5) |> inspect(),
-           adapter: :postgresql
-         }
-       )}
+  defp unavailable,
+    do: refuse(:function_lookup_unavailable, "cannot read the catalog facts of a statement")
+
+  defp refuse(reason, message, found \\ []) do
+    {:error,
+     Error.new(:query_enforcement, "PostgreSQL refuses a statement: " <> message,
+       details:
+         %{code: :query_rule_not_evaluable, reason: reason, adapter: :postgresql}
+         |> then(
+           &if(found == [], do: &1, else: Map.put(&1, :found, found |> Enum.take(5) |> inspect()))
+         )
+     )}
+  end
 end
