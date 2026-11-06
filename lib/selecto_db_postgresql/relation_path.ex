@@ -32,6 +32,7 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   alias Selecto.Write.Error
   alias SelectoDBPostgreSQL.RelationPath.Scanner
+  alias SelectoDBPostgreSQL.SessionGuard
 
   @path_key "selecto:reset_schemas"
 
@@ -241,13 +242,13 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   defp lookup(execute, plain, true) do
     name = "selecto_path_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
 
-    case execute.("SAVEPOINT " <> name, []) do
+    case execute.(SessionGuard.control("SAVEPOINT " <> name), []) do
       {:ok, _} ->
         result = lookup(execute, plain, false)
 
         Enum.each(
           ["ROLLBACK TO SAVEPOINT " <> name, "RELEASE SAVEPOINT " <> name],
-          &execute.(&1, [])
+          &execute.(SessionGuard.control(&1), [])
         )
 
         result

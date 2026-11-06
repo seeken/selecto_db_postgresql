@@ -281,6 +281,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
 
     try do
       tokens = Qualify.tokenize(sql)
+      one_statement!(tokens)
+      if Keyword.get(opts, :read) == true, do: read_statement!(tokens)
 
       cond do
         Qualify.rewrite?(tokens) -> rewrite(execute, tokens, opts)
@@ -290,6 +292,25 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     catch
       {:qualify_refuse, reason, message} -> refuse(reason, message)
     end
+  end
+
+  # Only the last token may be a semicolon: Selecto generates one statement,
+  # and what follows a semicolon would run past every check of the first.
+  defp one_statement!(tokens) do
+    if {:punct, ";"} in Enum.drop(tokens, -1),
+      do: throw({:qualify_refuse, :sql_unqualifiable, "a statement is one statement"})
+  end
+
+  # A read reads: COMMIT or ROLLBACK here would end the read's own transaction.
+  defp read_statement!(tokens) do
+    first =
+      case Enum.find(tokens, &(&1 != {:punct, "("})) do
+        {:id, word} -> String.upcase(word)
+        _other -> nil
+      end
+
+    if first not in ~w(SELECT WITH VALUES TABLE),
+      do: throw({:qualify_refuse, :sql_unqualifiable, "a read is a query"})
   end
 
   defp rewrite(execute, tokens, opts) do

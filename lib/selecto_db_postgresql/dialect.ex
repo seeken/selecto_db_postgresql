@@ -109,7 +109,7 @@ defmodule SelectoDBPostgreSQL.Dialect do
       when map_size(fragment) == 5 do
     with {:ok, target} <- Map.fetch(@computed_cast_types, type),
          true <- computed_expression?(expression) do
-      {:ok, ["CAST(", expression, " AS ", target, ")"]}
+      {:ok, computed_cast(expression, target)}
     else
       _ -> invalid_computed_value(:cast)
     end
@@ -141,6 +141,14 @@ defmodule SelectoDBPostgreSQL.Dialect do
   end
 
   def render_computed_value(_fragment, _selecto), do: invalid_computed_value(:unknown)
+
+  # Postgrex encodes a parameter by the type the statement gives it: a string
+  # cast to another type binds as text, and the server converts it.
+  defp computed_cast({:param, value} = expression, target)
+       when is_binary(value) and target != "TEXT",
+       do: ["CAST(CAST(", expression, " AS TEXT) AS ", target, ")"]
+
+  defp computed_cast(expression, target), do: ["CAST(", expression, " AS ", target, ")"]
 
   defp computed_expression?(expression),
     do: computed_sql?(expression) and computed_sql_present?(expression)

@@ -714,6 +714,30 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     GenServer.stop(c)
   end
 
+  test "citext's pattern operators answer for every pg_catalog string (M3, R51)", %{opts: opts} do
+    {:ok, c} = Adapter.connect(opts)
+    read = &Adapter.execute(c, &1, [], selecto_read: true)
+    mixed = [[1], [3], [5]]
+
+    for sql <- [
+          "SELECT id FROM items WHERE ci LIKE 'mixed'::varchar ORDER BY id",
+          "SELECT id FROM items WHERE ci ~~ CAST('mixed' AS varchar) ORDER BY id",
+          "SELECT id FROM items WHERE ci ~ 'mixed'::varchar ORDER BY id",
+          "SELECT id FROM items WHERE ci LIKE N'mixed' ORDER BY id",
+          "SELECT id FROM items WHERE ci SIMILAR TO 'mixed' ORDER BY id",
+          "SELECT id FROM items WHERE ci LIKE ANY (ARRAY['mixed', 'zzz']) ORDER BY id",
+          "SELECT id FROM items WHERE ci LIKE ANY (ARRAY['mixed']::text[]) ORDER BY id",
+          "SELECT id FROM items WHERE (ci || 'x') = 'MiXedx' OR (ci || 'x') = 'mixedx' ORDER BY id"
+        ] do
+      assert {:ok, %{rows: ^mixed}} = read.(sql), sql
+    end
+
+    assert {:ok, %{rows: [[2]]}} = read.("SELECT id FROM items WHERE ci NOT SIMILAR TO 'mixed'")
+    assert {:ok, %{rows: [[2]]}} = read.("SELECT id FROM items WHERE ci !~ 'mixed'::varchar")
+    assert {:ok, %{rows: []}} = read.(~S|SELECT id FROM items WHERE ci = E'mi\'xed'|)
+    GenServer.stop(c)
+  end
+
   test "a plant under a keyword or U& name never answers (R58, R60)", %{opts: opts} do
     {:ok, admin} = Adapter.connect(opts)
     forged = "RETURNS text LANGUAGE sql AS $$ SELECT 'FORGED'::text $$"
