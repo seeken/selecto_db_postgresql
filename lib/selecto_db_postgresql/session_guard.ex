@@ -149,7 +149,8 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
     "extra_float_digits",
     "bytea_output",
     "standard_conforming_strings",
-    "timezone_abbreviations"
+    "timezone_abbreviations",
+    "client_encoding"
   ]
 
   # R30, R35 (amended): the settings every Selecto statement runs under,
@@ -255,8 +256,11 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   def check(execute, sql, relations \\ []) do
     case execute.(@shadow_sql, [Enum.uniq(relations ++ relation_tokens(sql)), tokens(sql)]) do
       {:ok, %{rows: [[0, snapshot, deferrable | settings]]}} when is_binary(snapshot) ->
-        {:ok,
-         %{snapshot: snapshot, deferrable: deferrable, settings: Enum.zip(@settings, settings)}}
+        utf8(%{
+          snapshot: snapshot,
+          deferrable: deferrable,
+          settings: Enum.zip(@settings, settings)
+        })
 
       {:ok, %{rows: [[shadowed | _]]}} when is_integer(shadowed) and shadowed > 0 ->
         shadowed()
@@ -273,8 +277,11 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   def snapshot(execute) do
     case execute.(@snapshot_sql, []) do
       {:ok, %{rows: [[snapshot, deferrable | settings]]}} when is_binary(snapshot) ->
-        {:ok,
-         %{snapshot: snapshot, deferrable: deferrable, settings: Enum.zip(@settings, settings)}}
+        utf8(%{
+          snapshot: snapshot,
+          deferrable: deferrable,
+          settings: Enum.zip(@settings, settings)
+        })
 
       _other ->
         unavailable()
@@ -369,9 +376,11 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
             shadowed()
 
           true ->
-            with {:ok, pinned} <- pinned(values) do
-              {:ok, %{snapshot: snapshot, deferrable: 0, settings: Enum.zip(@settings, settings)},
-               pinned}
+            state = %{snapshot: snapshot, deferrable: 0, settings: Enum.zip(@settings, settings)}
+
+            with {:ok, state} <- utf8(state),
+                 {:ok, pinned} <- pinned(values) do
+              {:ok, state, pinned}
             end
         end
 
@@ -524,6 +533,22 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   end
 
   def deferrable_free(_execute, _state, _opts), do: :ok
+
+  # R65: Postgrex sends a parameter as UTF-8 bytes, which the server reads in
+  # the session's client_encoding: under LATIN1 the tenant café arrives as
+  # cafÃ©, another tenant's name. Every statement's check refuses it, and the
+  # setting is compared with the rest, so a statement that changes it is
+  # caught before the next one sends a parameter.
+  defp utf8(state) do
+    if :proplists.get_value("client_encoding", state.settings, nil) == "UTF8",
+      do: {:ok, state},
+      else:
+        refused(
+          :query_rule_not_evaluable,
+          :client_encoding,
+          "the session's client_encoding is not UTF8: parameters would be misread"
+        )
+  end
 
   defp shadowed,
     do:

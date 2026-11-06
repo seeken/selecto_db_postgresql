@@ -295,6 +295,15 @@ defmodule SelectoDBPostgreSQL.Adapter do
   Without an integer `:timeout` the statement runs exactly as before.
   """
   @impl true
+  def execute(_connection, query, _params, _opts) when not (is_binary(query) or is_list(query)) do
+    {:error,
+     %Selecto.Error{
+       type: :query_error,
+       message: "PostgreSQL statement must be SQL text",
+       details: %{reason: :invalid_statement, adapter: :postgresql}
+     }}
+  end
+
   def execute(connection, query, params, opts) do
     if Selecto.Executor.selecto_read?(opts) do
       with {:ok, query, opts} <- qualify_read(connection, query, opts) do
@@ -3680,7 +3689,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # commits (w3exrev16 item 18). An idle checked-out connection gets a
   # managed transaction.
   defp with_postgres_transaction(%DBConnection{} = connection, opts, fun) do
-    if DBConnection.status(connection) == :transaction do
+    if DBConnection.status(connection) != :idle do
       with_savepoint(&Postgrex.query(connection, &1, []), fn -> fun.(connection) end)
     else
       with_native_postgres_transaction(connection, opts, fun)
@@ -3701,6 +3710,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
       details: %{
         code: :query_rule_not_evaluable,
         reason: :connection_broken,
+        adapter: :postgresql
+      }
+    )
+  end
+
+  defp unowned_transaction do
+    Error.new(
+      :query_enforcement,
+      "PostgreSQL write refused: this connection is in a transaction Selecto did not open and " <>
+        "the caller does not hold; use DBConnection.run/3 and pass its connection",
+      details: %{
+        code: :query_rule_not_evaluable,
+        reason: :unowned_transaction,
         adapter: :postgresql
       }
     )
@@ -3748,14 +3770,20 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  # Checked out first, so the status decides: after a raw BEGIN on this
-  # connection a managed transaction would disconnect it, and the host's next
-  # statement would autocommit.
+  # Checked out first, so the status decides. A pool hands out any of its
+  # connections, so a transaction found here is not provably the caller's:
+  # joining could lose an acknowledged write, and a managed transaction would
+  # disconnect it. It refuses; a host in its own transaction passes the
+  # connection from DBConnection.run/3, which joins under a savepoint.
   defp with_native_postgres_transaction(connection, opts, fun) do
     if valid_postgrex_connection?(connection) do
       DBConnection.run(
         connection,
-        &with_postgres_transaction(&1, opts, fun),
+        fn checked_out ->
+          if DBConnection.status(checked_out) == :idle,
+            do: with_postgres_transaction(checked_out, opts, fun),
+            else: {:error, unowned_transaction()}
+        end,
         Keyword.take(opts, [:timeout, :deadline, :queue_target, :queue_interval])
       )
     else
@@ -3786,7 +3814,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
             if ecto_in_transaction?(repo),
               do: with_savepoint(&safe_ecto_query(repo, &1), fn -> fun.(repo) end),
               else: managed_ecto_transaction(repo, transaction_opts, fun)
-          end
+          end,
+          Keyword.take(opts, [:timeout])
         ])
       else
         if module_exports?(repo, :in_transaction?, 0) and apply(repo, :in_transaction?, []),

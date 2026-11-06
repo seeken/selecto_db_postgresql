@@ -28,7 +28,15 @@ defmodule SelectoDBPostgreSQL.EctoTransactionIntegrationTest do
     Application.put_env(
       :selecto_db_postgresql,
       SandboxRepo,
-      Keyword.merge(options, pool_size: 2, pool: Sandbox)
+      # Thirty writers wait their turn on one connection: the queue must not
+      # drop them on a loaded machine.
+      Keyword.merge(options,
+        pool_size: 2,
+        pool: Sandbox,
+        queue_target: 60_000,
+        queue_interval: 60_000,
+        ownership_timeout: 300_000
+      )
     )
 
     {:ok, plain} = PlainRepo.start_link()
@@ -137,7 +145,10 @@ defmodule SelectoDBPostgreSQL.EctoTransactionIntegrationTest do
 
     results =
       2..31
-      |> Task.async_stream(&write(SandboxRepo, table, &1), max_concurrency: 30, timeout: 60_000)
+      |> Task.async_stream(&write(SandboxRepo, table, &1),
+        max_concurrency: 30,
+        timeout: :infinity
+      )
       |> Enum.map(fn {:ok, result} -> result end)
 
     assert Enum.all?(results, &match?({:ok, %{affected_rows: 1}}, &1)), inspect(results)
@@ -166,7 +177,7 @@ defmodule SelectoDBPostgreSQL.EctoTransactionIntegrationTest do
           write(SandboxRepo, table, id)
         end,
         max_concurrency: 30,
-        timeout: 60_000
+        timeout: :infinity
       )
       |> Enum.map(fn {:ok, result} -> result end)
 

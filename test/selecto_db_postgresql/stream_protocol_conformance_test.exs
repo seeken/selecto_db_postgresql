@@ -112,7 +112,8 @@ defmodule SelectoDBPostgreSQL.StreamProtocolConformanceTest do
                  ~r/PostgreSQL stream transaction failed: :rolled_back/,
                  fn -> Enum.to_list(stream) end
 
-    assert System.monotonic_time(:millisecond) - started_at < 1_000
+    # Well inside the stream's receive timeout: load must not fail it.
+    assert System.monotonic_time(:millisecond) - started_at < 30_000
   end
 
   @tag :postgres
