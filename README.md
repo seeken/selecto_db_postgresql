@@ -373,18 +373,33 @@ another schema's relation, function or operator of the same name. So:
   retarget membership, writes, foreign-key guards, MERGE and the post-image
   re-read name pg_catalog's operator too. Compile-only SQL (`to_sql/1`
   without a connection) is unchanged.
-- **One last step before every statement runs** (R47): every function the
-  statement calls without a schema is qualified with the schema PostgreSQL
-  would pick under the pinned search_path (pg_catalog's when it has one,
-  so a `public.lower(varchar)` never shadows it; else the extension's own
-  schema), a comparison of two atoms that a builder wrote bare (recursive
-  query-member joins, a retarget's context correlation) becomes
-  pg_catalog's operator, and a statement that would still resolve an
-  operator or function by name is refused (`reason: :bare_operator`).
-  Builders that write compound bare comparisons (tagging, hierarchy, OLAP,
-  enhanced joins, subfilters) are therefore refused on PostgreSQL rather
-  than run. The test suite records every statement the adapter generates
-  and fails if any of them would resolve by name.
+- **One last step before every statement runs** (R47, R49c, R50):
+  `SelectoDBPostgreSQL.Qualify` rewrites whatever a builder wrote bare, so the
+  specialised builders (tagging, hierarchy, OLAP, enhanced joins) run like
+  any other. Every operator names its schema, grouped as PostgreSQL's
+  precedence groups it; IN, BETWEEN, LIKE, SIMILAR TO, IS DISTINCT FROM,
+  NULLIF and simple CASE get explicit operators; every function is
+  pg_catalog's (a `public.lower(varchar)` never shadows it), the function an
+  extension defines for its first argument's type (citext's `max`,
+  `replace`), or the one candidate among the pinned schemas. The operands of
+  an operator or function in an extension's schema are cast to the member's
+  argument type, so nothing planted beside it over a domain is chosen. A
+  citext against text compares as text, in either order, as PostgreSQL
+  resolves it. An expression that may have an extension type but cannot be
+  resolved by query scope (`COALESCE(citext_col, 'x') = $1`) refuses
+  (`reason: :operand_type_unknown`), and so does a function with no single
+  candidate (`:function_not_found`, `:function_ambiguous`). Under REPEATABLE
+  READ or SERIALIZABLE the types of the columns a statement names are checked
+  through the parser (`pg_typeof((NULL::rel).col)`), and a change after the
+  transaction's snapshot refuses (`:catalog_changed`). A statement already
+  explicit runs as it is, with no catalog read. The test suite records every
+  statement at the driver call and fails if any of Selecto's own, guard and
+  catalog SQL included, would resolve by name; the host's SQL is never
+  rewritten.
+- **uuid columns** take their text value as a uuid in reads and writes,
+  whatever the field's declared type. Text that is no uuid refuses
+  (`reason: :invalid_uuid`), as does a non-canonical spelling on a tenant
+  column.
 - Every catalog read the adapter runs for its checks is pg_catalog-qualified.
 
 ## Atomic write graphs and MERGE
