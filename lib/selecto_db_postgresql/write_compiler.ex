@@ -20,7 +20,10 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
   @spec compile(Command.t(), keyword()) ::
           {:ok, %{text: String.t(), params: [term()]}} | {:error, Error.t()}
   def compile(%Command{} = command, opts) do
-    opts = Keyword.put(opts, :write_field_types, Map.get(command.metadata, :field_types, %{}))
+    opts =
+      opts
+      |> Keyword.put(:write_field_types, Map.get(command.metadata, :field_types, %{}))
+      |> Keyword.put(:tenant_fields, tenant_fields(command.metadata))
 
     case command.operation do
       :insert ->
@@ -43,6 +46,10 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
            details: %{operation: operation}
          )}
     end
+  end
+
+  defp tenant_fields(metadata) do
+    metadata |> Map.get(:tenant_fields, []) |> List.wrap() |> Enum.map(&to_string/1)
   end
 
   defp compile_insert(%Command{} = command, opts) do
@@ -368,6 +375,49 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
   end
 
   defp compile_field_value(field, {:literal, value}, opts, offset) when is_binary(value) do
+    if uuid_column?(field, opts),
+      do: compile_uuid(field, value, opts, offset),
+      else: compile_text_value(field, value, opts, offset)
+  end
+
+  defp compile_field_value(_field, value, opts, offset), do: compile_value(value, opts, offset)
+
+  defp uuid_column?(field, opts) do
+    match?(
+      {_schema, "pg_catalog.uuid"},
+      opts |> Keyword.get(:operator_types, %{}) |> Map.get(to_string(field))
+    )
+  end
+
+  @uuid ~r/\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/
+
+  # A uuid or domain-over-uuid column: the text form is bound as the driver
+  # encodes a uuid. A value that is no uuid refuses, typed, and a tenant
+  # column takes only the canonical form: an upper-case spelling is no
+  # admitted tenant, even though the column would store the same value.
+  defp compile_uuid(_field, value, opts, offset) when byte_size(value) == 16,
+    do: compile_value({:literal, value}, opts, offset)
+
+  defp compile_uuid(field, value, opts, offset) do
+    tenant? = to_string(field) in Keyword.get(opts, :tenant_fields, [])
+
+    if Regex.match?(@uuid, value) and (not tenant? or value == String.downcase(value)) do
+      raw = value |> String.replace("-", "") |> Base.decode16!(case: :mixed)
+      compile_value({:literal, raw}, opts, offset)
+    else
+      {:error,
+       Error.new(:query_enforcement, "PostgreSQL refuses a value that is no canonical uuid",
+         details: %{
+           code: :query_rule_not_evaluable,
+           reason: :invalid_uuid,
+           field: to_string(field),
+           adapter: :postgresql
+         }
+       )}
+    end
+  end
+
+  defp compile_text_value(field, value, opts, offset) do
     types = Keyword.get(opts, :write_field_types, %{})
 
     type =
@@ -386,8 +436,6 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
          )}
     end
   end
-
-  defp compile_field_value(_field, value, opts, offset), do: compile_value(value, opts, offset)
 
   defp temporal_value("date", value), do: Date.from_iso8601(value)
 
