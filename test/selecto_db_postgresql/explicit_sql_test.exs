@@ -417,12 +417,9 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
                "pg_catalog.replace("
     end
 
-    test "an expression that may be citext against an untyped value refuses" do
-      assert {:error, :operand_type_unknown, _} =
-               Qualify.qualify(
-                 "SELECT 1 FROM s.t r WHERE COALESCE(r.ci, 'x') = $1",
-                 ext_facts()
-               )
+    test "a common type is named; an array of an extension type keeps its member" do
+      assert qualify!("SELECT 1 FROM s.t r WHERE COALESCE(r.ci, 'x') = $1", ext_facts()) =~
+               ~s|OPERATOR("ext".=)|
 
       assert qualify!(
                "SELECT 1 FROM s.t r WHERE r.ci = ANY($1)",

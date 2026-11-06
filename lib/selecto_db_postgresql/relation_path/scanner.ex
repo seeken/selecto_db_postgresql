@@ -30,22 +30,67 @@ defmodule SelectoDBPostgreSQL.RelationPath.Scanner do
 
   defp tokens(sql, i, acc) when i >= byte_size(sql), do: Enum.reverse(acc)
 
+  # By the first byte: this runs on every statement, and a regex per token
+  # costs more than the rest of the read.
   defp tokens(sql, i, acc) do
     rest = binary_part(sql, i, byte_size(sql) - i)
 
-    cond do
-      match = Regex.run(~r/\A\s+/, rest) ->
-        tokens(sql, i + byte_size(hd(match)), acc)
+    case rest do
+      <<c, _::binary>> when c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v] ->
+        tokens(sql, i + 1, acc)
 
-      String.starts_with?(rest, "--") ->
+      <<"--", _::binary>> ->
         tokens(sql, i + span_to(rest, "\n", 1), acc)
 
-      String.starts_with?(rest, "/*") ->
+      <<"/*", _::binary>> ->
         tokens(sql, i + span_to(rest, "*/", 2), acc)
 
-      match = Regex.run(~r/\A[Ee]?'(?:[^']|'')*'/, rest) ->
-        tokens(sql, i + byte_size(hd(match)), [{:other, hd(match), i} | acc])
+      <<c, _::binary>> when c in [?(, ?), ?,, ?., ?;] ->
+        tokens(sql, i + 1, [{:punct, <<c>>, i} | acc])
 
+      <<c, q, tail::binary>> when c in [?E, ?e] and q == ?' ->
+        quoted(sql, i, tail, 2, ?', :other, acc, rest)
+
+      <<?', tail::binary>> ->
+        quoted(sql, i, tail, 1, ?', :other, acc, rest)
+
+      <<?", tail::binary>> ->
+        quoted(sql, i, tail, 1, ?", :qident, acc, rest)
+
+      <<c, _::binary>> when c in ?A..?Z or c in ?a..?z or c == ?_ or c >= 0x80 ->
+        size = word_size(rest, 0)
+        tokens(sql, i + size, [{:word, binary_part(rest, 0, size), i} | acc])
+
+      _other ->
+        other(sql, i, rest, acc)
+    end
+  end
+
+  defp word_size(<<c, tail::binary>>, size)
+       when c in ?A..?Z or c in ?a..?z or c in ?0..?9 or c == ?_ or c == ?$ or c >= 0x80,
+       do: word_size(tail, size + 1)
+
+  defp word_size(_rest, size), do: size
+
+  # A quoted run with its doubled quotes; unterminated, what follows reads as
+  # any other text.
+  defp quoted(sql, i, tail, opening, quote, kind, acc, rest) do
+    case quoted_size(tail, quote, opening) do
+      nil ->
+        other(sql, i, rest, acc)
+
+      size ->
+        tokens(sql, i + size, [{kind, binary_part(rest, 0, size), i} | acc])
+    end
+  end
+
+  defp quoted_size(<<q, q, tail::binary>>, q, size), do: quoted_size(tail, q, size + 2)
+  defp quoted_size(<<q, _::binary>>, q, size), do: size + 1
+  defp quoted_size(<<_, tail::binary>>, q, size), do: quoted_size(tail, q, size + 1)
+  defp quoted_size(<<>>, _q, _size), do: nil
+
+  defp other(sql, i, rest, acc) do
+    cond do
       match = Regex.run(~r/\A\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/, rest) ->
         tag = hd(match)
         tail = binary_part(rest, byte_size(tag), byte_size(rest) - byte_size(tag))
@@ -58,18 +103,9 @@ defmodule SelectoDBPostgreSQL.RelationPath.Scanner do
 
         tokens(sql, i + len, [{:other, binary_part(rest, 0, len), i} | acc])
 
-      match = Regex.run(~r/\A"(?:[^"]|"")*"/, rest) ->
-        tokens(sql, i + byte_size(hd(match)), [{:qident, hd(match), i} | acc])
-
-      match = Regex.run(~r/\A[A-Za-z_\x{80}-\x{10FFFF}][A-Za-z0-9_$\x{80}-\x{10FFFF}]*/u, rest) ->
-        tokens(sql, i + byte_size(hd(match)), [{:word, hd(match), i} | acc])
-
-      match = Regex.run(~r/\A[(),.;]/, rest) ->
-        tokens(sql, i + 1, [{:punct, hd(match), i} | acc])
-
       match =
           Regex.run(
-            ~r/\A(?:\$[0-9]+|[0-9][0-9.]*(?:[eE][+-]?[0-9]+)?|::|[^\sA-Za-z0-9_"'(),.;$]+|.)/us,
+            ~r/\A(?:\$[0-9]+|[0-9][0-9.]*(?:[eE][+-]?[0-9]+)?|::|[^\sA-Za-z0-9_"'(),.;$]+|.)/s,
             rest
           ) ->
         tokens(sql, i + byte_size(hd(match)), [{:other, hd(match), i} | acc])

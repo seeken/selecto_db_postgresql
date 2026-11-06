@@ -368,7 +368,6 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       citext_lt: {"ci", {"<", "N"}},
       domain_citext_eq: {"dci", "bob"},
       domain_citext_ne: {"dci", {"!=", "BOB"}},
-      citext_subquery: {"ci", {:subquery, :in, "SELECT code FROM codes", []}},
       citext_vs_text: {"ci", {:ref, "name"}},
       text_vs_citext: {"name", {:ref, "ci"}},
       computed_lower: {"lower_vc", "alpha"},
@@ -638,23 +637,29 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
   test "an expression that may be citext refuses against an untyped value (R49c)", %{opts: opts} do
     {:ok, c} = Adapter.connect(opts)
 
+    # PostgreSQL's common type names these: citext throughout, as natively.
     for sql <- [
-          "SELECT id FROM items WHERE COALESCE(ci, 'x') = 'MIXED'",
-          "SELECT id FROM items WHERE (CASE WHEN n > 0 THEN ci END) = 'MIXED'",
-          "SELECT max(COALESCE(ci, 'x')) FROM items",
+          "SELECT id FROM items WHERE COALESCE(ci, 'x') = 'MIXED' ORDER BY id",
+          "SELECT id FROM items WHERE (CASE WHEN n > 0 THEN ci END) = 'MIXED' ORDER BY id",
+          "SELECT id FROM items WHERE GREATEST(ci, 'a') = 'MIXED' ORDER BY id",
+          "SELECT max(COALESCE(ci, 'x')) FROM items"
+        ] do
+      assert {:ok, %{rows: rows}} = typed(c, sql), sql
+      assert {:ok, %{rows: ^rows}} = Adapter.execute(c, sql, [], []), sql
+    end
+
+    for sql <- [
           # M3: no OPERATOR() says "each column by its own type".
           "SELECT id FROM items WHERE (ci, org) <> ('MIXED', 't1')",
-          "SELECT id FROM items WHERE ROW(ci, org) = ROW('MIXED', 't1')",
-          # A member for text exists: the operand's type must be named.
-          "SELECT id FROM items WHERE ci LIKE (n + 1)::text || COALESCE(ci, 'x')"
+          "SELECT id FROM items WHERE ROW(ci, org) = ROW('MIXED', 't1')"
         ] do
       assert {:error, %{details: %{reason: :operand_type_unknown}}} =
                typed(c, sql),
              sql
     end
 
-    # A computed field over citext through the domain: typed or refused,
-    # never pg_catalog's text comparison.
+    # A computed field over citext and varchar through the domain: their common
+    # type is text, as natively.
     computed =
       domain()
       |> put_in([:source, :columns, :ci_or], %{
@@ -663,7 +668,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       })
       |> update_in([:source, :fields], &[:ci_or | &1])
 
-    assert {:refused, :operand_type_unknown} =
+    assert {:ok, []} =
              c
              |> base(computed)
              |> Selecto.select(["id"])
@@ -780,16 +785,16 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
           "NULLIF(NULLIF(ci, 'x'), 'y') = 'MIXED'",
           "NULLIF(dci, 'x') = 'BOB'",
           "NULLIF('mixed', ci) IS NULL",
-          "NULLIF(ci, vc) = 'MIXED'"
+          "NULLIF(ci, vc) = 'MIXED'",
+          "COALESCE(NULLIF(ci, 'x'), 'y') = 'MIXED'"
         ] do
       statement = sql.(where)
       assert {:ok, %{rows: rows}} = typed(c, statement), where
       assert {:ok, %{rows: ^rows}} = Adapter.execute(c, statement, [], []), where
     end
 
-    # Around NULLIF the extension type is still there, and an array no column
-    # names has an element type not known here: typed refusals.
-    for where <- ["COALESCE(NULLIF(ci, 'x'), 'y') = 'MIXED'", "(ARRAY['a'::ext.citext])[1] = 'A'"] do
+    # An array no column names has an element type not known here: refused.
+    for where <- ["(ARRAY['a'::ext.citext])[1] = 'A'"] do
       assert {:error, %{details: %{reason: :operand_type_unknown}}} =
                typed(c, sql.(where)),
              where
@@ -851,7 +856,54 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
 
     assert {:refused, :sql_unprovable} = raw.({:raw_sql_filter, ["ci::text = 'x'"]})
     assert {:refused, :sql_unprovable} = raw.({:raw_sql_filter, ["COALESCE(ci, 'x') = 'x'"]})
-    refute match?({:refused, _}, raw.({:raw_sql_filter, ["n > 6 AND COALESCE(name, 'x') <> ''"]}))
+
+    assert {:refused, :sql_unprovable} =
+             raw.({"ci", {:subquery, :in, "SELECT code FROM codes", []}})
+
+    assert {:refused, :sql_unprovable} = raw.({:exists, "SELECT 1 FROM items x WHERE x.ci = 'a'"})
+
+    # The whole statement counts, and it reads no extension column.
+    plain = fn filter ->
+      c |> base(domain()) |> Selecto.select(["id", "n"]) |> Selecto.filter(filter) |> run()
+    end
+
+    refute match?({:refused, _}, plain.({:raw_sql_filter, ["n > 6"]}))
+    GenServer.stop(c)
+  end
+
+  test "custom_sql templates are read after substitution (M3)", %{opts: opts} do
+    {:ok, c} = Adapter.connect(opts)
+    read = fn selector -> c |> base(domain()) |> Selecto.select(["id", selector]) |> run() end
+
+    refute match?({:refused, _}, read.({:custom_sql, "upper({{f}})", %{"f" => "name"}}))
+
+    assert {:refused, :sql_unprovable} =
+             read.({:custom_sql, "COALESCE({{f}}, 'x')", %{"f" => "ci"}})
+
+    GenServer.stop(c)
+  end
+
+  test "a cast literal is typed, parenthesised or not", %{opts: opts} do
+    {:ok, c} = Adapter.connect(opts)
+    sql = "SELECT id FROM items WHERE ('mixed')::text = ci ORDER BY id"
+    assert {:ok, %{rows: rows}} = Adapter.execute(c, sql, [], [])
+    assert {:ok, %{rows: ^rows}} = typed(c, sql)
+    GenServer.stop(c)
+  end
+
+  test "generated NULLIF coerces its first operand, whatever its form (H2)", %{opts: opts} do
+    {:ok, c} = Adapter.connect(opts)
+
+    for sql <- [
+          "SELECT NULLIF(COALESCE(ci, CAST('a' AS text)), name), count(*) FROM items GROUP BY 1 ORDER BY 1",
+          "SELECT NULLIF(GREATEST(ci, ci), upper('')), count(*) FROM items GROUP BY 1 ORDER BY 1",
+          "SELECT NULLIF(NULLIF(ci, 'x'), name), count(*) FROM items GROUP BY 1 ORDER BY 1",
+          "SELECT NULLIF(CASE WHEN id > 0 THEN ci END, lower(name)), count(*) FROM items GROUP BY 1 ORDER BY 1"
+        ] do
+      assert {:ok, %{rows: rows}} = Adapter.execute(c, sql, [], [])
+      assert {:ok, %{rows: ^rows}} = typed(c, sql), sql
+    end
+
     GenServer.stop(c)
   end
 
@@ -889,13 +941,19 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
 
     for sql <- [
           "SELECT id FROM items WHERE #{nested} = 'a'",
-          "SELECT id FROM items WHERE #{cased} = 'a'",
-          "SELECT id FROM items WHERE #{wide}",
-          "SELECT id FROM items WHERE name = '#{String.duplicate("a", 3_000_000)}'"
+          "SELECT id FROM items WHERE #{cased} = 'a'"
         ] do
       {micros, result} = :timer.tc(fn -> typed(c, sql) end)
       assert {:error, %{details: %{reason: :statement_too_large}}} = result
       assert micros < 30_000_000
+    end
+
+    for sql <- [
+          "SELECT id FROM items WHERE #{wide}",
+          "SELECT id FROM items WHERE name = '#{String.duplicate("a", 3_000_000)}'"
+        ] do
+      assert {:error, %{details: %{reason: :statement_too_large}}} =
+               Adapter.execute(c, sql, [], selecto_read: true)
     end
 
     GenServer.stop(c)

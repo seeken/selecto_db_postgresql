@@ -403,7 +403,10 @@ another schema's relation, function or operator of the same name. So:
   text such as `raw_sql_filter` inside a generated read, may compare extension
   types directly; anything it cannot prove (casts, subscripts, COALESCE, CASE,
   GREATEST, LEAST, NULLIF, subqueries, set operations) refuses `:sql_unprovable`
-  when the statement touches an extension type.
+  when the statement touches an extension type. A generated statement that
+  carries any such text, a custom column's `select:` or an `{:exists, sql}`
+  say, counts as hand-built as a whole. Every statement is still parsed for its
+  CTE names and the rest of the checks.
 - **Deployment.** No untrusted role may have CREATE on a schema the application
   reaches, and hosts schema-qualify functions in their triggers, views and
   policies: code already running as the application role is outside what these

@@ -320,11 +320,21 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # entry point that skipped prepare_read) resolves the relations its own
   # text names, with the same rules.
   defp qualify_read(connection, query, opts) do
-    with :ok <- ExplicitSQL.bounded(query) do
+    with :ok <- hand_built_bound(query, opts) do
       resolve_read(connection, query, opts)
     else
       {:error, %Error{} = error} -> {:error, read_refusal(error)}
     end
+  end
+
+  defp hand_built_bound(query, opts),
+    do: if(hand_built?(opts), do: ExplicitSQL.bounded(query), else: :ok)
+
+  # Text Selecto did not generate, whole or in part: a builder marked it, or no
+  # compile named its relations.
+  defp hand_built?(opts) do
+    Keyword.get(opts, :selecto_raw_sql) == true or
+      not is_map(Keyword.get(opts, :selecto_qualified_relations))
   end
 
   defp resolve_read(connection, query, opts) do
@@ -353,7 +363,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
           end
       end
 
-    hand_built? = not is_map(Keyword.get(opts, :selecto_qualified_relations))
+    hand_built? = hand_built?(opts)
 
     with {:ok, relations} <- relations,
          {:ok, query} <- RelationPath.qualify(query, relations) do
@@ -679,8 +689,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
                    read: true,
                    isolation: pinned.isolation,
                    declared_functions: plan.declared_functions,
-                   hand_built: plan.hand_built,
-                   raw_fragments: plan.raw_fragments
+                   hand_built: plan.hand_built
                  )
                ),
              {:ok, result} <- read_result(execute.(plan.prefix <> query, params)),
@@ -689,10 +698,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
           {:ok, result}
         else
           error ->
-            case run_all(guard, undo) do
-              :ok -> error
-              {:error, _failed} -> {:error, read_refusal(broken_connection())}
-            end
+            # The original stands: a read kept nothing, and what failed it
+            # (a timeout) is why the undo cannot run either.
+            _ = run_all(guard, undo)
+            error
         end
 
       {:error, _} = error ->
@@ -772,8 +781,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       path: read_path(opts),
       prefix: Keyword.get(opts, :selecto_explain, ""),
       declared_functions: Keyword.get(opts, :selecto_declared_functions, []),
-      hand_built: Keyword.get(opts, :selecto_hand_built, false),
-      raw_fragments: Keyword.get(opts, :selecto_raw_fragments, [])
+      hand_built: Keyword.get(opts, :selecto_hand_built, false)
     }
 
   @doc """
@@ -3732,6 +3740,15 @@ defmodule SelectoDBPostgreSQL.Adapter do
     )
   end
 
+  # The first error stands (R66): a deadlock keeps its SQLSTATE. It says the
+  # connection is broken too, and a refusal that had no error of its own is
+  # that alone.
+  defp broken({:error, %Error{details: details} = error}) do
+    {:error, %{error | details: Map.put(details || %{}, :connection_broken, true)}}
+  end
+
+  defp broken(_error), do: {:error, broken_connection()}
+
   defp unowned_transaction do
     Error.new(
       :query_enforcement,
@@ -3770,7 +3787,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
                  {:ok, _} <- query.("RELEASE SAVEPOINT #{name}") do
               error
             else
-              _failed -> {:error, broken_connection()}
+              _failed -> broken(error)
             end
         end
 
@@ -4053,8 +4070,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
                      ExplicitSQL.prepare(check, query,
                        isolation: pinned.isolation,
                        declared_functions: Keyword.get(opts, :selecto_declared_functions, []),
-                       hand_built: Keyword.get(opts, :selecto_hand_built, false),
-                       raw_fragments: Keyword.get(opts, :selecto_raw_fragments, [])
+                       hand_built: Keyword.get(opts, :selecto_hand_built, false)
                      ) do
                 {before, pinned, prepared}
               else
