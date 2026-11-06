@@ -399,6 +399,15 @@ another schema's relation, function or operator of the same name. So:
   pg_catalog string type, which compares as text as PostgreSQL does. Any other
   pair refuses in Selecto, not at the server: an implicit cast could make it
   resolve and compare the wrong thing (box3d `=` by area, geometry as text).
+- **Hand-built SQL.** Selecto guards what it generates. Hand-written SQL, and raw
+  text such as `raw_sql_filter` inside a generated read, may compare extension
+  types directly; anything it cannot prove (casts, subscripts, COALESCE, CASE,
+  GREATEST, LEAST, NULLIF, subqueries, set operations) refuses `:sql_unprovable`
+  when the statement touches an extension type.
+- **Deployment.** No untrusted role may have CREATE on a schema the application
+  reaches, and hosts schema-qualify functions in their triggers, views and
+  policies: code already running as the application role is outside what these
+  guards address.
 - **Functions.** Selecto does not reimplement overload resolution. A function
   outside pg_catalog is named only as the exact match for its arguments' known
   types or the sole candidate that can take them, and no argument is cast to a

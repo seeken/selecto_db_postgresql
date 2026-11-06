@@ -173,6 +173,7 @@ defmodule SelectoDBPostgreSQL.RelationPath.Scanner do
        start: start,
        length: last_start + byte_size(last_text) - start,
        name: unquote_name(last_text),
+       folded: fold_name(last_text),
        qualified?: length(parts) > 1
      }, rest}
   end
@@ -182,6 +183,9 @@ defmodule SelectoDBPostgreSQL.RelationPath.Scanner do
        do: take_chain([next | rest], [part | acc])
 
   defp take_chain([part | rest], acc), do: {Enum.reverse([part | acc]), rest}
+
+  defp fold_name("\"" <> _ = name), do: unquote_name(name)
+  defp fold_name(name), do: String.downcase(name)
 
   defp unquote_name("\"" <> _ = name),
     do: name |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")

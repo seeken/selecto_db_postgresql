@@ -320,6 +320,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # entry point that skipped prepare_read) resolves the relations its own
   # text names, with the same rules.
   defp qualify_read(connection, query, opts) do
+    with :ok <- ExplicitSQL.bounded(query) do
+      resolve_read(connection, query, opts)
+    else
+      {:error, %Error{} = error} -> {:error, read_refusal(error)}
+    end
+  end
+
+  defp resolve_read(connection, query, opts) do
     relations =
       case Keyword.get(opts, :selecto_qualified_relations) do
         relations when is_map(relations) ->
@@ -345,9 +353,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
           end
       end
 
+    hand_built? = not is_map(Keyword.get(opts, :selecto_qualified_relations))
+
     with {:ok, relations} <- relations,
          {:ok, query} <- RelationPath.qualify(query, relations) do
-      {:ok, query, Keyword.put(opts, :selecto_qualified_relations, relations)}
+      {:ok, query,
+       opts
+       |> Keyword.put(:selecto_qualified_relations, relations)
+       |> Keyword.put(:selecto_hand_built, hand_built?)}
     else
       {:error, %Error{} = error} -> {:error, read_refusal(error)}
       {:error, _} = error -> error
@@ -665,7 +678,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
                  ExplicitSQL.prepare(guard, query,
                    read: true,
                    isolation: pinned.isolation,
-                   declared_functions: plan.declared_functions
+                   declared_functions: plan.declared_functions,
+                   hand_built: plan.hand_built,
+                   raw_fragments: plan.raw_fragments
                  )
                ),
              {:ok, result} <- read_result(execute.(plan.prefix <> query, params)),
@@ -756,7 +771,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
     do: %{
       path: read_path(opts),
       prefix: Keyword.get(opts, :selecto_explain, ""),
-      declared_functions: Keyword.get(opts, :selecto_declared_functions, [])
+      declared_functions: Keyword.get(opts, :selecto_declared_functions, []),
+      hand_built: Keyword.get(opts, :selecto_hand_built, false),
+      raw_fragments: Keyword.get(opts, :selecto_raw_fragments, [])
     }
 
   @doc """
@@ -4035,7 +4052,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
                    {:ok, prepared} <-
                      ExplicitSQL.prepare(check, query,
                        isolation: pinned.isolation,
-                       declared_functions: Keyword.get(opts, :selecto_declared_functions, [])
+                       declared_functions: Keyword.get(opts, :selecto_declared_functions, []),
+                       hand_built: Keyword.get(opts, :selecto_hand_built, false),
+                       raw_fragments: Keyword.get(opts, :selecto_raw_fragments, [])
                      ) do
                 {before, pinned, prepared}
               else

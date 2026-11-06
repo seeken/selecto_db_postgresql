@@ -119,7 +119,14 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
         assert {:ok, {[[1]], _, _}} = read.({"l", "top.a"})
         assert {:ok, {[[1]], _, _}} = read.({"l", ["top.a", "x"]})
 
-        hand_built = &Adapter.execute(c, &1, [], selecto_read: true)
+        hand_built = fn sql ->
+          relations = %{
+            SelectoDBPostgreSQL.RelationPath.path_key() => ["public", ext],
+            "ht" => ~s("public"."ht")
+          }
+
+          Adapter.execute(c, sql, [], selecto_read: true, selecto_qualified_relations: relations)
+        end
 
         assert {:ok, %{rows: [[1], [2]]}} =
                  hand_built.("SELECT id FROM ht WHERE l ~ 'top.*' ORDER BY id")
@@ -201,7 +208,14 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
   end
 
   defp guarded(c, sql, params \\ []) do
-    case Adapter.execute(c, sql, params, selecto_read: true) do
+    # The qualifier's own route: what Selecto generates. Hand-built text
+    # refuses the forms these tests prove (the hand-built tests elsewhere).
+    relations = %{SelectoDBPostgreSQL.RelationPath.path_key() => ["public"]}
+
+    case Adapter.execute(c, sql, params,
+           selecto_read: true,
+           selecto_qualified_relations: relations
+         ) do
       {:ok, %{rows: rows}} -> rows
       {:error, %{details: %{reason: reason}}} -> {:refused, reason}
       other -> other

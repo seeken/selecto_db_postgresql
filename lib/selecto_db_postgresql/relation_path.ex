@@ -32,6 +32,7 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   alias Selecto.Write.Error
   alias SelectoDBPostgreSQL.RelationPath.Scanner
+  alias SelectoDBPostgreSQL.Qualify
   alias SelectoDBPostgreSQL.SessionGuard
 
   @path_key "selecto:reset_schemas"
@@ -350,7 +351,7 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
     sql
     |> Scanner.refs()
-    |> Enum.reject(&(&1.qualified? or String.downcase(&1.name) in ctes))
+    |> Enum.reject(&(&1.qualified? or &1.folded in ctes))
     |> Enum.map(& &1.name)
     |> Enum.uniq()
   end
@@ -423,6 +424,12 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   def qualify(sql, map) do
     sql = IO.iodata_to_binary(sql)
 
+    if scan_ctes(sql) == :unsure,
+      do: ctes_unresolved(),
+      else: qualify_sure(sql, map)
+  end
+
+  defp qualify_sure(sql, map) do
     case leading_with(sql) do
       {:ok, recursive?, ctes, main} when not recursive? ->
         names = Enum.map(ctes, &elem(&1, 0))
@@ -453,11 +460,10 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   defp rewrite(sql, map, ctes) do
     sql = IO.iodata_to_binary(sql)
-    ctes = Enum.map(ctes, &String.downcase/1)
 
     sql
     |> Scanner.refs()
-    |> Enum.reject(&(&1.qualified? or String.downcase(&1.name) in ctes))
+    |> Enum.reject(&(&1.qualified? or &1.folded in ctes))
     |> Enum.filter(&Map.has_key?(map, &1.name))
     |> Enum.reverse()
     |> Enum.reduce(sql, fn ref, acc ->
@@ -515,7 +521,7 @@ defmodule SelectoDBPostgreSQL.RelationPath do
     with [head, name] <- Regex.run(@cte_head, rest, capture: :all_but_first),
          after_head = binary_part(rest, byte_size(head), byte_size(rest) - byte_size(head)),
          {:ok, body, tail} <- split_paren(after_head) do
-      acc = [{unquote_name(name), head, body} | acc]
+      acc = [{fold_name(name), head, body} | acc]
 
       case Regex.run(~r/\A\s*,/, tail) do
         [comma] ->
@@ -558,11 +564,106 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   defp split_paren(_text, _index, _depth), do: :error
 
+  # H1: read from tokens, so a comma with no space, a comment, a U& name or a
+  # quoted column list is a CTE like any other. Names as PostgreSQL folds them.
   defp cte_names(sql) do
-    ~r/(?:\bwith(?:\s+recursive)?|,)\s+("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)\s*(?:\([^)]*\)\s*)?\bas\s*(?:not\s+)?(?:materialized\s*)?\(/i
-    |> Regex.scan(sql, capture: :all_but_first)
-    |> Enum.map(fn [name] -> name |> unquote_name() |> String.downcase() end)
+    case scan_ctes(sql) do
+      {:ok, names} -> names
+      :unsure -> []
+    end
   end
+
+  defp scan_ctes(sql) do
+    sql |> IO.iodata_to_binary() |> Qualify.tokenize() |> walk_ctes(nil, [])
+  catch
+    {:qualify_refuse, _reason, _message} -> :unsure
+  end
+
+  defp walk_ctes([], _previous, names), do: {:ok, names}
+
+  defp walk_ctes([{:id, word} = token | rest], previous, names) do
+    if String.upcase(word) == "WITH" do
+      list = drop_recursive(rest)
+
+      case cte_list(list, []) do
+        {:ok, found} ->
+          walk_ctes(list, token, names ++ found)
+
+        :error ->
+          if previous in [nil, {:punct, "("}, {:punct, ";"}],
+            do: :unsure,
+            else: walk_ctes(rest, token, names)
+      end
+    else
+      walk_ctes(rest, token, names)
+    end
+  end
+
+  defp walk_ctes([token | rest], _previous, names), do: walk_ctes(rest, token, names)
+
+  defp drop_recursive([{:id, word} | rest] = tokens) do
+    if String.upcase(word) == "RECURSIVE", do: rest, else: tokens
+  end
+
+  defp drop_recursive(tokens), do: tokens
+
+  defp cte_list([{kind, _} = name | rest], names) when kind in [:id, :qid] do
+    with {:ok, rest} <- skip_columns(rest),
+         {:ok, rest} <- word(rest, "AS"),
+         rest = optional_materialized(rest),
+         [{:punct, "("} | body] <- rest,
+         {:ok, rest} <- skip_group(body, 1) do
+      names = [Qualify.folded_name(name) | names]
+
+      case rest do
+        [{:punct, ","} | more] -> cte_list(more, names)
+        _end_of_list -> {:ok, names}
+      end
+    else
+      _other -> :error
+    end
+  end
+
+  defp cte_list(_tokens, _names), do: :error
+
+  defp skip_columns([{:punct, "("} | rest]), do: skip_group(rest, 1)
+  defp skip_columns(tokens), do: {:ok, tokens}
+
+  defp word([{:id, text} | rest], expected) do
+    if String.upcase(text) == expected, do: {:ok, rest}, else: :error
+  end
+
+  defp word(_tokens, _expected), do: :error
+
+  defp optional_materialized(tokens) do
+    tokens =
+      case word(tokens, "NOT") do
+        {:ok, rest} -> rest
+        :error -> tokens
+      end
+
+    case word(tokens, "MATERIALIZED") do
+      {:ok, rest} -> rest
+      :error -> tokens
+    end
+  end
+
+  defp skip_group(tokens, 0), do: {:ok, tokens}
+  defp skip_group([], _depth), do: :error
+  defp skip_group([{:punct, "("} | rest], depth), do: skip_group(rest, depth + 1)
+  defp skip_group([{:punct, ")"} | rest], depth), do: skip_group(rest, depth - 1)
+  defp skip_group([_token | rest], depth), do: skip_group(rest, depth)
+
+  defp ctes_unresolved,
+    do:
+      refusal(
+        :relation_unresolved,
+        "cannot read a statement's WITH list; its CTE names must not be taken for relations",
+        []
+      )
+
+  defp fold_name("\"" <> _ = name), do: unquote_name(name)
+  defp fold_name(name), do: String.downcase(name)
 
   defp unquote_name("\"" <> _ = name),
     do: name |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")

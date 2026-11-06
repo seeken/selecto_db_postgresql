@@ -273,6 +273,14 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       GenServer.stop(c)
     end
 
+    test "UNICODE is UTF8 by another name", ctx do
+      c = ctx.connection
+      sql!(c, "SELECT pg_catalog.set_config('client_encoding', 'UNICODE', false)")
+      assert {:ok, {[[1, "mine"]], _, _}} = enc_read(c, ctx.enc)
+      assert {:ok, %{affected_rows: 1}} = enc_write(c, ctx.enc, "w")
+      sql!(c, "SELECT pg_catalog.set_config('client_encoding', 'UTF8', false)")
+    end
+
     test "a plant setting it during a write refuses, and the write rolls back", ctx do
       c = ctx.connection
       assert {:error, %{details: %{reason: :client_encoding}}} = enc_write(c, ctx.enc, "plant")
@@ -280,6 +288,56 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       # The rollback took the setting with it.
       assert sql!(c, "SELECT pg_catalog.current_setting('client_encoding')") == [["UTF8"]]
       assert notes(c, ctx.enc) == [["mine"], ["SECRET"]]
+    end
+  end
+
+  describe "CTE names (H1)" do
+    setup ctx do
+      relation = "selecto_cte_#{System.unique_integer([:positive])}"
+
+      {:ok, _} =
+        Adapter.execute(
+          ctx.connection,
+          "CREATE TABLE public.#{relation} AS SELECT 'REAL'::text AS v",
+          [],
+          []
+        )
+
+      on_exit(fn ->
+        {:ok, d} = Adapter.connect(Keyword.put(ConnectionOptions.options(), :pool_size, 1))
+        Adapter.execute(d, "DROP TABLE IF EXISTS public.#{relation}", [], [])
+        GenServer.stop(d)
+      end)
+
+      %{relation: relation}
+    end
+
+    test "a CTE is never rewritten to a real table of its name", ctx do
+      r = ctx.relation
+
+      for sql <- [
+            "WITH a AS (SELECT 1),#{r} AS (SELECT 'CTE' AS v) SELECT v FROM #{r}",
+            "WITH a AS (SELECT 1) , /* c */ #{r} AS (SELECT 'CTE' AS v) SELECT v FROM #{r}",
+            "WITH a AS (SELECT 1), -- c\n#{r} AS (SELECT 'CTE' AS v) SELECT v FROM #{r}",
+            ~s|WITH #{r}("v") AS (SELECT 'CTE') SELECT v FROM #{r}|,
+            ~s|WITH #{r} ("a)b", v) AS (SELECT 1, 'CTE') SELECT v FROM #{r}|,
+            ~s|WITH U&"#{r}" AS (SELECT 'CTE' AS v) SELECT v FROM #{r}|,
+            "WITH #{r} AS NOT MATERIALIZED (SELECT 'CTE' AS v) SELECT v FROM #{r}"
+          ] do
+        result = Adapter.execute(ctx.connection, sql, [], selecto_read: true)
+
+        assert match?({:ok, %{rows: [["CTE"]]}}, result) or
+                 match?({:error, %{details: _}}, result),
+               sql <> inspect(result)
+      end
+    end
+
+    test "a quoted CTE of another case does not hide the real table", ctx do
+      r = ctx.relation
+      sql = ~s|WITH "#{String.upcase(r)}" AS (SELECT 'CTE' AS v) SELECT v FROM #{r}|
+
+      assert {:ok, %{rows: [["REAL"]]}} =
+               Adapter.execute(ctx.connection, sql, [], selecto_read: true)
     end
   end
 

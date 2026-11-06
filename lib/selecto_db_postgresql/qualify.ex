@@ -83,6 +83,12 @@ defmodule SelectoDBPostgreSQL.Qualify do
   # and X'' (bit): PostgreSQL leaves its type to the context.
   @untyped_literal ~r/\A(?:\$\d+|[Ee]'(?:[^'\\]|\\.|'')*'|(?:[Uu]&)?'(?:[^']|'')*'(?:\s*UESCAPE\s*'.')?|\$([^$]*)\$.*\$\1\$)\z/is
 
+  @max_rendered_bytes 4_194_304
+
+  # What hand-built SQL may not touch an extension type through (user ruling
+  # 2026-11-06): the typer proves direct comparisons, no more.
+  @unprovable ~w(CASE COALESCE NULLIF GREATEST LEAST CAST UNION INTERSECT EXCEPT VALUES)
+
   @boolean_op ~w(= <> != < > <= >= ~~ ~~* !~~ !~~* ~ ~* !~ !~* @> <@ && ^@ ? ?| ?& @? @@)
 
   @system_column ~w(tableoid ctid xmin xmax cmin cmax)
@@ -105,6 +111,73 @@ defmodule SelectoDBPostgreSQL.Qualify do
   @op_chars ~c"+-*/<>=~!@#%^&|`?"
 
   # ---- Tokens ------------------------------------------------------------
+
+  @doc """
+  Refuses hand-built SQL that touches an extension type through anything the
+  qualifier cannot prove: casts, subscripts, COALESCE, CASE, GREATEST, LEAST,
+  NULLIF, subqueries, set operations. A statement that touches none keeps
+  working. Selecto guards what it generates; a refusal here is acceptable, a
+  guess is not.
+  """
+  def prove!(tokens, facts) do
+    if touches_extension?(tokens, facts) and unprovable?(tokens, 1), do: unproved!()
+    :ok
+  end
+
+  @doc "prove!/2 for raw text inside a generated statement, which has no SELECT of its own."
+  def prove_fragment!(tokens, facts) do
+    if touches_extension?(tokens, facts) and unprovable?(tokens, 0), do: unproved!()
+    :ok
+  end
+
+  defp unproved!,
+    do:
+      refuse(
+        :sql_unprovable,
+        "hand-built SQL touches an extension type through something Selecto cannot prove"
+      )
+
+  defp touches_extension?(tokens, facts) do
+    columns = extension_columns(facts)
+
+    Enum.any?(tokens, fn
+      {kind, _} = token when kind in [:id, :qid] -> MapSet.member?(columns, unquote_name(token))
+      {:op, "*"} -> MapSet.size(columns) > 0
+      _other -> false
+    end) or map_size(Map.get(facts, :casts, %{})) > 0 or outside_catalog?(facts)
+  end
+
+  defp extension_columns(facts) do
+    for {_relation, columns} <- Map.get(facts, :relations, %{}),
+        {name, entry} <- columns,
+        extension?(entry) or entry[:unknown] == true or is_map(entry[:elem]),
+        into: MapSet.new(),
+        do: name
+  end
+
+  defp outside_catalog?(facts) do
+    facts
+    |> Map.get(:functions, %{})
+    |> Enum.any?(fn {_key, info} -> Enum.any?(info.candidates, &(&1.schema != "pg_catalog")) end)
+  end
+
+  defp unprovable?(tokens, selects) do
+    {found?, _previous, count} =
+      Enum.reduce(tokens, {false, nil, 0}, fn token, {found?, previous, count} ->
+        up = upper(token)
+
+        found? =
+          found? or up in @unprovable or up == "WITH" or token == {:punct, "::"} or
+            (token == {:punct, "["} and upper(previous) != "ARRAY")
+
+        {found?, token, if(up == "SELECT", do: count + 1, else: count)}
+      end)
+
+    found? or count > selects
+  end
+
+  @doc "A name token as PostgreSQL folds it: U& decoded, bare names in lower case."
+  def folded_name({kind, _} = token) when kind in [:id, :qid], do: unquote_name(token)
 
   @doc "The significant tokens of `sql`: `{kind, text}`, kind :str, :qid, :param, :num, :id, :op, :punct."
   def tokenize(sql) when is_binary(sql), do: scan(sql, [])
@@ -1229,8 +1302,10 @@ defmodule SelectoDBPostgreSQL.Qualify do
     close = close_index(st, word_at + 1)
     if close == nil, do: refuse(:sql_unqualifiable, "generated SQL has unbalanced parentheses")
 
-    st = %{st | pos: word_at + 2}
+    first = word_at + 2
+    st = %{st | pos: first}
     {a, st} = read_run(st)
+    after_first = st.pos
     st = expect(st, ",")
     {b, st} = read_run(st)
     st = expect(st, ")")
@@ -1241,11 +1316,21 @@ defmodule SelectoDBPostgreSQL.Qualify do
     consumed = st.consumed
     {op, cast, st} = op_sql(st, %{kind: :op, op: "="}, a, b)
 
+    single_evaluation!(st, first, after_first)
+    result = nullif_result(st, a, b, cast)
+
+    # The ELSE is the first argument at the type the equality took it at.
+    kept =
+      cond do
+        cast != nil -> left_cast(left, cast)
+        result[:type] != nil -> "CAST((#{left}) AS #{result.type})"
+        true -> "(#{left})"
+      end
+
     sql =
       "(CASE WHEN (#{left_cast(left, cast)}) #{op} (#{right_cast(right, cast)}) " <>
-        "THEN NULL ELSE (#{left}) END)"
+        "THEN NULL ELSE #{kept} END)"
 
-    result = nullif_result(st, a, b, cast)
     extension? = result[:entry] != nil or result[:unknown] == true
     st = if extension?, do: %{st | consumed: consumed}, else: st
     postfix(st, Map.merge(result, %{sql: sql, keeps_refs: extension?}), mark)
@@ -1269,6 +1354,27 @@ defmodule SelectoDBPostgreSQL.Qualify do
   defp case_result(_strings), do: %{}
 
   defp branch_seen({count, strings?}, st), do: {count + 1, strings? and st.branch_string}
+
+  # NULLIF and a simple CASE are rewritten with their first operand written
+  # more than once. PostgreSQL evaluates it once, so a volatile call there
+  # refuses rather than run twice.
+  defp single_evaluation!(st, first, stop) do
+    functions = Map.get(st.facts, :functions, %{})
+
+    for at <- first..(stop - 1)//1,
+        punct?(st, at + 1, "("),
+        match?({kind, _} when kind in [:id, :qid], tok(st, at)),
+        info = Map.get(functions, unquote_name(tok(st, at))),
+        info != nil,
+        Enum.any?(info.candidates, &Map.get(&1, :volatile, false)) do
+      refuse(
+        :volatile_operand,
+        "a volatile call here would run twice, where PostgreSQL runs it once"
+      )
+    end
+
+    :ok
+  end
 
   # NULLIF has the type its equality takes the first argument at: the
   # extension's with a member for the pair, text when that resolves to text's;
@@ -1300,7 +1406,9 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
   # A simple CASE x WHEN v ...: searched, with explicit operators.
   defp simple_case(st, mark) do
+    first = st.pos
     {subject, st} = read_run(st, "WHEN")
+    single_evaluation!(st, first, st.pos)
     {left, st} = render(st, subject)
     {parts, st, strings} = simple_branches(st, subject, left, [], {0, true})
 
@@ -2042,6 +2150,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
   # The column references this atom's type depends on: itself for a column;
   # none for a known or extension-typed result; else those read inside it.
   defp finish_atom(st, atom, mark) do
+    bounded!(atom.sql)
     {kept, own} = Enum.split(st.refs, mark)
 
     {refs, st} =
@@ -2078,6 +2187,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
     items = List.to_tuple(run)
     {tree, i} = climb(items, 0, 0)
     {sql, st} = render(st, tree)
+    bounded!(sql)
 
     st = %{st | run_string: i == tuple_size(items) and concat_string?(st, tree)}
 
@@ -2094,6 +2204,13 @@ defmodule SelectoDBPostgreSQL.Qualify do
       end)
 
     {Enum.join([sql | rest], " "), st}
+  end
+
+  # M6: NULLIF, a simple CASE and the like write an operand more than once,
+  # so a few bytes nested can render exponentially.
+  defp bounded!(sql) do
+    if byte_size(sql) > @max_rendered_bytes,
+      do: refuse(:statement_too_large, "a statement renders beyond the size Selecto will run")
   end
 
   defp concat_string?(st, %{binary: %{op: "||"}}), do: catalog_string?(st.concat)
