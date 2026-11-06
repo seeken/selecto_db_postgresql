@@ -140,9 +140,10 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   SELECT 'col' AS selecto_guard_fact, CAST(a.rel AS pg_catalog.text) AS selecto_guard_fact_relation,
     CAST(a.attname AS pg_catalog.text) AS selecto_guard_fact_column,
     CAST(a.atttypid AS pg_catalog.text) AS selecto_guard_fact_name,
-    (SELECT #{@quoted_argument} FROM pg_catalog.pg_type t
+    (SELECT #{@quoted_argument} FROM c
+     JOIN pg_catalog.pg_type t ON t.oid #{@op} c.oid AND t.typtype OPERATOR(pg_catalog.<>) 'd'
      JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} t.typnamespace
-     WHERE t.oid #{@op} a.atttypid) AS selecto_guard_fact_schema,
+     WHERE c.rel #{@op} a.rel AND c.att #{@op} a.attname AND NOT c.arr LIMIT 1) AS selecto_guard_fact_schema,
     #{@no_args} AS selecto_guard_fact_arguments FROM a
   UNION ALL
   SELECT 'deep', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), #{@none}, #{@none}, #{@no_args}
@@ -161,7 +162,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   UNION ALL
   SELECT CASE WHEN e.arr THEN 'etyp' ELSE 'typ' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
     pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
-      pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))), #{@none}, #{@no_args}
+      pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))),
+    CAST(ty.typcategory AS pg_catalog.text), #{@no_args}
   FROM e JOIN pg_catalog.pg_type ty ON ty.oid #{@op} e.oid
   JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} ty.typnamespace
   UNION ALL
@@ -202,7 +204,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   JOIN LATERAL (
     SELECT #{@none} AS op, CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
         WHERE d.classid #{@op} #{@type_class} AND d.deptype #{@op} 'e' AND d.objid #{@op} w.t)
-        THEN pg_catalog.concat('ext:', pg_catalog.quote_ident(CAST((SELECT tn.nspname FROM pg_catalog.pg_namespace tn
+        THEN pg_catalog.concat('ext:', CAST(wt.typcategory AS pg_catalog.text), ':', pg_catalog.quote_ident(CAST((SELECT tn.nspname FROM pg_catalog.pg_namespace tn
           WHERE tn.oid #{@op} wt.typnamespace) AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(wt.typname AS pg_catalog.text)))
       WHEN w.t #{@op} ANY (ARRAY(SELECT x.oid FROM x)) OR wt.typtype #{@op} 'p'
         OR wt.typtype #{@op} 'c' THEN 'unknown' ELSE 'known' END AS schema
@@ -239,7 +241,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   SELECT 'typ' AS selecto_guard_cast_fact, e.name AS selecto_guard_cast_key,
     pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
       pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))) AS selecto_guard_cast_name,
-    #{@none} AS selecto_guard_cast_schema, #{@no_args} AS selecto_guard_cast_arguments
+    CAST(ty.typcategory AS pg_catalog.text) AS selecto_guard_cast_schema,
+    #{@no_args} AS selecto_guard_cast_arguments
   FROM e JOIN pg_catalog.pg_type ty ON ty.oid #{@op} e.oid
   JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} ty.typnamespace
   UNION ALL
@@ -436,9 +439,14 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   defp decode_row(["fcol", position, name, _, state, _], acc) do
     update_rowset_column(acc, name, position, fn entry ->
       case state do
-        "unknown" -> %{entry | unknown: true}
-        "ext:" <> type -> %{entry | type: type}
-        _ -> entry
+        "unknown" ->
+          %{entry | unknown: true}
+
+        <<"ext:", category::binary-size(1), ":", type::binary>> ->
+          %{entry | type: type, category: category}
+
+        _ ->
+          entry
       end
     end)
   end
@@ -455,7 +463,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
 
     update = fn entry ->
       case String.trim_leading(kind, "e") do
-        "typ" -> %{entry | type: name}
+        "typ" -> %{entry | type: name, category: schema}
         "op" -> %{entry | ops: put_operator(entry.ops, name, schema, hd(args), List.last(args))}
         "fn" -> %{entry | fns: put_function(entry.fns, name, schema, args)}
       end
@@ -492,16 +500,16 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
       end
 
     function = %{schema: schema, self: self?, args: args, nargs: length(args)}
-    Map.update(fns, String.downcase(name), [function], &[function | &1])
+    Map.update(fns, name, [function], &[function | &1])
   end
 
-  defp new_entry, do: %{ops: %{}, fns: %{}, type: nil, elem: nil, unknown: false}
+  defp new_entry, do: %{ops: %{}, fns: %{}, type: nil, category: nil, elem: nil, unknown: false}
 
   defp update_column(acc, relation, column, fun) do
     key = relation_key(relation)
     columns = Map.get(acc.relations, key, %{})
-    entry = fun.(Map.get(columns, String.downcase(column), new_entry()))
-    columns = Map.put(columns, String.downcase(column), entry)
+    entry = fun.(Map.get(columns, column, new_entry()))
+    columns = Map.put(columns, column, entry)
     %{acc | relations: Map.put(acc.relations, key, columns)}
   end
 
@@ -531,9 +539,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     |> Enum.reject(&(&1 == {:punct, "."}))
     |> Enum.map_join(".", fn
       {:qid, text} -> text |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")
-      {_kind, text} -> text
+      {_kind, text} -> String.downcase(text)
     end)
-    |> String.downcase()
   end
 
   # R49a: what the catalog said at the snapshot against what the parser
@@ -593,8 +600,9 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
       {:ok, %{rows: rows}} when is_list(rows) ->
         {:ok,
          Enum.reduce(rows, %{}, fn
-           ["typ", key, name, _, _], acc ->
-             Map.update(acc, key, %{new_entry() | type: name}, &%{&1 | type: name})
+           ["typ", key, name, category, _], acc ->
+             entry = Map.get(acc, key, new_entry())
+             Map.put(acc, key, %{entry | type: name, category: category})
 
            ["op", key, op, schema, [left, right]], acc ->
              entry = Map.get(acc, key, new_entry())

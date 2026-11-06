@@ -4,6 +4,13 @@ CHANGES
 Unreleased
 ----------
 
+- A non-member operator on an extension operand refuses in Selecto, except a
+  string-category type against a pg_catalog string. A non-member function beside
+  an extension's members is ambiguous. Keyword-named functions are qualified.
+  Catalog facts key columns by exact name. Reads take the `read_only_reads`
+  setting and refuse writes typed (`read_only_read`); row locks are read from
+  tokens.
+
 - An operator outside pg_catalog is named only when it is a member of the
   operand type's extension for those operand types; an explicit one is
   verified. Selecto reads run READ ONLY. `explain/2`, `explain_analyze/2` and

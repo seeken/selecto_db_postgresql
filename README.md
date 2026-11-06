@@ -404,17 +404,29 @@ another schema's relation, function or operator of the same name. So:
   those operand types; `hstore < hstore`, which the extension does not define,
   refuses (`reason: :operator_not_member`) whatever is planted beside it, and
   an `OPERATOR(ext.op)` already in a statement is verified the same way.
+  pg_catalog's operator stands in for a missing member in exactly one case: a
+  string-category extension type (citext, domains over it) against a
+  pg_catalog string type, which compares as text as PostgreSQL does. Any other
+  pair refuses in Selecto, not at the server: an implicit cast could make it
+  resolve and compare the wrong thing (box3d `=` by area, geometry as text).
+- **Functions.** A non-member beside an extension's own functions leaves the
+  call ambiguous (`:function_ambiguous`), whatever the arguments favour. A
+  keyword followed by `(` that is no syntax is a function (hstore's `delete`).
 - **Reads cannot write.** A Selecto read runs with `transaction_read_only`
   pinned on, so a function or planted operator it reaches cannot write through
   it; in a host transaction its savepoint ends by ROLLBACK TO, which restores
   the host's setting. A read that takes row locks (`FOR UPDATE`, `FOR SHARE`)
   stays writable, since PostgreSQL refuses those read-only. A host function
   that writes (or `nextval`) in a domain view or custom column therefore
-  refuses in a read.
+  refuses in a read (`reason: :read_only_read`).
+  `config :selecto_db_postgresql, read_only_reads: false` turns this off.
 - **EXPLAIN is a read.** `Selecto.explain/2`, `explain_analyze/2` and
   `QueryAnalyzer` run through the same qualification, pin and session checks,
   with the same refusals: even plain EXPLAIN evaluates operators, since a
   selectivity estimator such as `eqsel` applies them to most-common values.
+- **`Selecto.to_sql/2` and `gen_sql/2` are compile-only.** Their text names
+  relations and operators bare and has none of this protection. It is for
+  display and tests; run a read through `Selecto.execute/2`.
 - **uuid columns** take their text value as a uuid in reads and writes,
   whatever the field's declared type. Text that is no uuid refuses
   (`reason: :invalid_uuid`), as does a non-canonical spelling on a tenant
