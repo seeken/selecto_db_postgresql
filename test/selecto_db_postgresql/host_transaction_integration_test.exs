@@ -66,6 +66,27 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
     assert sql!(c, "SELECT note FROM public.#{ctx.table} WHERE id = 1") == [["n"]]
   end
 
+  test "a write on a module that is no pool refuses, without an exit", ctx do
+    defmodule NoPool do
+      def query(_sql, _params), do: {:error, :no_pool}
+    end
+
+    scope = {:eq, {:field, "org"}, {:literal, "t1"}}
+
+    {:ok, command} =
+      Command.new(%{
+        operation: :update,
+        relation: ctx.table,
+        predicate: {:and, [{:eq, {:field, "id"}, {:literal, 1}}, scope]},
+        assignments: [%{field: "note", value: {:literal, "new"}}],
+        expected_cardinality: :many,
+        metadata: %{post_image: %{predicate: scope, key: ["id"]}}
+      })
+
+    assert {:error, %{type: :transaction_failed}} =
+             Adapter.execute_write_unsafe(NoPool, command, [])
+  end
+
   test "outside a transaction a write on a pid takes its own", ctx do
     assert {:ok, %{affected_rows: 1}} = write(ctx.connection, ctx.table, 1)
 
