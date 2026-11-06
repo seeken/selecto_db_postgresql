@@ -218,6 +218,17 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     exception -> {:raised, Exception.message(exception)}
   end
 
+  defp stream_ids(c) do
+    {:ok, stream} =
+      c
+      |> base()
+      |> Selecto.select(["id"])
+      |> Selecto.filter({"ci", "mixed"})
+      |> Selecto.execute_stream(receive_timeout: 5_000)
+
+    {:ok, stream |> Enum.map(&elem(&1, 0)) |> Enum.sort()}
+  end
+
   defp ids(c, filter) do
     base(c) |> Selecto.select(["id"]) |> Selecto.filter(filter) |> run()
   end
@@ -355,6 +366,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       citext_lt: {"ci", {"<", "N"}},
       domain_citext_eq: {"dci", "bob"},
       domain_citext_ne: {"dci", {"!=", "BOB"}},
+      citext_subquery: {"ci", {:subquery, :in, "SELECT code FROM codes", []}},
       citext_vs_text: {"ci", {:ref, "name"}},
       text_vs_citext: {"name", {:ref, "ci"}},
       computed_lower: {"lower_vc", "alpha"},
@@ -368,6 +380,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     |> Map.merge(specialised(c))
     |> Map.merge(%{
       tenant: q.(["id"]) |> run(),
+      stream: stream_ids(c),
       join: q.(["id", "cat.name"]) |> run(),
       citext_join: q.(["id", "code_row.label"]) |> run(),
       group_count:
@@ -460,6 +473,9 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
   @reads [
     {"citext aggregate", "SELECT max(ci) FROM items WHERE org = 't1'"},
     {"citext aggregate over a domain", "SELECT max(dci) FROM items WHERE org = 't1'"},
+    {"citext aggregate with DISTINCT", "SELECT max(DISTINCT ci) FROM items WHERE org = 't1'"},
+    {"implicit alias through a derived table",
+     "SELECT s.id FROM (SELECT id, ci c FROM items) s WHERE s.c = 'MIXED' ORDER BY s.id"},
     {"citext aggregate in HAVING",
      "SELECT id FROM items WHERE org = 't1' GROUP BY id HAVING max(ci) = 'MIXED' ORDER BY id"},
     {"citext overload", "SELECT replace(ci, 'M', 'z') FROM items WHERE id = 3"},
@@ -538,7 +554,8 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     for sql <- [
           "SELECT id FROM items WHERE COALESCE(ci, 'x') = 'MIXED'",
           "SELECT id FROM items WHERE (CASE WHEN n > 0 THEN ci END) = 'MIXED'",
-          "SELECT id FROM items WHERE ci = ANY($1)"
+          "SELECT id FROM items WHERE ci = ANY($1)",
+          "SELECT max(COALESCE(ci, 'x')) FROM items"
         ] do
       params = if String.contains?(sql, "$1"), do: [["MIXED"]], else: []
 
@@ -565,6 +582,63 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
              |> run()
 
     GenServer.stop(c)
+  end
+
+  test "a function outside the pinned schemas is not a candidate", %{opts: opts} do
+    {:ok, admin} = Adapter.connect(opts)
+
+    for sql <- [
+          "CREATE SCHEMA offpath",
+          "CREATE FUNCTION offpath.only_there(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1'"
+        ],
+        do: exec!(admin, sql)
+
+    try do
+      {:ok, c} = Adapter.connect(opts)
+
+      assert {:error, %{details: %{reason: :function_not_found}}} =
+               Adapter.execute(c, "SELECT only_there(name) FROM items", [], selecto_read: true)
+
+      GenServer.stop(c)
+    after
+      exec!(admin, "DROP SCHEMA offpath CASCADE")
+      GenServer.stop(admin)
+    end
+  end
+
+  test "a domain chain deeper than the walk refuses", %{opts: opts} do
+    {:ok, admin} = Adapter.connect(opts)
+
+    domains =
+      Enum.map_reduce(1..17, "ext.citext", fn level, previous ->
+        {"CREATE DOMAIN deep#{level} AS #{previous}", "deep#{level}"}
+      end)
+      |> elem(0)
+
+    for sql <- domains, do: exec!(admin, sql)
+    exec!(admin, "CREATE TABLE deep16t (id int PRIMARY KEY, k deep16)")
+    exec!(admin, "CREATE TABLE deep17t (id int PRIMARY KEY, k deep17)")
+    exec!(admin, "INSERT INTO deep16t VALUES (1, 'MiX')")
+
+    try do
+      {:ok, c} = Adapter.connect(opts)
+
+      assert {:ok, %{rows: [[1]]}} =
+               Adapter.execute(c, "SELECT id FROM deep16t WHERE k = 'mix'", [],
+                 selecto_read: true
+               )
+
+      assert {:error, %{details: %{reason: :domain_chain_too_deep}}} =
+               Adapter.execute(c, "SELECT id FROM deep17t WHERE k = 'mix'", [],
+                 selecto_read: true
+               )
+
+      GenServer.stop(c)
+    after
+      exec!(admin, "DROP TABLE deep16t, deep17t")
+      exec!(admin, "DROP DOMAIN deep1 CASCADE")
+      GenServer.stop(admin)
+    end
   end
 
   test "a citext-tenant UPDATE applies, under plants, and another tenant's never", %{opts: opts} do
