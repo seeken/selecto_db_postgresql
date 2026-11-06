@@ -79,6 +79,10 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
   @comparison ~w(< > = <= >= <> !=)
 
+  # A parameter, or a string literal in any spelling but N'' (bpchar), B''
+  # and X'' (bit): PostgreSQL leaves its type to the context.
+  @untyped_literal ~r/\A(?:\$\d+|(?:[Ee]|[Uu]&)?'(?:[^']|'')*'(?:\s*UESCAPE\s*'.')?|\$([^$]*)\$.*\$\1\$)\z/is
+
   @boolean_op ~w(= <> != < > <= >= ~~ ~~* !~~ !~~* ~ ~* !~ !~* @> <@ && ^@ ? ?| ?& @? @@)
 
   @system_column ~w(tableoid ctid xmin xmax cmin cmax)
@@ -716,7 +720,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
     {%{
        kind: :atom,
-       sql: "((#{left_cast(left, cast)}) #{op} (#{right_cast(pattern, cast)}))"
+       sql: "((#{left_cast(left, cast)}) #{op}" <> right_side(right, pattern, cast)
      }, head, st}
   end
 
@@ -2033,18 +2037,19 @@ defmodule SelectoDBPostgreSQL.Qualify do
     {left_sql, st} = render(st, left)
     {right_sql, st} = render(st, right)
     {op_text, cast, st} = op_sql(st, op, left, right)
-    quantified = right |> Map.get(:atom, %{}) |> Map.get(:quantified)
+    {"((#{left_cast(left_sql, cast)}) #{op_text}" <> right_side(right, right_sql, cast), st}
+  end
 
-    # x op ANY/ALL/SOME (array or subquery): the quantifier belongs to the
-    # operator's syntax and takes no parentheses of its own.
-    right_text =
-      cond do
-        quantified == nil -> " (#{right_cast(right_sql, cast)}))"
-        cast == nil -> " #{right_sql})"
-        true -> " #{quantified_cast(quantified, cast)})"
-      end
+  # x op ANY/ALL/SOME (array or subquery): the quantifier belongs to the
+  # operator's syntax and takes no parentheses of its own.
+  defp right_side(right, sql, cast) do
+    quantified = (right || %{}) |> Map.get(:atom, %{}) |> Map.get(:quantified)
 
-    {"((#{left_cast(left_sql, cast)}) #{op_text}" <> right_text, st}
+    cond do
+      quantified == nil -> " (#{right_cast(sql, cast)}))"
+      cast == nil -> " #{sql})"
+      true -> " #{quantified_cast(quantified, cast)})"
+    end
   end
 
   defp left_cast(sql, nil), do: sql
@@ -2279,7 +2284,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
         %{unknown: true}
 
       Map.get(atom, :column) == nil and
-          Regex.match?(~r/\A(?:\$\d+|[Ee]?'(?:[^']|'')*')\z/, atom.sql) ->
+          Regex.match?(@untyped_literal, atom.sql) ->
         %{untyped: true}
 
       Map.get(atom, :entry) != nil ->

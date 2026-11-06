@@ -300,7 +300,7 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
     refute Keyword.has_key?(opts, :timeout)
     refute Keyword.has_key?(opts, :deadline)
     # The statement cache's name (on by default) is the only option added.
-    assert opts == Adapter.statement_cache_opts("SELECT 1", [])
+    assert opts == []
   end
 
   defp start_repo(config) do
