@@ -17,7 +17,7 @@ defmodule SelectoDBPostgreSQL.FunctionVerificationTest do
       mock_connection(
         catalog_row(),
         query_assertion: fn query, params, opts ->
-          assert query =~ "to_regprocedure($1)"
+          assert query =~ "pg_catalog.to_regprocedure($1::pg_catalog.text)"
           assert query =~ "has_function_privilege"
           assert query =~ "pg_extension"
 

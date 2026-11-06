@@ -3,84 +3,89 @@ defmodule SelectoDBPostgreSQL.FunctionVerification do
 
   alias Selecto.FunctionVerification.Request
 
+  # R48: Selecto's own catalog SQL names every operator and function.
   @catalog_query """
   WITH requested AS (
-    SELECT to_regprocedure($1)::oid AS oid
+    SELECT pg_catalog.to_regprocedure($1::pg_catalog.text)::pg_catalog.oid AS oid
   ),
   candidates AS (
-    SELECT count(*)::integer AS candidate_count
-    FROM pg_proc AS candidate
-    JOIN pg_namespace AS candidate_namespace ON candidate_namespace.oid = candidate.pronamespace
-    WHERE candidate.prokind = 'f'
-      AND candidate.proname = $2
+    SELECT pg_catalog.count(*)::pg_catalog.int4 AS candidate_count
+    FROM pg_catalog.pg_proc AS candidate
+    JOIN pg_catalog.pg_namespace AS candidate_namespace
+      ON candidate_namespace.oid OPERATOR(pg_catalog.=) candidate.pronamespace
+    WHERE candidate.prokind OPERATOR(pg_catalog.=) 'f'
+      AND candidate.proname::pg_catalog.text OPERATOR(pg_catalog.=) $2::pg_catalog.text
       AND CASE
-        WHEN $3::text IS NULL THEN pg_function_is_visible(candidate.oid)
-        ELSE candidate_namespace.nspname = $3
+        WHEN $3::pg_catalog.text IS NULL THEN pg_catalog.pg_function_is_visible(candidate.oid)
+        ELSE candidate_namespace.nspname::pg_catalog.text OPERATOR(pg_catalog.=) $3::pg_catalog.text
       END
   )
   SELECT
-    resolved_function.oid::text,
+    resolved_function.oid::pg_catalog.text,
     CASE
       WHEN resolved_function.oid IS NULL THEN NULL
-      ELSE format(
+      ELSE pg_catalog.format(
         '%I.%I(%s)',
         namespace.nspname,
         resolved_function.proname,
-        pg_get_function_identity_arguments(resolved_function.oid)
+        pg_catalog.pg_get_function_identity_arguments(resolved_function.oid)
       )
     END AS resolved_identity,
-    format_type(resolved_function.prorettype, NULL) AS return_type,
+    pg_catalog.format_type(resolved_function.prorettype, NULL) AS return_type,
     resolved_function.proretset,
-    resolved_function.provolatile::text,
-    has_function_privilege(resolved_function.oid, 'EXECUTE') AS executable,
-    current_setting('server_version_num') AS server_version_num,
-    current_setting('search_path') AS search_path,
-    current_database() AS database_name,
+    resolved_function.provolatile::pg_catalog.text,
+    pg_catalog.has_function_privilege(resolved_function.oid, 'EXECUTE') AS executable,
+    pg_catalog.current_setting('server_version_num') AS server_version_num,
+    pg_catalog.current_setting('search_path') AS search_path,
+    pg_catalog.current_database() AS database_name,
     ARRAY(
       SELECT resolved_function.proargnames[index]
-      FROM generate_subscripts(resolved_function.proargmodes, 1) AS index
-      WHERE resolved_function.proargmodes[index]::text IN ('o', 'b', 't')
+      FROM pg_catalog.generate_subscripts(resolved_function.proargmodes, 1) AS index
+      WHERE resolved_function.proargmodes[index]::pg_catalog.text OPERATOR(pg_catalog.=)
+        ANY (ARRAY['o', 'b', 't']::pg_catalog.text[])
       ORDER BY index
     ) AS output_names,
     ARRAY(
-      SELECT format_type(resolved_function.proallargtypes[index], NULL)
-      FROM generate_subscripts(resolved_function.proargmodes, 1) AS index
-      WHERE resolved_function.proargmodes[index]::text IN ('o', 'b', 't')
+      SELECT pg_catalog.format_type(resolved_function.proallargtypes[index], NULL)
+      FROM pg_catalog.generate_subscripts(resolved_function.proargmodes, 1) AS index
+      WHERE resolved_function.proargmodes[index]::pg_catalog.text OPERATOR(pg_catalog.=)
+        ANY (ARRAY['o', 'b', 't']::pg_catalog.text[])
       ORDER BY index
     ) AS output_types,
     ARRAY(
       SELECT attribute.attname
-      FROM pg_attribute AS attribute
-      WHERE attribute.attrelid = resolved_function.prorettype
-        AND attribute.attnum > 0
+      FROM pg_catalog.pg_attribute AS attribute
+      WHERE attribute.attrelid OPERATOR(pg_catalog.=) resolved_function.prorettype
+        AND attribute.attnum OPERATOR(pg_catalog.>) 0
         AND NOT attribute.attisdropped
       ORDER BY attribute.attnum
     ) AS composite_output_names,
     ARRAY(
-      SELECT format_type(attribute.atttypid, attribute.atttypmod)
-      FROM pg_attribute AS attribute
-      WHERE attribute.attrelid = resolved_function.prorettype
-        AND attribute.attnum > 0
+      SELECT pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+      FROM pg_catalog.pg_attribute AS attribute
+      WHERE attribute.attrelid OPERATOR(pg_catalog.=) resolved_function.prorettype
+        AND attribute.attnum OPERATOR(pg_catalog.>) 0
         AND NOT attribute.attisdropped
       ORDER BY attribute.attnum
     ) AS composite_output_types,
     candidates.candidate_count,
     ARRAY(
       SELECT required_extension
-      FROM unnest($4::text[]) AS required_extension
+      FROM pg_catalog.unnest($4::pg_catalog.text[]) AS required_extension
       WHERE EXISTS (
         SELECT 1
-        FROM pg_extension
-        WHERE pg_extension.extname = required_extension
+        FROM pg_catalog.pg_extension
+        WHERE pg_extension.extname::pg_catalog.text OPERATOR(pg_catalog.=) required_extension
       )
       ORDER BY required_extension
     ) AS satisfied_extensions
   FROM requested
   CROSS JOIN candidates
-  LEFT JOIN pg_proc AS resolved_function
-    ON resolved_function.oid = requested.oid
-   AND resolved_function.prokind = 'f'
-  LEFT JOIN pg_namespace AS namespace ON namespace.oid = resolved_function.pronamespace
+  LEFT JOIN pg_catalog.pg_proc AS resolved_function
+    ON resolved_function.oid OPERATOR(pg_catalog.=) requested.oid
+   AND resolved_function.prokind OPERATOR(pg_catalog.=) 'f'
+  LEFT JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid OPERATOR(pg_catalog.=) resolved_function.pronamespace
   """
 
   @type query_fun ::

@@ -108,13 +108,15 @@ defmodule SelectoDBPostgreSQL.ColumnCatalogIntegrationTest do
 
       assert {:ok, %{"org_key" => %{type: "text"}}} = Adapter.column_catalog(connection, plain)
 
-      # A temp table shadows the permanent one, for the catalog as for the
-      # unqualified INSERT.
+      # A temp namesake changes neither the write (qualified to its
+      # resolved schema, R38a) nor the catalog read that must describe it.
       {:ok, _} =
         Adapter.execute(connection, "CREATE TEMP TABLE #{plain} (org_key varchar(5))", [], [])
 
+      assert {:ok, %{"org_key" => %{type: "text"}}} = Adapter.column_catalog(connection, plain)
+
       assert {:ok, %{"org_key" => %{type: "character varying(5)"}}} =
-               Adapter.column_catalog(connection, plain)
+               Adapter.column_catalog(connection, "pg_temp.#{plain}")
 
       {:ok, _} = Adapter.execute(connection, "DROP TABLE pg_temp.#{plain}", [], [])
     after

@@ -297,7 +297,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         guarded_read(connection, query, params, opts)
       end
     else
-      execute_plain(connection, query, params, opts)
+      execute_plain(connection, SQLRecorder.host(query), params, opts)
     end
   end
 
@@ -607,7 +607,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
              :ok <- read_step(RelationPath.qualified(query)),
              {:ok, query} <-
                read_step(ExplicitSQL.prepare(guard, query, isolation: pinned.isolation)),
-             {:ok, result} <- execute.(SQLRecorder.record(query), params),
+             {:ok, result} <- execute.(query, params),
              :ok <- read_step(SessionGuard.unpin(guard, pinned, before)),
              :ok <- read_compare(guard, before),
              :ok <- run_all(guard, close) do
@@ -719,7 +719,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # itself; their result columns carry the `selecto_guard_` tag (R22), so a
   # certification harness can recognise exactly these receipts.
   defp guard_statement(connection, sql, params),
-    do: guard_statement_run(connection, SQLRecorder.record(sql, :guard), params)
+    do: guard_statement_run(connection, sql, params)
 
   defp guard_statement_run({:pool, pool_ref}, sql, params) do
     case resolve_live_pool_pid(pool_ref) do
@@ -946,11 +946,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
   WITH RECURSIVE walk (attnum, attname, typid, typmod, colloid, depth) AS (
     SELECT a.attnum, a.attname::pg_catalog.text, a.atttypid, a.atttypmod, a.attcollation, 0
     FROM pg_catalog.pg_attribute a
-    WHERE a.attrelid = pg_catalog.to_regclass($1::pg_catalog.text) AND a.attnum > 0 AND NOT a.attisdropped
+    WHERE a.attrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1::pg_catalog.text)
+      AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
     UNION ALL
-    SELECT w.attnum, w.attname, t.typbasetype, t.typtypmod, w.colloid, w.depth + 1
-    FROM walk w JOIN pg_catalog.pg_type t ON t.oid = w.typid
-    WHERE t.typtype = 'd' AND w.depth < 16
+    SELECT w.attnum, w.attname, t.typbasetype, t.typtypmod, w.colloid, w.depth OPERATOR(pg_catalog.+) 1
+    FROM walk w JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) w.typid
+    WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND w.depth OPERATOR(pg_catalog.<) 16
   )
   SELECT DISTINCT ON (w.attnum)
          w.attname AS selecto_catalog_column,
@@ -958,42 +959,43 @@ defmodule SelectoDBPostgreSQL.Adapter do
          t.typtype::pg_catalog.text AS selecto_catalog_typtype,
          COALESCE(c.collisdeterministic, true) AS selecto_catalog_deterministic
   FROM walk w
-  JOIN pg_catalog.pg_type t ON t.oid = w.typid
-  LEFT JOIN pg_catalog.pg_collation c ON c.oid = w.colloid
+  JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) w.typid
+  LEFT JOIN pg_catalog.pg_collation c ON c.oid OPERATOR(pg_catalog.=) w.colloid
   ORDER BY w.attnum, w.depth DESC
   """
 
   @impl Selecto.DB.WriteAdapter
   # format_type of each column's resolved base type and typmod, with the
   # column collation's collisdeterministic (query_enforced_scalar v2
-  # verified metadata). The relation resolves exactly as the write names it:
-  # each dotted part quoted, through the search path (a temp table shadows
-  # like it does for the INSERT). An enum reports base `enum`. A domain the
+  # verified metadata). The relation resolves exactly as the write will name
+  # it (RelationPath): its declared schema, or the pinned resolution, never
+  # the session's current search_path. An enum reports base `enum`. A domain the
   # walk could not resolve is reported `base_verified`, so only identity-safe
   # decisions are made on it. The selecto_catalog_* column names tag the read
   # in driver traces.
   def column_catalog(connection, table) when is_binary(table) do
-    relation =
-      table
-      |> String.split(".")
-      |> Enum.map_join(".", &quote_identifier/1)
+    case resolve_relations(connection, [table]) do
+      {:ok, relations} -> read_column_catalog(connection, Map.fetch!(relations, table))
+      # No relation by that name: nothing is verified.
+      {:error, %Error{details: %{reason: :relation_unresolved}}} -> {:ok, %{}}
+      {:error, _reason} = error -> error
+    end
+  end
 
-    case execute(connection, @column_catalog_sql, [relation], []) do
-      {:ok, %{rows: rows}} ->
-        {:ok,
-         Map.new(rows, fn [name, type, typtype, deterministic] ->
-           info =
-             case typtype do
-               "e" -> %{type: "enum", deterministic: deterministic == true}
-               "d" -> %{type: type, deterministic: deterministic == true, trust: :base_verified}
-               _ -> %{type: type, deterministic: deterministic == true}
-             end
+  defp read_column_catalog(connection, relation) do
+    with {:ok, %{rows: rows}} <-
+           execute_statement(connection, @column_catalog_sql, [relation], []) do
+      {:ok,
+       Map.new(rows, fn [name, type, typtype, deterministic] ->
+         info =
+           case typtype do
+             "e" -> %{type: "enum", deterministic: deterministic == true}
+             "d" -> %{type: type, deterministic: deterministic == true, trust: :base_verified}
+             _ -> %{type: type, deterministic: deterministic == true}
+           end
 
-           {name, info}
-         end)}
-
-      {:error, _reason} = error ->
-        error
+         {name, info}
+       end)}
     end
   end
 
@@ -1760,7 +1762,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     check = fn sql, params ->
       execute_statement(
         connection,
-        SQLRecorder.record(sql, :guard),
+        sql,
         params,
         Keyword.take(opts, [:timeout, :log])
       )
@@ -1936,7 +1938,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
            ExplicitSQL.prepare(&guard_statement(connection, &1, &2), sql,
              isolation: pinned_isolation(opts)
            ) do
-      execute_statement(connection, SQLRecorder.record(sql), params, opts)
+      execute_statement(connection, sql, params, opts)
     end
   end
 
@@ -2289,7 +2291,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         UNION ALL
         SELECT matviewname AS table_name,
                'materialized_view' AS source_kind
-        FROM pg_matviews
+        FROM pg_catalog.pg_matviews
         WHERE schemaname = $1
         ORDER BY table_name
         """
@@ -2680,7 +2682,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp execute_ecto_query(repo, query, params, opts \\ []) do
-    case apply(ecto_sql_module(), :query, [repo, normalize_query(query), params, opts]) do
+    statement = query |> normalize_query() |> SQLRecorder.driver()
+
+    case apply(ecto_sql_module(), :query, [repo, statement, params, opts]) do
       {:ok, result} -> {:ok, normalize_result(result)}
       {:error, reason} -> {:error, reason}
     end
@@ -2739,7 +2743,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp query_postgrex(connection, query, params, opts) do
-    statement = normalize_query(query)
+    statement = query |> normalize_query() |> SQLRecorder.driver()
 
     case Postgrex.query(connection, statement, params, statement_cache_opts(statement, opts)) do
       {:ok, result} -> {:ok, normalize_result(result)}
@@ -2803,7 +2807,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
         query_fun.(query, params, prepared: false)
 
       _ ->
-        execute_statement(connection, query, params, prepared: false)
+        # R48: Selecto's own catalog reads resolve nothing by name either.
+        with {:ok, query} <-
+               ExplicitSQL.prepare(&guard_statement(connection, &1, &2), query) do
+          execute_statement(connection, query, params, prepared: false)
+        end
     end
   end
 
@@ -3370,6 +3378,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp execute_with_pool_pid(pool_pid, query, params, cache_key, opts) do
+    SQLRecorder.driver(query)
+
     query_opts = [timeout: Keyword.get(opts, :timeout, 15_000)] ++ Keyword.take(opts, [:deadline])
 
     try do
@@ -3771,16 +3781,16 @@ defmodule SelectoDBPostgreSQL.Adapter do
                      {:ok, pinned} <- SessionGuard.pin(check, read_path(opts)),
                      {:ok, prepared} <-
                        ExplicitSQL.prepare(check, query, isolation: pinned.isolation) do
-                  {before, pinned, SQLRecorder.record(prepared)}
+                  {before, pinned, prepared}
                 else
                   error -> refuse.(error)
                 end
               else
-                {nil, nil, query}
+                {nil, nil, SQLRecorder.host(query)}
               end
 
             tx_conn
-            |> Postgrex.stream(query, params, max_rows: max_rows)
+            |> Postgrex.stream(SQLRecorder.driver(query), params, max_rows: max_rows)
             |> Enum.each(fn %Postgrex.Result{rows: rows, columns: columns} ->
               if guarded? do
                 case SessionGuard.compare(check, before, pinned: pinned) do
