@@ -36,6 +36,7 @@ defmodule SelectoDBPostgreSQL.PostImage do
   # outside the scope guarantee.
 
   alias Selecto.Write.{Command, Error}
+  alias SelectoDBPostgreSQL.SessionGuard
 
   @key_alias "selecto_post_image_key_"
 
@@ -166,7 +167,8 @@ defmodule SelectoDBPostgreSQL.PostImage do
         SELECT
           (SELECT pg_catalog.count(*) #{rows} AND (#{scope.text})) AS selecto_post_image_matched,
           (SELECT pg_catalog.count(*) #{rows}) AS selecto_post_image_rows,
-          #{blocked_sql(command)} AS selecto_post_image_blocked
+          #{blocked_sql(command)} AS selecto_post_image_blocked,
+          (#{SelectoDBPostgreSQL.SessionGuard.Deferrable.probe_sql()}) AS selecto_post_image_deferrable
         FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) $#{oid_param}::pg_catalog.oid
         """
 
@@ -175,19 +177,21 @@ defmodule SelectoDBPostgreSQL.PostImage do
             scope.params ++ [target.oid]
 
         case execute.(sql, params) do
-          {:ok, %{rows: [[matched, rows, blocked]]}} ->
-            cond do
-              blocked != 0 ->
-                refused(
-                  :query_rule_not_evaluable,
-                  "the relation cannot prove the written rows' scope"
-                )
+          {:ok, %{rows: [[matched, rows, blocked, deferrable]]}} ->
+            with {:ok, deferred} <- SessionGuard.deferrable_count(execute, deferrable) do
+              cond do
+                blocked != 0 or deferred != 0 ->
+                  refused(
+                    :query_rule_not_evaluable,
+                    "the relation cannot prove the written rows' scope"
+                  )
 
-              rows != affected or matched != affected ->
-                refused(:query_rule_violation, "the written rows left the trusted write scope")
+                rows != affected or matched != affected ->
+                  refused(:query_rule_violation, "the written rows left the trusted write scope")
 
-              true ->
-                :ok
+                true ->
+                  :ok
+              end
             end
 
           {:ok, _other} ->
@@ -228,11 +232,11 @@ defmodule SelectoDBPostgreSQL.PostImage do
       """,
       # A deferrable constraint trigger fires at commit, after this check,
       # and can sit on any table a row trigger writes to (an audit table)
-      # or on a leaf partition: any in the database refuses. This runs
-      # after the DML (a trigger committed while the write waited on a row
-      # lock is seen), which needs a fresh statement snapshot: outside READ
-      # COMMITTED the check is refused.
-      SelectoDBPostgreSQL.SessionGuard.Deferrable.count_sql(),
+      # or on a leaf partition: any in the database refuses, by the column
+      # beside this one and its count. This runs after the DML (a trigger
+      # committed while the write waited on a row lock is seen), which needs
+      # a fresh statement snapshot: outside READ COMMITTED the check is
+      # refused.
       "CASE WHEN pg_catalog.current_setting('transaction_isolation') OPERATOR(pg_catalog.=) 'read committed' THEN 0 ELSE 1 END",
       # Inheritance (non-partition) children: the parent's rows are not the
       # only ones the relation's name reads.
@@ -337,23 +341,24 @@ defmodule SelectoDBPostgreSQL.PostImage do
         OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.pg_rewrite r
          WHERE r.ev_class OPERATOR(pg_catalog.=) ANY (SELECT oid FROM tree)
            AND r.rulename OPERATOR(pg_catalog.<>) '_RETURN' AND r.ev_type OPERATOR(pg_catalog.=) ANY (ARRAY[#{rule_events(command.operation)}]::pg_catalog."char"[]))
+        AS selecto_delete_blocked,
       -- A deferrable trigger fires at commit, after this check, and can sit
       -- on any table a row trigger writes to: any in the database refuses,
-      -- as for inserts, updates and upserts (w3exrev17). Every term is an
-      -- int8 count (pg_catalog's int8 +).
-        OPERATOR(pg_catalog.+) (#{SelectoDBPostgreSQL.SessionGuard.Deferrable.count_sql()})
-        AS selecto_delete_blocked
+      -- as for inserts, updates and upserts (w3exrev17).
+      (#{SelectoDBPostgreSQL.SessionGuard.Deferrable.probe_sql()}) AS selecto_delete_deferrable
     """
 
     case execute.(sql, [oid]) do
-      {:ok, %{rows: [[1, 0]]}} ->
-        :ok
-
-      {:ok, %{rows: [[_relation, _blocked]]}} ->
-        refused(
-          :query_rule_not_evaluable,
-          "a bound-scope write cannot run under statement-level triggers, rules or deferrable triggers"
-        )
+      {:ok, %{rows: [[relation, blocked, deferrable]]}} ->
+        with {:ok, deferred} <- SessionGuard.deferrable_count(execute, deferrable) do
+          if relation == 1 and blocked == 0 and deferred == 0,
+            do: :ok,
+            else:
+              refused(
+                :query_rule_not_evaluable,
+                "a bound-scope write cannot run under statement-level triggers, rules or deferrable triggers"
+              )
+        end
 
       _ ->
         refused(:query_rule_not_evaluable, "cannot check the delete's relation")

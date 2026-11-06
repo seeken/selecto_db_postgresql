@@ -4,6 +4,15 @@ CHANGES
 Unreleased
 ----------
 
+- Every statement runs unnamed, whatever the configuration (R63): code a
+  statement reaches could DEALLOCATE and PREPARE a named one, and the driver
+  bound the replacement. The `statement_cache` setting is removed. Transaction
+  statements use the simple protocol. A read is 7 server statements instead of
+  14: the reset-path lookup is one statement, snapshot and pin one, compare and
+  unpin one, with one pg_settings scan per pin and no deferrable count in a
+  read (R61). A write tests for any deferrable trigger cheaply and runs the full
+  count only when it finds one. U& and dollar-quoted strings are untyped
+  literals; LIKE takes ANY/ALL.
 - A function outside pg_catalog is named only as the exact match for its
   arguments' known types or the sole candidate that can take them; an argument
   is never cast to a type it lacks, and anything else is `:function_ambiguous`

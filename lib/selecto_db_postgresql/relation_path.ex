@@ -35,45 +35,55 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   @path_key "selecto:reset_schemas"
 
-  # Under the reset path: its schemas, and the session's temp relations
-  # (R42 FINAL).
-  @schemas_sql "SELECT CAST(pg_catalog.current_schemas(false) AS pg_catalog.text[]) " <>
-                 "AS selecto_guard_reset_schemas, " <>
-                 "(SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c " <>
-                 "WHERE c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) " <>
-                 "AS selecto_guard_temp_relations"
-
   @temp_key "selecto:temp_relations"
 
-  @host_sql "SELECT CAST(pg_catalog.current_schemas(true) AS pg_catalog.text[]) " <>
-              "AS selecto_guard_host_schemas"
-
-  @reset_sql "SELECT pg_catalog.set_config('search_path', (SELECT s.reset_val " <>
-               "FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'search_path'), true) " <>
-               "AS selecto_guard_reset_path"
-
-  # Per name: the schema and relation the reset path (now in effect,
-  # current_schemas(false), the temp schema excluded) resolves it to, and
-  # the ones the host's path ($2) resolves it to.
-  @resolve_sql """
-  WITH selecto_reset AS (
+  # One statement, so the reset path it sets ends with it (its own implicit
+  # transaction, or the savepoint around it in a host transaction). In order,
+  # each CTE reading the one before so nothing runs early: the host's
+  # schemas; search_path set to its reset value, PostgreSQL resolving it
+  # (R36); the reset path's schemas and the session's temp relations (R42
+  # FINAL). Per name ($1): the schema and relation the reset path resolves it
+  # to (the temp schema excluded) and the ones the host's path resolves it
+  # to. No name still gives one row: the schemas are needed whatever the
+  # names.
+  @lookup_sql """
+  WITH selecto_before AS MATERIALIZED (
+    SELECT CAST(pg_catalog.current_schemas(true) AS pg_catalog.text[]) AS schemas
+  ),
+  selecto_path AS MATERIALIZED (
+    SELECT b.schemas,
+           pg_catalog.set_config('search_path', (SELECT s.reset_val FROM pg_catalog.pg_settings s
+             WHERE s.name OPERATOR(pg_catalog.=) 'search_path'), true) AS reset_path
+    FROM selecto_before b
+  ),
+  selecto_schemas AS MATERIALIZED (
+    SELECT p.schemas AS host, p.reset_path,
+           CAST(pg_catalog.current_schemas(false) AS pg_catalog.text[]) AS reset,
+           (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c
+            WHERE c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) AS temps
+    FROM selecto_path p
+  ),
+  selecto_reset AS (
     SELECT u.nsp, u.ord
-    FROM pg_catalog.unnest(pg_catalog.current_schemas(false)) WITH ORDINALITY AS u(nsp, ord)
+    FROM selecto_schemas s
+    CROSS JOIN LATERAL pg_catalog.unnest(s.reset) WITH ORDINALITY AS u(nsp, ord)
     JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) u.nsp
     WHERE n.oid OPERATOR(pg_catalog.<>) pg_catalog.pg_my_temp_schema()
   ),
   selecto_host AS (
     SELECT u.nsp, u.ord
-    FROM pg_catalog.unnest($2::pg_catalog.text[]) WITH ORDINALITY AS u(nsp, ord)
+    FROM selecto_schemas s
+    CROSS JOIN LATERAL pg_catalog.unnest(s.host) WITH ORDINALITY AS u(nsp, ord)
   ),
   selecto_match AS (
     SELECT r.name, n.nspname, c.relname,
            n.oid OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema() AS is_temp,
            (CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) r.name) AS exact
     FROM pg_catalog.unnest($1::pg_catalog.text[]) AS r(name)
+    CROSS JOIN LATERAL pg_catalog.unnest(ARRAY[r.name, pg_catalog.lower(r.name)]) AS v(name)
     JOIN pg_catalog.pg_class c
-      ON CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) r.name
-         OR CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) pg_catalog.lower(r.name)
+      ON c.relname OPERATOR(pg_catalog.=) CAST(v.name AS pg_catalog.name)
+         AND CAST(c.relname AS pg_catalog.text) OPERATOR(pg_catalog.=) v.name
     JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
     WHERE c.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r', 'p', 'v', 'm', 'f']::pg_catalog."char"[])
   )
@@ -93,8 +103,12 @@ defmodule SelectoDBPostgreSQL.RelationPath do
          COALESCE((SELECT m.is_temp FROM selecto_match m
           JOIN selecto_host h ON h.nsp OPERATOR(pg_catalog.=) m.nspname
           WHERE m.name OPERATOR(pg_catalog.=) r.name ORDER BY h.ord, m.exact DESC LIMIT 1), false)
-           AS selecto_guard_relation_host_temp
-  FROM pg_catalog.unnest($1::pg_catalog.text[]) AS r(name)
+           AS selecto_guard_relation_host_temp,
+         x.reset AS selecto_guard_reset_schemas,
+         x.temps AS selecto_guard_temp_relations,
+         x.reset_path AS selecto_guard_reset_path
+  FROM selecto_schemas x
+  LEFT JOIN pg_catalog.unnest($1::pg_catalog.text[]) AS r(name) ON true
   """
 
   @doc """
@@ -224,30 +238,34 @@ defmodule SelectoDBPostgreSQL.RelationPath do
     |> String.starts_with?(["pg_temp.", ~s("pg_temp".), "pg_temp_", ~s("pg_temp_)])
   end
 
-  defp lookup(execute, plain, in_transaction?) do
+  defp lookup(execute, plain, true) do
     name = "selecto_path_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
 
-    {open, close} =
-      if in_transaction?,
-        do:
-          {"SAVEPOINT " <> name, ["ROLLBACK TO SAVEPOINT " <> name, "RELEASE SAVEPOINT " <> name]},
-        else: {"BEGIN", ["ROLLBACK"]}
-
-    case execute.(open, []) do
+    case execute.("SAVEPOINT " <> name, []) do
       {:ok, _} ->
-        result =
-          with {:ok, %{rows: [[host]]}} when is_list(host) <- execute.(@host_sql, []),
-               {:ok, %{rows: [[_reset]]}} <- execute.(@reset_sql, []),
-               {:ok, %{rows: [[schemas, temps]]}} when is_list(schemas) <-
-                 execute.(@schemas_sql, []),
-               {:ok, %{rows: rows}} when is_list(rows) <- execute.(@resolve_sql, [plain, host]) do
-            {:ok, rows, Enum.reject(schemas, &String.starts_with?(&1, "pg_temp")), temps}
-          else
-            _ -> :error
-          end
+        result = lookup(execute, plain, false)
 
-        Enum.each(close, &execute.(&1, []))
+        Enum.each(
+          ["ROLLBACK TO SAVEPOINT " <> name, "RELEASE SAVEPOINT " <> name],
+          &execute.(&1, [])
+        )
+
         result
+
+      _ ->
+        :error
+    end
+  end
+
+  defp lookup(execute, plain, false) do
+    case execute.(@lookup_sql, [plain]) do
+      {:ok, %{rows: [[_, _, _, _, _, schemas, temps, _] | _] = rows}} when is_list(schemas) ->
+        rows =
+          for [name, schema, relation, host, temp | _] <- rows,
+              not is_nil(name),
+              do: [name, schema, relation, host, temp]
+
+        {:ok, rows, Enum.reject(schemas, &String.starts_with?(&1, "pg_temp")), temps}
 
       _ ->
         :error

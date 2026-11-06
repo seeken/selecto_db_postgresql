@@ -11,23 +11,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   ## Prepared statements
 
-  By default the adapter prepares each statement once per connection under a
-  name, so later executions take one round trip (Bind/Execute), as Ecto's
-  default `prepare: :named` does. The default keeps 256 names per
-  connection; set another count, or turn it off:
-
-      config :selecto_db_postgresql, statement_cache: 1024
-      config :selecto_db_postgresql, statement_cache: false   # or 0
-
-  Off, Postgrex prepares every statement unnamed, which costs two round trips
-  per statement (Parse/Describe, then Bind/Execute).
-
-  A name is a hash slot of the SQL, so each connection holds at most that
-  many prepared statements however many query shapes are built; two shapes
-  sharing a slot replace each other. Named statements need a server session
-  per connection, so set `statement_cache: false` behind a transaction-mode
-  pooler (PgBouncer before 1.21, or without `max_prepared_statements`). Ecto
-  repository connections keep the repository's own `:prepare` setting.
+  Every statement runs unnamed, always: `pg_prepared_statements` stays empty.
+  Code a statement reaches can DEALLOCATE and PREPARE a named statement, in a
+  READ ONLY transaction and past a ROLLBACK, and the driver would bind the
+  replacement without parsing it. This works behind a transaction-mode pooler
+  too. Ecto repository connections keep the repository's own `:prepare`
+  setting for the repository's queries; the adapter's run unnamed there too.
   """
 
   @behaviour Selecto.DB.Adapter
@@ -638,8 +627,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
     case guard.(open, []) do
       {:ok, _} ->
-        with {:ok, before} <- read_check(guard, query),
-             {:ok, pinned} <- read_step(SessionGuard.pin(guard, plan.path, read_only: read_only?)),
+        with {:ok, before, pinned} <-
+               read_step(
+                 SessionGuard.open_read(guard, normalize_query(query), plan.path,
+                   read_only: read_only?
+                 )
+               ),
              :ok <- read_step(RelationPath.qualified(query)),
              {:ok, query} <-
                read_step(
@@ -649,8 +642,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
                  )
                ),
              {:ok, result} <- read_result(execute.(plan.prefix <> query, params)),
-             :ok <- read_step(SessionGuard.unpin(guard, pinned, before)),
-             :ok <- read_compare(guard, before),
+             :ok <- read_step(SessionGuard.close(guard, before, pinned)),
              :ok <- run_all(guard, close) do
           {:ok, result}
         else
@@ -723,6 +715,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp read_step(:ok), do: :ok
   defp read_step({:ok, _} = ok), do: ok
+  defp read_step({:ok, _, _} = ok), do: ok
   defp read_step({:error, %Error{} = error}), do: {:error, read_refusal(error)}
 
   # The search_path a read pins (R30), from the relations prepare_read/2
@@ -843,20 +836,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp guard_statement_run(connection, sql, params),
     do: query_postgrex(connection, sql, params, [])
-
-  defp read_check(execute, query) do
-    case SessionGuard.check(execute, normalize_query(query)) do
-      {:ok, before} -> {:ok, before}
-      {:error, error} -> {:error, read_refusal(error)}
-    end
-  end
-
-  defp read_compare(execute, before) do
-    case SessionGuard.compare(execute, before) do
-      :ok -> :ok
-      {:error, error} -> {:error, read_refusal(error)}
-    end
-  end
 
   defp read_refusal(%Error{} = error),
     do: %Selecto.Error{type: error.type, message: error.message, details: error.details}
@@ -1922,7 +1901,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # either).
   defp write_session(check, text, opts) do
     with {:ok, current} <- SessionGuard.check(check, text),
-         :ok <- SessionGuard.deferrable_free(current, writes: true) do
+         :ok <- SessionGuard.deferrable_free(check, current, writes: true) do
       session_baseline(opts, current)
     end
   end
@@ -2126,7 +2105,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # follow it, so no catalog read or user code runs unobserved.
   defp ensure_baseline(connection, opts) do
     with {:ok, current} <- SessionGuard.snapshot(&guard_statement(connection, &1, &2)),
-         :ok <- SessionGuard.deferrable_free(current, writes: true),
+         :ok <-
+           SessionGuard.deferrable_free(
+             &guard_statement(connection, &1, &2),
+             current,
+             writes: true
+           ),
          {:ok, _baseline} <- session_baseline(opts, current) do
       :ok
     end
@@ -2140,11 +2124,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
         :ok
 
       baseline ->
-        with :ok <- SessionGuard.compare(check, baseline, write_compare(opts)) do
-          case pinned_value(opts) do
-            nil -> :ok
-            pinned -> SessionGuard.unpin(check, pinned, baseline)
-          end
+        case pinned_value(opts) do
+          nil -> SessionGuard.compare(check, baseline, write_compare(opts))
+          pinned -> SessionGuard.close(check, baseline, pinned, writes: true)
         end
     end
   end
@@ -2165,12 +2147,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp verify_read_committed(connection, %Command{metadata: metadata}, opts)
        when is_map(metadata) do
     if Enum.any?(@guard_metadata, &(Map.get(metadata, &1) not in [nil, []])) do
-      case execute_statement(
-             connection,
-             "SELECT pg_catalog.current_setting('transaction_isolation') AS selecto_isolation_level",
-             [],
-             Keyword.take(opts, [:timeout, :log])
-           ) do
+      case transaction_isolation(connection, opts) do
         {:ok, %{rows: [["read committed"]]}} ->
           :ok
 
@@ -2196,6 +2173,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp verify_read_committed(_connection, _command, _opts), do: :ok
+
+  # The pin read it, in this transaction.
+  defp transaction_isolation(connection, opts) do
+    case pinned_isolation(opts) do
+      nil ->
+        execute_statement(
+          connection,
+          "SELECT pg_catalog.current_setting('transaction_isolation') AS selecto_isolation_level",
+          [],
+          Keyword.take(opts, [:timeout, :log])
+        )
+
+      isolation ->
+        {:ok, %{rows: [[isolation]]}}
+    end
+  end
 
   defp verify_native_constraints(_connection, %Command{native_constraints: []}, _declared, _opts),
     do: :ok
@@ -2854,10 +2847,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
     :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
+  @transaction_statement ~r/\A(?:BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/
+
   defp query_postgrex(connection, query, params, opts) do
     statement = query |> normalize_query() |> SQLRecorder.driver()
 
-    case Postgrex.query(connection, statement, params, statement_cache_opts(statement, opts)) do
+    case Postgrex.query(connection, statement, params, unnamed(statement, params, opts)) do
       {:ok, result} -> {:ok, normalize_result(result)}
       {:error, reason} -> {:error, reason}
     end
@@ -2867,50 +2862,20 @@ defmodule SelectoDBPostgreSQL.Adapter do
     :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
-  @default_statement_cache_slots 256
-
   @doc false
-  # Postgrex options for one statement under the `:statement_cache` setting.
-  #
-  # On (the default, 256 slots), the statement is prepared once per
-  # connection under a name and later executions send only Bind/Execute, one
-  # round trip, as Ecto's default `prepare: :named` does. Off (`false` or
-  # `0`), Postgrex prepares every statement unnamed, which costs two round
-  # trips: Parse/Describe, then Bind/Execute.
-  # The name is a hash slot of the SQL, so each connection holds at most
-  # `slots` prepared statements however many query shapes the application
-  # builds; two shapes sharing a slot replace each other (Postgrex compares
-  # the statement text). A statement with a `:comment`, its own
-  # `:cache_statement`, or `prepared: false` (introspection) stays unnamed.
-  #
-  #     config :selecto_db_postgresql, statement_cache: 1024
-  #     config :selecto_db_postgresql, statement_cache: false   # or 0
-  #
-  # Named statements need a session per connection: a transaction-mode
-  # connection pooler (PgBouncer before 1.21, or without
-  # max_prepared_statements) cannot use them, so turn it off there.
-  def statement_cache_opts(statement, opts) do
-    case statement_cache_slots() do
-      0 ->
-        opts
+  # R63: no statement of this adapter is ever named. PREPARE and DEALLOCATE
+  # work from any function a statement reaches, in a READ ONLY transaction,
+  # and survive ROLLBACK, and Postgrex binds a name without parsing it again,
+  # so a named guard, or a named business statement, can be swapped for
+  # another under the same name. An unnamed statement is parsed from the text
+  # sent with it. A transaction statement takes no parameters and returns no
+  # rows: the simple protocol sends it in one round trip.
+  def unnamed(statement, params, opts) do
+    opts = Keyword.delete(opts, :cache_statement)
 
-      slots ->
-        if Keyword.has_key?(opts, :comment) or Keyword.has_key?(opts, :cache_statement) or
-             Keyword.get(opts, :prepared) == false do
-          opts
-        else
-          name = "selecto_" <> Integer.to_string(:erlang.phash2(statement, slots))
-          Keyword.put(opts, :cache_statement, name)
-        end
-    end
-  end
-
-  defp statement_cache_slots do
-    case Application.get_env(:selecto_db_postgresql, :statement_cache, true) do
-      true -> @default_statement_cache_slots
-      slots when is_integer(slots) and slots > 0 -> slots
-      _off -> 0
-    end
+    if params == [] and Regex.match?(@transaction_statement, IO.iodata_to_binary(statement)),
+      do: Keyword.put(opts, :query_type, :text),
+      else: opts
   end
 
   defp introspection_query(connection, query, params) do
@@ -3498,7 +3463,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       if cache_key do
         execute_with_prepared_cache(pool_pid, query, params, cache_key, query_opts)
       else
-        Postgrex.query(pool_pid, query, params, statement_cache_opts(query, query_opts))
+        Postgrex.query(pool_pid, query, params, unnamed(query, params, query_opts))
       end
     rescue
       e ->
@@ -3515,7 +3480,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_with_prepared_cache(pool_pid, query, params, cache_key, query_opts) do
     case Selecto.ConnectionPool.prepared_statement_cached?(pool_pid, cache_key) do
       false ->
-        result = Postgrex.query(pool_pid, query, params, statement_cache_opts(query, query_opts))
+        result = Postgrex.query(pool_pid, query, params, unnamed(query, params, query_opts))
 
         if match?({:ok, _}, result) do
           Selecto.ConnectionPool.mark_prepared_statement(pool_pid, cache_key)
@@ -3524,7 +3489,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         result
 
       true ->
-        Postgrex.query(pool_pid, query, params, statement_cache_opts(query, query_opts))
+        Postgrex.query(pool_pid, query, params, unnamed(query, params, query_opts))
     end
   end
 

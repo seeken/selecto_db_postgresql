@@ -531,6 +531,12 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
                })
     end
 
+    test "LIKE takes a quantifier without parentheses of its own" do
+      out = qualify!("SELECT 1 FROM s.t WHERE name LIKE ANY (ARRAY['x%'])")
+      assert out =~ "OPERATOR(pg_catalog.~~) ANY"
+      refute out =~ "(ANY"
+    end
+
     test "a column named set is not the SET of an UPDATE" do
       out = qualify!("SELECT k.update, k.set = 'other' AS r FROM s.t AS k")
       assert out =~ "OPERATOR(pg_catalog.=)"

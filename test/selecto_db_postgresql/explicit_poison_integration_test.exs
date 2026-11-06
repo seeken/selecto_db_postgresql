@@ -683,6 +683,37 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     end
   end
 
+  test "U& and dollar-quoted strings compare as untyped literals, as natively", %{opts: opts} do
+    {:ok, c} = Adapter.connect(opts)
+
+    for literal <- [
+          "'mixed'",
+          "E'mixed'",
+          "U&'mixed'",
+          "U&'m!0069xed' UESCAPE '!'",
+          "$$mixed$$",
+          "$q$mixed$q$"
+        ] do
+      sql = "SELECT id FROM items WHERE ci = #{literal} ORDER BY id"
+      assert {:ok, %{rows: [[1], [3], [5]]}} = Adapter.execute(c, sql, [], selecto_read: true)
+    end
+
+    assert {:ok, %{rows: [[2]]}} =
+             Adapter.execute(c, "SELECT id FROM items WHERE ci NOT IN (U&'MIXED')", [],
+               selecto_read: true
+             )
+
+    assert {:ok, %{rows: [[1]]}} =
+             Adapter.execute(
+               c,
+               "SELECT id FROM items WHERE name LIKE ANY (ARRAY['al%']) ORDER BY id",
+               [],
+               selecto_read: true
+             )
+
+    GenServer.stop(c)
+  end
+
   test "a plant under a keyword or U& name never answers (R58, R60)", %{opts: opts} do
     {:ok, admin} = Adapter.connect(opts)
     forged = "RETURNS text LANGUAGE sql AS $$ SELECT 'FORGED'::text $$"

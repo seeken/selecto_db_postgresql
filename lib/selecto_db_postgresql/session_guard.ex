@@ -59,6 +59,15 @@ defmodule SelectoDBPostgreSQL.SessionGuard.Deferrable do
         "WHERE co.collnamespace OPERATOR(pg_catalog.<>) #{@catalog}) " <>
         "AND " <> base_types("i.indrelid", "CAST(i.indkey AS pg_catalog.int2[])") <> ")"
 
+  @doc """
+  The deferrable triggers of any kind: a cheap test that needs the count below
+  only when it finds one. Every trigger the count sees is one of these.
+  """
+  def probe_sql,
+    do:
+      "SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t " <>
+        "WHERE t.tgdeferrable AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'"
+
   @doc "The count statement (no parameters); every name pg_catalog-qualified."
   def count_sql,
     do:
@@ -148,28 +157,41 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
                       jsonb json jsonpath regconfig regclass oid tid numeric int2 int4 int8
                       float4 float8 bool interval bytea inet cidr name)
 
+  # pg_settings is a scan of every setting: once per pin, not once per setting.
+  @reset_values "selecto_reset_values AS MATERIALIZED (SELECT s.name, s.reset_val " <>
+                  "FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) ANY (ARRAY[" <>
+                  Enum.map_join(@pinned, ", ", &"'#{&1}'") <>
+                  "]::pg_catalog.text[]))"
+
   @temp "pg_catalog.pg_my_temp_schema()"
 
   # The settings are compared one by one (R30, R35: Selecto pins them
   # around its statements), the temp catalog in one string.
-  @snapshot_columns "pg_catalog.concat_ws(' | ', 'temp'" <>
-                      ", (SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', CAST(c.oid AS pg_catalog.text), " <>
-                      "CAST(c.xmin AS pg_catalog.text), CAST(c.relname AS pg_catalog.text)), ',' ORDER BY c.oid) " <>
-                      "FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) #{@temp}), " <>
-                      "(SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', CAST(r.oid AS pg_catalog.text), " <>
-                      "CAST(r.xmin AS pg_catalog.text)), ',' ORDER BY r.oid) FROM pg_catalog.pg_rewrite r " <>
-                      "JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) r.ev_class " <>
-                      "WHERE c.relnamespace OPERATOR(pg_catalog.=) #{@temp}), " <>
-                      "(SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', CAST(t.oid AS pg_catalog.text), " <>
-                      "CAST(t.xmin AS pg_catalog.text), CAST(t.typname AS pg_catalog.text)), ',' ORDER BY t.oid) " <>
-                      "FROM pg_catalog.pg_type t WHERE t.typnamespace OPERATOR(pg_catalog.=) #{@temp}), 'end') " <>
-                      "AS selecto_guard_session, " <>
-                      "(" <>
-                      SelectoDBPostgreSQL.SessionGuard.Deferrable.count_sql() <>
-                      ") AS selecto_guard_deferrable, " <>
-                      Enum.map_join(Enum.with_index(@settings), ", ", fn {name, index} ->
-                        "pg_catalog.current_setting('#{name}') AS selecto_guard_setting_#{index}"
-                      end)
+  @temp_columns "pg_catalog.concat_ws(' | ', 'temp'" <>
+                  ", (SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', CAST(c.oid AS pg_catalog.text), " <>
+                  "CAST(c.xmin AS pg_catalog.text), CAST(c.relname AS pg_catalog.text)), ',' ORDER BY c.oid) " <>
+                  "FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) #{@temp}), " <>
+                  "(SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', CAST(r.oid AS pg_catalog.text), " <>
+                  "CAST(r.xmin AS pg_catalog.text)), ',' ORDER BY r.oid) FROM pg_catalog.pg_rewrite r " <>
+                  "JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) r.ev_class " <>
+                  "WHERE c.relnamespace OPERATOR(pg_catalog.=) #{@temp}), " <>
+                  "(SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', CAST(t.oid AS pg_catalog.text), " <>
+                  "CAST(t.xmin AS pg_catalog.text), CAST(t.typname AS pg_catalog.text)), ',' ORDER BY t.oid) " <>
+                  "FROM pg_catalog.pg_type t WHERE t.typnamespace OPERATOR(pg_catalog.=) #{@temp}), 'end') " <>
+                  "AS selecto_guard_session"
+
+  @setting_columns Enum.map_join(Enum.with_index(@settings), ", ", fn {name, index} ->
+                     "pg_catalog.current_setting('#{name}') AS selecto_guard_setting_#{index}"
+                   end)
+
+  # A read leaves the deferrable triggers out (R61): only writes refuse on
+  # them, and another session's trigger is no change of this one.
+  @read_columns @temp_columns <> ", " <> @setting_columns
+
+  @snapshot_columns @temp_columns <>
+                      ", (" <>
+                      SelectoDBPostgreSQL.SessionGuard.Deferrable.probe_sql() <>
+                      ") AS selecto_guard_deferrable, " <> @setting_columns
 
   @snapshot_sql "SELECT " <> @snapshot_columns
 
@@ -179,14 +201,16 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   # kept for the call shape only. A temp TYPE named like an identifier or a
   # generated cast type is still refused (defence in depth: the pinned path
   # searches pg_temp last).
-  @shadow_sql "SELECT CAST(CASE WHEN $1::pg_catalog.text[] IS NULL THEN 0 ELSE 0 END AS pg_catalog.int8) " <>
-                "OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.pg_type t " <>
-                "WHERE t.typnamespace OPERATOR(pg_catalog.=) #{@temp} " <>
-                "AND t.typrelid OPERATOR(pg_catalog.=) 0 " <>
-                "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type e WHERE e.oid OPERATOR(pg_catalog.=) t.typelem " <>
-                "AND e.typrelid OPERATOR(pg_catalog.<>) 0) " <>
-                "AND CAST(t.typname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY ($2::pg_catalog.text[])) " <>
-                "AS selecto_guard_shadowed, " <> @snapshot_columns
+  @shadow_count "CAST(CASE WHEN $1::pg_catalog.text[] IS NULL THEN 0 ELSE 0 END AS pg_catalog.int8) " <>
+                  "OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.pg_type t " <>
+                  "WHERE t.typnamespace OPERATOR(pg_catalog.=) #{@temp} " <>
+                  "AND t.typrelid OPERATOR(pg_catalog.=) 0 " <>
+                  "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type e WHERE e.oid OPERATOR(pg_catalog.=) t.typelem " <>
+                  "AND e.typrelid OPERATOR(pg_catalog.<>) 0) " <>
+                  "AND CAST(t.typname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY ($2::pg_catalog.text[])) " <>
+                  "AS selecto_guard_shadowed"
+
+  @shadow_sql "SELECT " <> @shadow_count <> ", " <> @snapshot_columns
 
   @doc "The snapshot statement (no parameters)."
   def snapshot_sql, do: @snapshot_sql
@@ -203,11 +227,7 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
          %{snapshot: snapshot, deferrable: deferrable, settings: Enum.zip(@settings, settings)}}
 
       {:ok, %{rows: [[shadowed | _]]}} when is_integer(shadowed) and shadowed > 0 ->
-        refused(
-          :query_rule_not_evaluable,
-          :temporary_shadow,
-          "a temporary relation or type of the session shadows a name the statement uses"
-        )
+        shadowed()
 
       {:ok, _other} ->
         unavailable()
@@ -237,7 +257,7 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
     case snapshot(execute) do
       {:ok, %{snapshot: ^before} = current} ->
         if settings_expected?(current, baseline, opts),
-          do: deferrable_free(current, opts),
+          do: deferrable_free(execute, current, opts),
           else: changed()
 
       {:ok, _changed} ->
@@ -277,8 +297,93 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   `:isolation`, the transaction's level (R49a).
   """
   def pin(execute, path, opts \\ []) do
-    names = ["search_path" | @pinned]
+    sql = "WITH " <> @reset_values <> " SELECT " <> pin_columns("$1", opts)
 
+    # An unreadable reset value (NULL, or an error) fails closed.
+    case execute.(sql, [path]) do
+      {:ok, %{rows: [values]}} -> pinned(values)
+      _other -> unavailable()
+    end
+  end
+
+  @doc """
+  A read's opening: the check/3 of `sql`, then pin/3 to `path`, in one
+  statement whose snapshot is taken before any pin (a materialised CTE the
+  pin reads). Returns `{:ok, before, pinned}`. Refuses as check/3 does; the
+  caller's rollback undoes the pin.
+  """
+  def open_read(execute, sql, path, opts \\ []) do
+    statement =
+      "WITH selecto_before AS MATERIALIZED (SELECT " <>
+        @shadow_count <>
+        ", " <>
+        @read_columns <>
+        "), " <>
+        @reset_values <>
+        " SELECT b.*, " <> pin_columns("$3", opts) <> " FROM selecto_before b"
+
+    params = [Enum.uniq(relation_tokens(sql)), tokens(sql), path]
+    width = length(@settings) + 2
+
+    case execute.(statement, params) do
+      {:ok, %{rows: [row]}} when length(row) > width ->
+        {[shadowed, snapshot | settings], values} = Enum.split(row, width)
+
+        cond do
+          not is_integer(shadowed) or not is_binary(snapshot) ->
+            unavailable()
+
+          shadowed > 0 ->
+            shadowed()
+
+          true ->
+            with {:ok, pinned} <- pinned(values) do
+              {:ok, %{snapshot: snapshot, deferrable: 0, settings: Enum.zip(@settings, settings)},
+               pinned}
+            end
+        end
+
+      _other ->
+        unavailable()
+    end
+  end
+
+  @doc """
+  The close of a read or (`writes: true`) a write: compare/3 and unpin/3 in
+  one statement, the snapshot taken while the pins should still hold and
+  before unpin's restore. Refuses as they do.
+  """
+  def close(execute, %{snapshot: before} = baseline, pinned, opts \\ []) do
+    {unpin_sql, params} = unpin_statement(pinned, baseline)
+    writes? = Keyword.get(opts, :writes) == true
+    columns = if writes?, do: @snapshot_columns, else: @read_columns
+
+    statement =
+      "WITH selecto_after AS MATERIALIZED (SELECT " <>
+        columns <>
+        ") SELECT a.*, " <> unpin_sql <> " FROM selecto_after a"
+
+    case execute.(statement, params) do
+      {:ok, %{rows: [[^before | row]]}} ->
+        {deferrable, row} = if writes?, do: {hd(row), tl(row)}, else: {0, row}
+        {settings, [restored]} = Enum.split(row, length(@settings))
+        current = %{deferrable: deferrable, settings: Enum.zip(@settings, settings)}
+
+        cond do
+          not settings_expected?(current, baseline, pinned: pinned) -> changed()
+          not is_binary(restored) -> changed()
+          true -> deferrable_free(execute, current, opts)
+        end
+
+      {:ok, %{rows: [[snapshot | _]]}} when is_binary(snapshot) ->
+        changed()
+
+      _other ->
+        unavailable()
+    end
+  end
+
+  defp pin_columns(path, opts) do
     read_only =
       if Keyword.get(opts, :read_only) == true,
         do:
@@ -286,32 +391,31 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
             "AS selecto_guard_pin_read_only",
         else: ""
 
-    reset = fn name ->
-      "(SELECT s.reset_val FROM pg_catalog.pg_settings s " <>
-        "WHERE s.name OPERATOR(pg_catalog.=) '#{name}')"
-    end
+    "pg_catalog.set_config('search_path', #{path}::pg_catalog.text, true) " <>
+      "AS selecto_guard_pin_0, " <>
+      Enum.map_join(Enum.with_index(@pinned, 1), ", ", fn {name, index} ->
+        reset =
+          "(SELECT r.reset_val FROM selecto_reset_values r " <>
+            "WHERE r.name OPERATOR(pg_catalog.=) '#{name}')"
 
-    sql =
-      "SELECT pg_catalog.set_config('search_path', $1::pg_catalog.text, true) " <>
-        "AS selecto_guard_pin_0, " <>
-        Enum.map_join(Enum.with_index(@pinned, 1), ", ", fn {name, index} ->
-          "pg_catalog.set_config('#{name}', #{reset.(name)}, true) AS selecto_guard_pin_#{index}"
-        end) <>
-        ", pg_catalog.current_setting('transaction_isolation') AS selecto_guard_pin_isolation" <>
-        read_only
+        "pg_catalog.set_config('#{name}', #{reset}, true) AS selecto_guard_pin_#{index}"
+      end) <>
+      ", pg_catalog.current_setting('transaction_isolation') AS selecto_guard_pin_isolation" <>
+      read_only
+  end
 
-    # An unreadable reset value (NULL, or an error) fails closed.
-    case execute.(sql, [path]) do
-      {:ok, %{rows: [values]}} when length(values) > length(names) ->
-        {values, [isolation | _read_only]} = Enum.split(values, length(names))
+  defp pinned(values) do
+    names = ["search_path" | @pinned]
 
-        if Enum.all?(values, &is_binary/1),
-          do:
-            {:ok, values |> then(&Map.new(Enum.zip(names, &1))) |> Map.put(:isolation, isolation)},
-          else: unavailable()
+    if length(values) > length(names) do
+      {values, [isolation | _read_only]} = Enum.split(values, length(names))
 
-      _other ->
-        unavailable()
+      if Enum.all?(values, &is_binary/1),
+        do:
+          {:ok, values |> then(&Map.new(Enum.zip(names, &1))) |> Map.put(:isolation, isolation)},
+        else: unavailable()
+    else
+      unavailable()
     end
   end
 
@@ -320,7 +424,17 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   set_config(..., true), in the same expression that checks every pin is
   still in place, so a statement that switched one in between refuses.
   """
-  def unpin(execute, pinned, %{settings: settings}) do
+  def unpin(execute, pinned, baseline) do
+    {sql, params} = unpin_statement(pinned, baseline)
+
+    case execute.("SELECT " <> sql, params) do
+      {:ok, %{rows: [[value]]}} when is_binary(value) -> :ok
+      {:ok, %{rows: [[nil]]}} -> changed()
+      _other -> unavailable()
+    end
+  end
+
+  defp unpin_statement(pinned, %{settings: settings}) do
     pinned = Map.delete(pinned, :isolation)
     names = Map.keys(pinned) |> Enum.sort()
     count = length(names)
@@ -343,15 +457,8 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
       Enum.map(names, &Map.fetch!(pinned, &1)) ++
         Enum.map(names, &:proplists.get_value(&1, settings, nil))
 
-    case execute.(
-           "SELECT CASE WHEN #{held} THEN pg_catalog.concat_ws(',', #{restore}) END " <>
-             "AS selecto_guard_unpin",
-           params
-         ) do
-      {:ok, %{rows: [[value]]}} when is_binary(value) -> :ok
-      {:ok, %{rows: [[nil]]}} -> changed()
-      _other -> unavailable()
-    end
+    {"CASE WHEN #{held} THEN pg_catalog.concat_ws(',', #{restore}) END AS selecto_guard_unpin",
+     params}
   end
 
   @doc """
@@ -361,21 +468,58 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   check before their DML and in the first post-DML statement
   (`writes: true`).
   """
-  def deferrable_free(state, opts \\ [])
+  def deferrable_free(execute, state, opts \\ [])
 
-  def deferrable_free(%{deferrable: count}, opts) when is_integer(count) and count > 0 do
+  def deferrable_free(execute, %{deferrable: count}, opts) when is_integer(count) and count > 0 do
     if Keyword.get(opts, :writes) do
-      refused(
-        :query_rule_not_evaluable,
-        :deferred_triggers,
-        "writes are refused while a deferrable trigger exists: it fires at COMMIT, after every check"
-      )
+      case deferrable_count(execute, count) do
+        {:ok, 0} ->
+          :ok
+
+        {:ok, _found} ->
+          refused(
+            :query_rule_not_evaluable,
+            :deferred_triggers,
+            "writes are refused while a deferrable trigger exists: it fires at COMMIT, after every check"
+          )
+
+        {:error, _} = error ->
+          error
+      end
     else
       :ok
     end
   end
 
-  def deferrable_free(_state, _opts), do: :ok
+  def deferrable_free(_execute, _state, _opts), do: :ok
+
+  defp shadowed,
+    do:
+      refused(
+        :query_rule_not_evaluable,
+        :temporary_shadow,
+        "a temporary relation or type of the session shadows a name the statement uses"
+      )
+
+  @doc """
+  The deferrable triggers that can run user code, given the probe's count:
+  the full statement runs only when the probe found one.
+  """
+  def deferrable_count(_execute, 0), do: {:ok, 0}
+
+  def deferrable_count(execute, probe) when is_integer(probe) do
+    sql =
+      "SELECT (" <>
+        SelectoDBPostgreSQL.SessionGuard.Deferrable.count_sql() <>
+        ") AS selecto_guard_deferrable"
+
+    case execute.(sql, []) do
+      {:ok, %{rows: [[count]]}} when is_integer(count) -> {:ok, count}
+      _other -> unavailable()
+    end
+  end
+
+  def deferrable_count(_execute, _probe), do: unavailable()
 
   @doc "The refusal for a changed session."
   def changed,
