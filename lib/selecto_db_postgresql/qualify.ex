@@ -840,6 +840,9 @@ defmodule SelectoDBPostgreSQL.Qualify do
                 :subquery
               ])
 
+            string_range?(st, open + 1, st.pos - 2) ->
+              %{known: true, type: "pg_catalog.text"}
+
             true ->
               %{}
           end
@@ -1231,22 +1234,80 @@ defmodule SelectoDBPostgreSQL.Qualify do
       "(CASE WHEN (#{left_cast(left, cast)}) #{op} (#{right_cast(right, cast)}) " <>
         "THEN NULL ELSE (#{left}) END)"
 
-    postfix(st, %{sql: sql}, mark)
+    postfix(st, Map.merge(string_result(operand_class(st, a)), %{sql: sql}), mark)
   end
 
   defp case_atom(st, mark) do
     st = advance(st)
 
+    first = st.pos
+
     if upper(tok(st, st.pos)) == "WHEN" do
       {inner, st} = searched_case(st, [])
-      postfix(st, %{sql: "CASE #{inner} END"}, mark)
+      postfix(st, Map.merge(case_result(st, first), %{sql: "CASE #{inner} END"}), mark)
     else
-      simple_case(st, mark)
+      simple_case(st, first, mark)
     end
   end
 
+  # R51 amendment 3: a CASE takes its type from its result branches, and all
+  # of them provably pg_catalog strings make it text.
+  defp case_result(st, first) do
+    ranges = case_branches(st, first, st.pos - 2, 0, nil, [])
+
+    if ranges != [] and Enum.all?(ranges, fn {from, to} -> string_range?(st, from, to) end),
+      do: %{known: true, type: "pg_catalog.text"},
+      else: %{}
+  end
+
+  # {first, last} token positions of each THEN and ELSE result.
+  defp case_branches(st, at, stop, depth, open, ranges) do
+    token = tok(st, at)
+    up = upper(token)
+    close = fn -> if open, do: [{open, at - 1} | ranges], else: ranges end
+
+    cond do
+      at > stop -> close.()
+      token == {:punct, "("} -> case_branches(st, at + 1, stop, depth + 1, open, ranges)
+      token == {:punct, ")"} -> case_branches(st, at + 1, stop, depth - 1, open, ranges)
+      up == "CASE" -> case_branches(st, at + 1, stop, depth + 1, open, ranges)
+      up == "END" and depth > 0 -> case_branches(st, at + 1, stop, depth - 1, open, ranges)
+      depth > 0 -> case_branches(st, at + 1, stop, depth, open, ranges)
+      up == "WHEN" -> case_branches(st, at + 1, stop, depth, nil, close.())
+      up in ["THEN", "ELSE"] -> case_branches(st, at + 1, stop, depth, at + 1, close.())
+      true -> case_branches(st, at + 1, stop, depth, open, ranges)
+    end
+  end
+
+  # Tokens first..last are one expression of pg_catalog strings.
+  defp string_range?(_st, first, last) when first > last, do: false
+
+  defp string_range?(st, first, last) do
+    if st.computing > 8 do
+      false
+    else
+      try do
+        inner = %{st | pos: first, limit: last + 1, refs: [], computing: st.computing + 1}
+        {tree, after_run} = read_run(inner)
+        after_run.pos == last + 1 and catalog_string?(operand_class(after_run, tree))
+      catch
+        {:qualify_refuse, _reason, _message} -> false
+      end
+    end
+  end
+
+  defp string_result(%{type: type} = class) do
+    if catalog_string?(class), do: %{known: true, type: type}, else: %{}
+  end
+
+  defp string_result(_class), do: %{}
+
+  defp catalog_string?(%{untyped: true}), do: true
+  defp catalog_string?(%{type: type}) when is_binary(type), do: plain_type(type) in @string_types
+  defp catalog_string?(_class), do: false
+
   # A simple CASE x WHEN v ...: searched, with explicit operators.
-  defp simple_case(st, mark) do
+  defp simple_case(st, first, mark) do
     {subject, st} = read_run(st, "WHEN")
     {left, st} = render(st, subject)
     {parts, st} = simple_branches(st, subject, left, [])
@@ -1260,7 +1321,8 @@ defmodule SelectoDBPostgreSQL.Qualify do
       end
 
     st = expect_word(st, "END")
-    postfix(st, %{sql: "CASE #{parts |> Enum.reverse() |> Enum.join(" ")} END"}, mark)
+    sql = "CASE #{parts |> Enum.reverse() |> Enum.join(" ")} END"
+    postfix(st, Map.merge(case_result(st, first), %{sql: sql}), mark)
   end
 
   defp simple_branches(st, subject, left, parts) do
@@ -1534,7 +1596,8 @@ defmodule SelectoDBPostgreSQL.Qualify do
     if catalog != [] and
          (reach(other, count) == [] or
             (reach(catalog, count) != [] and not extension_argument?(st, args))) do
-      {catalog_call(name, args, info, reach(catalog, count)), st}
+      {catalog_call(name, args, info, reach(catalog, count)) |> string_call(st, args, catalog),
+       st}
     else
       {candidate_call(st, name, key, candidates, args, info), st}
     end
@@ -1547,6 +1610,32 @@ defmodule SelectoDBPostgreSQL.Qualify do
       type: catalog_result(candidates)
     }
   end
+
+  # Strings into a function with overloads for strings: those overloads'
+  # result, where the overloads together do not say (lower: text or a range).
+  defp string_call(%{type: nil} = call, st, args, candidates) do
+    strings? =
+      args != [] and
+        Enum.all?(args, fn arg ->
+          case argument_fact(st, arg) do
+            {:type, type} -> plain_type(type) in @string_types
+            :untyped -> true
+            _open -> false
+          end
+        end)
+
+    overloads =
+      candidates
+      |> reach(length(args))
+      |> Enum.filter(fn c -> Enum.all?(c.args, &(plain_type(&1) in @string_types)) end)
+
+    case strings? and catalog_result(overloads) do
+      type when is_binary(type) -> %{call | known: true, type: type}
+      _unknown -> call
+    end
+  end
+
+  defp string_call(call, _st, _args, _candidates), do: call
 
   defp extension_argument?(st, args) do
     Enum.any?(args, fn %{lone: atom} ->
@@ -2148,12 +2237,13 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
     member = member_operator(name, l, r)
 
-    if member == nil and (l[:entry] != nil or r[:entry] != nil) and not string_fallback?(l, r),
-      do:
-        refuse(
-          :operator_not_member,
-          "an operator is no member of its operand's extension for these operands"
-        )
+    if member == nil and (l[:entry] != nil or r[:entry] != nil) and
+         not string_fallback?(l, r) and not string_pair?(name, l, r),
+       do:
+         refuse(
+           :operator_not_member,
+           "an operator is no member of its operand's extension for these operands"
+         )
 
     # A comparison's operands do not type an expression around it (a CASE
     # WHEN tier = 'gold' THEN 'G' ...): their references are consumed.
@@ -2170,6 +2260,13 @@ defmodule SelectoDBPostgreSQL.Qualify do
   # compares as text, as PostgreSQL resolves it). Anything else an implicit
   # cast could make resolve and compare the wrong thing: box3d = compares
   # areas, geometry = text compares text.
+  # R51 amendment 3: citext has neither operator, and PostgreSQL resolves
+  # both to text's.
+  defp string_pair?(name, %{entry: %{category: "S"}}, %{entry: %{category: "S"}}),
+    do: name in ["||", "^@"]
+
+  defp string_pair?(_name, _left, _right), do: false
+
   defp string_operand?(%{entry: %{category: "S"}}), do: true
   defp string_operand?(%{untyped: true}), do: true
   defp string_operand?(%{type: type}) when is_binary(type), do: plain_type(type) in @string_types
@@ -2368,6 +2465,11 @@ defmodule SelectoDBPostgreSQL.Qualify do
     end
   end
 
+  defp string_item?(st, item) do
+    {_alias, body} = item_body(st, item)
+    string_range?(st, hd(item), hd(item) + length(body) - 1)
+  end
+
   # ARRAY[...] of string literals, or anything cast to a pg_catalog string
   # array: text[], as PostgreSQL types it (R51 amendment 3).
   defp string_array?(sql) do
@@ -2409,8 +2511,15 @@ defmodule SelectoDBPostgreSQL.Qualify do
     with scope when is_integer(scope) <- Map.get(st.scopes.opens, open),
          [item] when item != [] <- Map.fetch!(st.scopes.scopes, scope).items do
       case item_entry(st, scope, item) do
-        %{unknown: true} -> %{unknown: true}
-        %{} = entry -> if extension?(entry), do: %{entry: entry}, else: %{}
+        %{unknown: true} ->
+          %{unknown: true}
+
+        %{} = entry ->
+          cond do
+            extension?(entry) -> %{entry: entry}
+            string_item?(st, item) -> %{type: "pg_catalog.text"}
+            true -> %{}
+          end
       end
     else
       _ -> %{unknown: true}

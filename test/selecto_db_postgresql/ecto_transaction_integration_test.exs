@@ -125,6 +125,56 @@ defmodule SelectoDBPostgreSQL.EctoTransactionIntegrationTest do
     assert note(table) == "n"
   end
 
+  test "concurrent writes in shared mode serialise on the one connection", %{table: table} do
+    Sandbox.checkout(SandboxRepo)
+    Sandbox.mode(SandboxRepo, {:shared, self()})
+    on_exit(fn -> Sandbox.mode(SandboxRepo, :manual) end)
+
+    SQL.query!(
+      SandboxRepo,
+      "INSERT INTO public.#{table} SELECT g, 't1', 'n' FROM generate_series(2, 31) g"
+    )
+
+    results =
+      2..31
+      |> Task.async_stream(&write(SandboxRepo, table, &1), max_concurrency: 30, timeout: 60_000)
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.all?(results, &match?({:ok, %{affected_rows: 1}}, &1)), inspect(results)
+
+    assert %{rows: [[30]]} =
+             SQL.query!(SandboxRepo, "SELECT count(*) FROM public.#{table} WHERE note = 'new'")
+
+    Sandbox.checkin(SandboxRepo)
+    assert count(table, 2) == 0
+  end
+
+  test "concurrent writes by allowed processes serialise too", %{table: table} do
+    Sandbox.checkout(SandboxRepo)
+    owner = self()
+
+    SQL.query!(
+      SandboxRepo,
+      "INSERT INTO public.#{table} SELECT g, 't1', 'n' FROM generate_series(2, 31) g"
+    )
+
+    results =
+      2..31
+      |> Task.async_stream(
+        fn id ->
+          Sandbox.allow(SandboxRepo, owner, self())
+          write(SandboxRepo, table, id)
+        end,
+        max_concurrency: 30,
+        timeout: 60_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.all?(results, &match?({:ok, %{affected_rows: 1}}, &1)), inspect(results)
+    assert %{rows: [[31]]} = SQL.query!(SandboxRepo, "SELECT count(*) FROM public.#{table}")
+    Sandbox.checkin(SandboxRepo)
+  end
+
   test "a read after a raw BEGIN joins the host's transaction", %{table: table} do
     {result, status} =
       PlainRepo.checkout(fn ->
