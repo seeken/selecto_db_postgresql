@@ -268,10 +268,12 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   WHERE c.castcontext #{@op} 'i'
   """
 
-  # M6: the qualifier's cost grows faster than a statement, and the read's
-  # timeout does not bound CPU: a hard limit, refused typed.
+  # M6: a hard limit on hand-built text, refused typed. A generated statement
+  # has its filters bounded where they compile, and what renders is bounded
+  # relative to what came in: rewrites write some operands twice.
   @max_statement_bytes 2_097_152
   @max_statement_tokens 50_000
+  @max_rendered_bytes 4_194_304
 
   @doc false
   def lookup_statements, do: [@probe_sql, @relations_sql, @relations_rowsets_sql, @casts_sql]
@@ -286,7 +288,9 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     verify? = Keyword.get(opts, :isolation) not in [nil, "read committed"]
 
     try do
-      tokens = sized_tokens(sql)
+      hand_built? = Keyword.get(opts, :hand_built) == true
+      tokens = if hand_built?, do: sized_tokens(sql), else: Qualify.tokenize(sql)
+      opts = Keyword.put(opts, :bytes, byte_size(sql))
       one_statement!(tokens)
       if Keyword.get(opts, :read) == true, do: read_statement!(tokens)
 
@@ -361,8 +365,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
       facts = Map.put(facts, :declared_functions, Keyword.get(opts, :declared_functions, []))
       if Keyword.get(opts, :hand_built) == true, do: Qualify.prove!(tokens, facts)
 
-      for text <- Keyword.get(opts, :raw_fragments, []),
-          do: Qualify.prove_fragment!(Qualify.tokenize(text), facts)
+      facts =
+        Map.put(facts, :max_rendered, max(@max_rendered_bytes, 8 * Keyword.fetch!(opts, :bytes)))
 
       case Qualify.qualify(tokens, facts) do
         {:ok, sql} ->

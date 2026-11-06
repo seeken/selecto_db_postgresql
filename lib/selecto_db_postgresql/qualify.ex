@@ -120,13 +120,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
   guess is not.
   """
   def prove!(tokens, facts) do
-    if touches_extension?(tokens, facts) and unprovable?(tokens, 1), do: unproved!()
-    :ok
-  end
-
-  @doc "prove!/2 for raw text inside a generated statement, which has no SELECT of its own."
-  def prove_fragment!(tokens, facts) do
-    if touches_extension?(tokens, facts) and unprovable?(tokens, 0), do: unproved!()
+    if touches_extension?(tokens, facts) and unprovable?(tokens), do: unproved!()
     :ok
   end
 
@@ -161,7 +155,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
     |> Enum.any?(fn {_key, info} -> Enum.any?(info.candidates, &(&1.schema != "pg_catalog")) end)
   end
 
-  defp unprovable?(tokens, selects) do
+  defp unprovable?(tokens) do
     {found?, _previous, count} =
       Enum.reduce(tokens, {false, nil, 0}, fn token, {found?, previous, count} ->
         up = upper(token)
@@ -173,7 +167,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
         {found?, token, if(up == "SELECT", do: count + 1, else: count)}
       end)
 
-    found? or count > selects
+    found? or count > 1
   end
 
   @doc "A name token as PostgreSQL folds it: U& decoded, bare names in lower case."
@@ -425,7 +419,8 @@ defmodule SelectoDBPostgreSQL.Qualify do
       computing: 0,
       lone_string: false,
       run_string: false,
-      branch_string: false,
+      branch_class: %{},
+      seq_classes: [],
       concat: %{}
     }
 
@@ -470,8 +465,15 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
   # A sequence of items up to (not including) the closing token (`)`, `]`)
   # or the limit. Expression runs are qualified; the rest copied.
-  defp sequence(st, close) do
-    seq(st, close, %{parts: [], run: [], set_list: false, lone: nil, string: false})
+  defp sequence(st, close, classes \\ nil) do
+    seq(st, close, %{
+      parts: [],
+      run: [],
+      set_list: false,
+      lone: nil,
+      string: false,
+      classes: classes
+    })
   end
 
   defp flush(st, %{run: []} = acc), do: {st, acc}
@@ -484,7 +486,11 @@ defmodule SelectoDBPostgreSQL.Qualify do
       end
 
     {sql, st} = emit_run(st, run)
-    {st, %{acc | run: [], parts: [sql | parts], lone: lone, string: st.run_string}}
+    single = with [%{kind: :atom} = atom] <- run, do: atom, else: (_other -> nil)
+    classes = if acc.classes, do: [run_class(st, single) | acc.classes]
+
+    {st,
+     %{acc | run: [], parts: [sql | parts], lone: lone, string: st.run_string, classes: classes}}
   end
 
   defp finish(st, acc) do
@@ -492,7 +498,10 @@ defmodule SelectoDBPostgreSQL.Qualify do
     one? = length(acc.parts) == 1
     lone = if one?, do: acc.lone, else: nil
     string? = one? and acc.string
-    {acc.parts |> Enum.reverse() |> Enum.join(" "), %{st | lone: lone, lone_string: string?}}
+    classes = if acc.classes, do: Enum.reverse(acc.classes), else: []
+
+    {acc.parts |> Enum.reverse() |> Enum.join(" "),
+     %{st | lone: lone, lone_string: string?, seq_classes: classes}}
   end
 
   defp seq(st, close, acc) do
@@ -1128,13 +1137,18 @@ defmodule SelectoDBPostgreSQL.Qualify do
     close = if open == "(", do: ")", else: "]"
     word = text(tok(st, st.pos))
     subquery? = upper(tok(st, open_at + 1)) in ~w(SELECT WITH VALUES)
-    {inner, st} = sequence(advance(st, 2), close)
+    common? = up in ~w(COALESCE GREATEST LEAST)
+    {inner, st} = sequence(advance(st, 2), close, if(common?, do: []))
     lone = st.lone
+    classes = st.seq_classes
     st = expect(st, close)
     word = if comma?, do: "pg_catalog.#{String.downcase(word)}", else: word
 
     extra =
       cond do
+        common? ->
+          common_class(classes)
+
         up in ~w(ANY ALL SOME) ->
           %{quantified: %{word: word, inner: inner, subquery: subquery? && open_at, lone: lone}}
 
@@ -1145,7 +1159,8 @@ defmodule SelectoDBPostgreSQL.Qualify do
           %{}
       end
 
-    atom = Map.merge(extra, %{sql: "#{word}#{open}#{inner}#{close}", known: up in @known_result})
+    known? = up in @known_result or extra[:known] == true
+    atom = Map.merge(extra, %{sql: "#{word}#{open}#{inner}#{close}", known: known?})
     postfix(st, atom, mark)
   end
 
@@ -1342,33 +1357,59 @@ defmodule SelectoDBPostgreSQL.Qualify do
     st = advance(st)
 
     if upper(tok(st, st.pos)) == "WHEN" do
-      {inner, st, strings} = searched_case(st, [], nil, {0, true})
-      postfix(st, Map.merge(case_result(strings), %{sql: "CASE #{inner} END"}), mark)
+      {inner, st, classes} = searched_case(st, [], nil, [])
+      postfix(st, Map.merge(common_class(classes), %{sql: "CASE #{inner} END"}), mark)
     else
       simple_case(st, mark)
     end
   end
 
-  # R51 amendment 3: a CASE takes its type from its result branches, and all
-  # of them provably pg_catalog strings make it text. The parse of each branch
-  # says so as it goes: nothing here reads a token twice.
-  defp case_result({count, true}) when count > 0, do: %{known: true, type: "pg_catalog.text"}
-  defp case_result(_strings), do: %{}
+  # PostgreSQL's common type of a CASE, COALESCE, GREATEST or LEAST
+  # (select_common_type) over what this qualifier can name: bare literals take
+  # the others' type, one extension type stays itself, and pg_catalog strings
+  # beside a string-category type are text. Each branch's parse says what it
+  # was as it goes: nothing here reads a token twice. Anything else leaves the
+  # expression to its references.
+  defp common_class(classes) do
+    typed = Enum.reject(classes, &(&1[:untyped] == true))
+    entries = typed |> Enum.map(& &1[:entry]) |> Enum.uniq()
 
-  defp branch_seen({count, strings?}, st), do: {count + 1, strings? and st.branch_string}
+    cond do
+      classes == [] ->
+        %{}
+
+      typed == [] ->
+        %{known: true, type: "pg_catalog.text"}
+
+      match?([%{}], entries) ->
+        %{entry: hd(entries), keeps_refs: true}
+
+      Enum.all?(typed, &string_operand?/1) ->
+        %{known: true, type: "pg_catalog.text"}
+
+      true ->
+        %{}
+    end
+  end
+
+  # What a run of a list or a branch is known to be.
+  defp run_class(st, lone) do
+    cond do
+      lone != nil and String.upcase(lone.sql) == "NULL" -> %{untyped: true}
+      lone != nil -> class_of(st, lone)
+      st.run_string -> %{type: "pg_catalog.text"}
+      true -> %{}
+    end
+  end
 
   # NULLIF and a simple CASE are rewritten with their first operand written
   # more than once. PostgreSQL evaluates it once, so a volatile call there
   # refuses rather than run twice.
   defp single_evaluation!(st, first, stop) do
-    functions = Map.get(st.facts, :functions, %{})
-
     for at <- first..(stop - 1)//1,
         punct?(st, at + 1, "("),
         match?({kind, _} when kind in [:id, :qid], tok(st, at)),
-        info = Map.get(functions, unquote_name(tok(st, at))),
-        info != nil,
-        Enum.any?(info.candidates, &Map.get(&1, :volatile, false)) do
+        volatile_call?(st, at) do
       refuse(
         :volatile_operand,
         "a volatile call here would run twice, where PostgreSQL runs it once"
@@ -1376,6 +1417,28 @@ defmodule SelectoDBPostgreSQL.Qualify do
     end
 
     :ok
+  end
+
+  # The function the call names: its schema's when spelled out, pg_catalog's
+  # before any other when bare, as the call itself resolves.
+  defp volatile_call?(st, at) do
+    functions = Map.get(st.facts, :functions, %{})
+    name = unquote_name(tok(st, at))
+
+    candidates =
+      if tok(st, at - 1) == {:punct, "."} do
+        info = Map.get(functions, {unquote_name(tok(st, at - 2)), name})
+        (info && info.candidates) || []
+      else
+        all = (Map.get(functions, name) || %{candidates: []}).candidates
+
+        case Enum.filter(all, &(&1.schema == "pg_catalog")) do
+          [] -> all
+          catalog -> catalog
+        end
+      end
+
+    Enum.any?(candidates, &Map.get(&1, :volatile, false))
   end
 
   # NULLIF has the type its equality takes the first argument at: the
@@ -1387,12 +1450,29 @@ defmodule SelectoDBPostgreSQL.Qualify do
     untyped? = first[:untyped] == true
 
     cond do
-      first[:entry] != nil and cast != nil -> %{entry: first.entry}
-      first[:entry] != nil -> %{known: true, type: "pg_catalog.text"}
-      first[:unknown] == true -> %{unknown: true}
-      untyped? and second[:entry] != nil and cast != nil -> %{entry: second.entry}
-      untyped? and second[:unknown] == true -> %{unknown: true}
-      true -> string_result(first)
+      first[:entry] != nil and cast != nil ->
+        %{entry: first.entry}
+
+      first[:entry] != nil ->
+        %{known: true, type: "pg_catalog.text"}
+
+      # A first operand not named here, beside a string: the equality took
+      # text, so the result is text, whatever the operand was. Beside anything
+      # else nothing says what it took.
+      first[:unknown] == true and catalog_string?(second) ->
+        %{known: true, type: "pg_catalog.text"}
+
+      first[:unknown] == true ->
+        refuse(:operand_type_unknown, "NULLIF of an operand whose type cannot be named")
+
+      untyped? and second[:entry] != nil and cast != nil ->
+        %{entry: second.entry}
+
+      untyped? and second[:unknown] == true ->
+        %{unknown: true}
+
+      true ->
+        string_result(first)
     end
   end
 
@@ -1416,36 +1496,36 @@ defmodule SelectoDBPostgreSQL.Qualify do
     {subject, st} = read_run(st, "WHEN")
     single_evaluation!(st, first, st.pos)
     {left, st} = render(st, subject)
-    {parts, st, strings} = simple_branches(st, subject, left, [], {0, true})
+    {parts, st, classes} = simple_branches(st, subject, left, [], [])
 
-    {parts, st, strings} =
+    {parts, st, classes} =
       if upper(tok(st, st.pos)) == "ELSE" do
         {sql, st} = case_branch(advance(st))
-        {["ELSE #{sql}" | parts], st, branch_seen(strings, st)}
+        {["ELSE #{sql}" | parts], st, [st.branch_class | classes]}
       else
-        {parts, st, strings}
+        {parts, st, classes}
       end
 
     st = expect_word(st, "END")
     sql = "CASE #{parts |> Enum.reverse() |> Enum.join(" ")} END"
-    postfix(st, Map.merge(case_result(strings), %{sql: sql}), mark)
+    postfix(st, Map.merge(common_class(classes), %{sql: sql}), mark)
   end
 
-  defp simple_branches(st, subject, left, parts, strings) do
+  defp simple_branches(st, subject, left, parts, classes) do
     if upper(tok(st, st.pos)) == "WHEN" do
       {value, st} = read_run(advance(st), "THEN")
       st = expect_word(st, "THEN")
       {result, st} = case_branch(st)
-      strings = branch_seen(strings, st)
+      classes = [st.branch_class | classes]
       {value_sql, st} = render(st, value)
       {op, cast, st} = op_sql(st, %{kind: :op, op: "="}, subject, value)
 
       part =
         "WHEN (#{left_cast(left, cast)}) #{op} (#{right_cast(value_sql, cast)}) THEN #{result}"
 
-      simple_branches(st, subject, left, [part | parts], strings)
+      simple_branches(st, subject, left, [part | parts], classes)
     else
-      {parts, st, strings}
+      {parts, st, classes}
     end
   end
 
@@ -1455,10 +1535,8 @@ defmodule SelectoDBPostgreSQL.Qualify do
     saved = st.limit
     {sql, st} = sequence(%{st | limit: stop}, nil)
 
-    string? =
-      st.lone_string or (st.lone != nil and catalog_string?(class_of(st, st.lone)))
-
-    {sql, %{st | limit: saved, pos: stop, branch_string: string?}}
+    class = if st.lone_string, do: %{type: "pg_catalog.text"}, else: run_class(st, st.lone)
+    {sql, %{st | limit: saved, pos: stop, branch_class: class}}
   end
 
   defp case_stop(st, i, depth, nested) do
@@ -1492,7 +1570,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
     end
   end
 
-  defp searched_case(st, parts, word, strings) do
+  defp searched_case(st, parts, word, classes) do
     token = tok(st, st.pos)
     up = upper(token)
 
@@ -1501,15 +1579,15 @@ defmodule SelectoDBPostgreSQL.Qualify do
         refuse(:sql_unqualifiable, "generated SQL could not be parsed")
 
       up == "END" ->
-        {parts |> Enum.reverse() |> Enum.join(" "), advance(st), strings}
+        {parts |> Enum.reverse() |> Enum.join(" "), advance(st), classes}
 
       up in ~w(WHEN THEN ELSE) ->
-        searched_case(advance(st), [text(token) | parts], up, strings)
+        searched_case(advance(st), [text(token) | parts], up, classes)
 
       true ->
         {sql, st} = case_branch(st)
-        strings = if word == "WHEN", do: strings, else: branch_seen(strings, st)
-        searched_case(st, [sql | parts], word, strings)
+        classes = if word == "WHEN", do: classes, else: [st.branch_class | classes]
+        searched_case(st, [sql | parts], word, classes)
     end
   end
 
@@ -2070,6 +2148,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
             column: nil,
             entry: nil,
             known: false,
+            untyped: false,
             row: false,
             subquery: nil,
             quantified: nil,
@@ -2156,7 +2235,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
   # The column references this atom's type depends on: itself for a column;
   # none for a known or extension-typed result; else those read inside it.
   defp finish_atom(st, atom, mark) do
-    bounded!(atom.sql)
+    bounded!(st, atom.sql)
     {kept, own} = Enum.split(st.refs, mark)
 
     {refs, st} =
@@ -2193,7 +2272,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
     items = List.to_tuple(run)
     {tree, i} = climb(items, 0, 0)
     {sql, st} = render(st, tree)
-    bounded!(sql)
+    bounded!(st, sql)
 
     st = %{st | run_string: i == tuple_size(items) and concat_string?(st, tree)}
 
@@ -2214,8 +2293,8 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
   # M6: NULLIF, a simple CASE and the like write an operand more than once,
   # so a few bytes nested can render exponentially.
-  defp bounded!(sql) do
-    if byte_size(sql) > @max_rendered_bytes,
+  defp bounded!(st, sql) do
+    if byte_size(sql) > Map.get(st.facts, :max_rendered, @max_rendered_bytes),
       do: refuse(:statement_too_large, "a statement renders beyond the size Selecto will run")
   end
 

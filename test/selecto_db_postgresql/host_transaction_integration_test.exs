@@ -332,12 +332,29 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       end
     end
 
-    test "a quoted CTE of another case does not hide the real table", ctx do
+    test "SEARCH and CYCLE do not end the list", ctx do
       r = ctx.relation
-      sql = ~s|WITH "#{String.upcase(r)}" AS (SELECT 'CTE' AS v) SELECT v FROM #{r}|
+      body = "a(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM a WHERE n < 2)"
 
-      assert {:ok, %{rows: [["REAL"]]}} =
-               Adapter.execute(ctx.connection, sql, [], selecto_read: true)
+      search =
+        "WITH RECURSIVE #{body} SEARCH DEPTH FIRST BY n SET o, #{r} AS (SELECT 'CTE' AS v) " <>
+          "SELECT v FROM #{r}"
+
+      assert {:ok, %{rows: [["CTE"]]}} =
+               Adapter.execute(ctx.connection, search, [], selecto_read: true)
+
+      # CYCLE's USING reads as a relation position: refused, never the table.
+      cycle =
+        "WITH RECURSIVE #{body} CYCLE n SET is_c USING p, #{r} AS (SELECT 'CTE' AS v) " <>
+          "SELECT v FROM #{r}"
+
+      assert {:error, _} = Adapter.execute(ctx.connection, cycle, [], selecto_read: true)
+    end
+
+    test "a WITH list that cannot be read refuses, with no extension type", ctx do
+      r = ctx.relation
+      sql = "WITH a AS (SELECT 1) UNKNOWN, #{r} AS (SELECT 'CTE' AS v) SELECT v FROM #{r}"
+      assert {:error, _} = Adapter.execute(ctx.connection, sql, [], selecto_read: true)
     end
   end
 

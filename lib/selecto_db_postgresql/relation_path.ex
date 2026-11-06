@@ -419,14 +419,14 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   the main query see the CTE. A CTE name equal to a relation of `map` that
   this cannot scope (WITH RECURSIVE, a nested WITH) refuses.
   """
-  def qualify(sql, map) when map_size(map) == 0, do: {:ok, IO.iodata_to_binary(sql)}
-
   def qualify(sql, map) do
     sql = IO.iodata_to_binary(sql)
 
-    if scan_ctes(sql) == :unsure,
-      do: ctes_unresolved(),
-      else: qualify_sure(sql, map)
+    cond do
+      scan_ctes(sql) == :unsure -> ctes_unresolved()
+      map_size(map) == 0 -> {:ok, sql}
+      true -> qualify_sure(sql, map)
+    end
   end
 
   defp qualify_sure(sql, map) do
@@ -506,8 +506,17 @@ defmodule SelectoDBPostgreSQL.RelationPath do
         rest = binary_part(sql, byte_size(head), byte_size(sql) - byte_size(head))
 
         case parse_ctes(rest, []) do
-          {:ok, ctes, main} -> {:ok, recursive not in [[], [""]], ctes, main}
-          :error -> :none
+          {:ok, ctes, main} ->
+            # SEARCH or CYCLE after a body: the general path reads the list.
+            if Regex.match?(
+                 ~r/\A\s*(?:\(|select\b|insert\b|update\b|delete\b|merge\b|values\b|table\b|with\b)/i,
+                 main
+               ),
+               do: {:ok, recursive not in [[], [""]], ctes, main},
+               else: :none
+
+          :error ->
+            :none
         end
 
       nil ->
@@ -581,18 +590,13 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   defp walk_ctes([], _previous, names), do: {:ok, names}
 
-  defp walk_ctes([{:id, word} = token | rest], previous, names) do
-    if String.upcase(word) == "WITH" do
+  defp walk_ctes([{:id, word} = token | rest], _previous, names) do
+    if String.upcase(word) == "WITH" and not with_option?(rest) do
       list = drop_recursive(rest)
 
       case cte_list(list, []) do
-        {:ok, found} ->
-          walk_ctes(list, token, names ++ found)
-
-        :error ->
-          if previous in [nil, {:punct, "("}, {:punct, ";"}],
-            do: :unsure,
-            else: walk_ctes(rest, token, names)
+        {:ok, found} -> walk_ctes(list, token, names ++ found)
+        :error -> :unsure
       end
     else
       walk_ctes(rest, token, names)
@@ -615,9 +619,12 @@ defmodule SelectoDBPostgreSQL.RelationPath do
          {:ok, rest} <- skip_group(body, 1) do
       names = [Qualify.folded_name(name) | names]
 
-      case rest do
-        [{:punct, ","} | more] -> cte_list(more, names)
-        _end_of_list -> {:ok, names}
+      with {:ok, rest} <- skip_search(rest),
+           {:ok, rest} <- skip_cycle(rest) do
+        case rest do
+          [{:punct, ","} | more] -> cte_list(more, names)
+          _other -> if statement_start?(rest), do: {:ok, names}, else: :error
+        end
       end
     else
       _other -> :error
@@ -625,6 +632,71 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   end
 
   defp cte_list(_tokens, _names), do: :error
+
+  # WITH ORDINALITY, WITH TIME ZONE and the like are no WITH clause.
+  defp with_option?([{:id, word} | _]) do
+    String.upcase(word) in ~w(ORDINALITY TIME TIES DATA NO CHECK LOCAL CASCADED UNIQUE
+                              WRAPPER CONDITIONAL UNCONDITIONAL KEYS ORDINALITY)
+  end
+
+  defp with_option?(_tokens), do: false
+
+  defp statement_start?([{:punct, "("} | _]), do: true
+
+  defp statement_start?([{:id, word} | _]),
+    do: String.upcase(word) in ~w(SELECT INSERT UPDATE DELETE MERGE VALUES TABLE WITH)
+
+  defp statement_start?(_tokens), do: false
+
+  # SEARCH { DEPTH | BREADTH } FIRST BY col [, ...] SET col
+  defp skip_search(tokens) do
+    with {:ok, rest} <- word(tokens, "SEARCH") do
+      with [{:id, _order} | rest] <- rest,
+           {:ok, rest} <- word(rest, "FIRST"),
+           {:ok, rest} <- word(rest, "BY"),
+           {:ok, rest} <- skip_names(rest),
+           {:ok, rest} <- word(rest, "SET"),
+           [{kind, _} | rest] when kind in [:id, :qid] <- rest do
+        {:ok, rest}
+      else
+        _other -> :error
+      end
+    else
+      :error -> {:ok, tokens}
+    end
+  end
+
+  # CYCLE col [, ...] SET col [TO value DEFAULT value] USING col
+  defp skip_cycle(tokens) do
+    with {:ok, rest} <- word(tokens, "CYCLE") do
+      with {:ok, rest} <- skip_names(rest),
+           {:ok, rest} <- word(rest, "SET"),
+           [{kind, _} | rest] when kind in [:id, :qid] <- rest,
+           {:ok, rest} <- skip_to_using(rest),
+           [{kind2, _} | rest] when kind2 in [:id, :qid] <- rest do
+        {:ok, rest}
+      else
+        _other -> :error
+      end
+    else
+      :error -> {:ok, tokens}
+    end
+  end
+
+  defp skip_names([{kind, _}, {:punct, ","} | rest]) when kind in [:id, :qid],
+    do: skip_names(rest)
+
+  defp skip_names([{kind, _} | rest]) when kind in [:id, :qid], do: {:ok, rest}
+  defp skip_names(_tokens), do: :error
+
+  defp skip_to_using([]), do: :error
+
+  defp skip_to_using([_token | rest] = tokens) do
+    case word(tokens, "USING") do
+      {:ok, after_using} -> {:ok, after_using}
+      :error -> skip_to_using(rest)
+    end
+  end
 
   defp skip_columns([{:punct, "("} | rest]), do: skip_group(rest, 1)
   defp skip_columns(tokens), do: {:ok, tokens}
