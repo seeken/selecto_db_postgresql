@@ -537,6 +537,40 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
       refute out =~ "(ANY"
     end
 
+    test "nesting costs a single pass: no typing reads a token twice" do
+      case_chain = fn depth ->
+        Enum.reduce(1..depth, "'a'", fn n, inner ->
+          "CASE WHEN a > #{n} THEN #{inner} ELSE 'b' END"
+        end)
+      end
+
+      else_chain = fn depth ->
+        Enum.reduce(1..depth, "'a'", fn n, inner ->
+          "CASE WHEN a > #{n} THEN 'b' ELSE #{inner} END"
+        end)
+      end
+
+      parens = fn depth ->
+        Enum.reduce(1..depth, "'a' || b", fn _n, inner -> "(#{inner} || 'c')" end)
+      end
+
+      corpus =
+        for name <- ["corpus_nested_1.sql", "corpus_nested_2.sql"],
+            do: File.read!(Path.join([__DIR__, "..", "fixtures", name]))
+
+      for sql <-
+            corpus ++
+              [
+                "SELECT 1 FROM s.t WHERE #{case_chain.(200)} = 'a'",
+                "SELECT 1 FROM s.t WHERE #{else_chain.(200)} = 'a'",
+                "SELECT 1 FROM s.t WHERE #{parens.(200)} = 'a'",
+                "SELECT 1 FROM s.t WHERE #{Enum.join(List.duplicate("b", 2000), " || ")} = 'a'"
+              ] do
+        {micros, _result} = :timer.tc(fn -> Qualify.qualify(sql, %{functions: functions()}) end)
+        assert micros < 5_000_000, "#{byte_size(sql)} bytes took #{div(micros, 1000)} ms"
+      end
+    end
+
     test "a column named set is not the SET of an UPDATE" do
       out = qualify!("SELECT k.update, k.set = 'other' AS r FROM s.t AS k")
       assert out =~ "OPERATOR(pg_catalog.=)"

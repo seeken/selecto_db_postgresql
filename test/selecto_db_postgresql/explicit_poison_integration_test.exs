@@ -756,6 +756,36 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     GenServer.stop(c)
   end
 
+  test "NULLIF and a subscript take the type they carry (F2)", %{opts: opts} do
+    {:ok, c} = Adapter.connect(opts)
+    sql = fn where -> "SELECT id FROM items WHERE #{where} ORDER BY id" end
+
+    for where <- [
+          "NULLIF(ci, 'x') = 'MIXED'",
+          "NULLIF(ci, 'x') <> 'MIXED'",
+          "NULLIF(ci, 'x') LIKE 'MIX%'",
+          "NULLIF(ci, 'x') NOT LIKE 'MIX%'",
+          "NULLIF(NULLIF(ci, 'x'), 'y') = 'MIXED'",
+          "NULLIF(dci, 'x') = 'BOB'",
+          "NULLIF('mixed', ci) IS NULL",
+          "NULLIF(ci, vc) = 'MIXED'"
+        ] do
+      statement = sql.(where)
+      assert {:ok, %{rows: rows}} = Adapter.execute(c, statement, [], selecto_read: true), where
+      assert {:ok, %{rows: ^rows}} = Adapter.execute(c, statement, [], []), where
+    end
+
+    # Around NULLIF the extension type is still there, and an array no column
+    # names has an element type not known here: typed refusals.
+    for where <- ["COALESCE(NULLIF(ci, 'x'), 'y') = 'MIXED'", "(ARRAY['a'::ext.citext])[1] = 'A'"] do
+      assert {:error, %{details: %{reason: :operand_type_unknown}}} =
+               Adapter.execute(c, sql.(where), [], selecto_read: true),
+             where
+    end
+
+    GenServer.stop(c)
+  end
+
   test "a plant under a keyword or U& name never answers (R58, R60)", %{opts: opts} do
     {:ok, admin} = Adapter.connect(opts)
     forged = "RETURNS text LANGUAGE sql AS $$ SELECT 'FORGED'::text $$"

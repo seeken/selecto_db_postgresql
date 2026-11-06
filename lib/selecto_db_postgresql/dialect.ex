@@ -142,20 +142,16 @@ defmodule SelectoDBPostgreSQL.Dialect do
 
   def render_computed_value(_fragment, _selecto), do: invalid_computed_value(:unknown)
 
+  @doc false
+  # A string literal under a cast goes from text to the target (Selecto's
+  # compiler asks): '1.5' is no integer here, as natively.
+  def casts_literals_from_text?, do: true
+
   # Postgrex encodes a parameter by the type the statement gives it: a string
   # cast to another type binds as text, and the server converts it.
   defp computed_cast({:param, value} = expression, target)
        when is_binary(value) and target != "TEXT",
        do: ["CAST(CAST(", expression, " AS TEXT) AS ", target, ")"]
-
-  # A cast of such a literal goes from the text to the target, whatever type
-  # the literal was inferred to have: '1.5' is no integer, as natively.
-  defp computed_cast(
-         ["CAST(CAST(", {:param, value} = param, " AS TEXT) AS ", _inferred, ")"],
-         target
-       )
-       when is_binary(value),
-       do: computed_cast(param, target)
 
   defp computed_cast(expression, target), do: ["CAST(", expression, " AS ", target, ")"]
 

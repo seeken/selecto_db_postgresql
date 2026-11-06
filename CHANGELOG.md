@@ -17,10 +17,16 @@ Unreleased
 - An Ecto repository's transaction is read from the checked-out connection,
   not Repo.in_transaction?/0, so a read under the SQL Sandbox or after a raw
   BEGIN joins it: Selecto never COMMITs a transaction it did not open.
-- A write on a pid or named connection after a raw BEGIN joins the host's
-  transaction under a savepoint; a stream there refuses, where both used to
-  disconnect it. An Ecto write's savepoint holds one checkout. A failed ROLLBACK
-  TO a Selecto savepoint refuses `:connection_broken`.
+- A stream after a raw BEGIN refuses, where it used to disconnect the host's
+  transaction. An Ecto write's savepoint holds one checkout, under the call's
+  timeout. A failed ROLLBACK TO a Selecto savepoint refuses `:connection_broken`.
+- A session whose client_encoding is not UTF8 refuses on every read, stream and
+  write (R65): parameters are UTF-8 bytes, and a tenant name would be misread
+  as another's. The setting is compared with the session's other settings.
+- A write on a pid or named connection that finds a transaction it cannot prove
+  the caller's refuses `:unowned_transaction`; DBConnection.run/3 joins. NULLIF
+  has the type its equality takes, a subscript its element's. Typing a statement
+  is a single pass.
 - A statement with anything after a semicolon refuses, and a read must be a
   query.
 - U& and dollar-quoted strings, and E'' with an escaped quote, are untyped
