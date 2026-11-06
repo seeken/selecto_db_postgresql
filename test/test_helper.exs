@@ -9,7 +9,7 @@ ExUnit.after_suite(fn _result ->
   # Every operator, by-name construct and function, of business statements
   # (R47) and of Selecto's own guard and catalog SQL (R48) alike.
   violations =
-    for {_kind, sql} <- statements,
+    for sql <- statements,
         found = SelectoDBPostgreSQL.ExplicitSQL.violations(sql),
         found != [],
         do: {found, sql}

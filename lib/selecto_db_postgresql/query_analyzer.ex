@@ -555,8 +555,9 @@ defmodule SelectoDBPostgreSQL.QueryAnalyzer do
       autovacuum_count,
       analyze_count,
       autoanalyze_count
-    FROM pg_stat_user_tables
-    WHERE schemaname = 'public' AND tablename = $1
+    FROM pg_catalog.pg_stat_user_tables
+    WHERE schemaname OPERATOR(pg_catalog.=) 'public'
+      AND relname OPERATOR(pg_catalog.=) $1::pg_catalog.name
     """
 
     case execute_raw_query(adapter, conn, query, [table_name]) do
