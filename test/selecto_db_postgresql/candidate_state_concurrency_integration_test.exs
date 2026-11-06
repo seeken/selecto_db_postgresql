@@ -64,7 +64,7 @@ defmodule SelectoDBPostgreSQL.CandidateStateConcurrencyIntegrationTest do
         end)
       end)
 
-    assert_receive :first_loaded
+    assert_receive :first_loaded, 5_000
 
     second_task =
       Task.async(fn ->

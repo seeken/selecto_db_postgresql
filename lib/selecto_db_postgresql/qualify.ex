@@ -909,7 +909,8 @@ defmodule SelectoDBPostgreSQL.Qualify do
               %{subquery: open}
 
             lone ->
-              Map.take(lone, [
+              lone
+              |> Map.take([
                 :column,
                 :known,
                 :entry,
@@ -920,6 +921,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
                 :subquery,
                 :subscript
               ])
+              |> Map.put(:untyped, lone[:untyped] == true or bare_literal?(lone))
 
             string? ->
               %{known: true, type: "pg_catalog.text"}
@@ -1393,6 +1395,10 @@ defmodule SelectoDBPostgreSQL.Qualify do
       true -> string_result(first)
     end
   end
+
+  # ('x') is as untyped as 'x'.
+  defp bare_literal?(atom),
+    do: Map.get(atom, :column) == nil and Regex.match?(@untyped_literal, atom.sql)
 
   defp string_result(%{type: type} = class) do
     if catalog_string?(class), do: %{known: true, type: type}, else: %{}
