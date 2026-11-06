@@ -405,6 +405,84 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
     )
   end
 
+  test "another session's deferrable trigger never refuses a read or a stream; writes keep R23" do
+    trigger =
+      "CREATE CONSTRAINT TRIGGER r61 AFTER UPDATE ON other DEFERRABLE INITIALLY DEFERRED " <>
+        "FOR EACH ROW EXECUTE FUNCTION tg()"
+
+    in_database(
+      [
+        "CREATE TABLE r (id int PRIMARY KEY, note text)",
+        "INSERT INTO r SELECT g, 'n' FROM generate_series(1, 5) g",
+        "CREATE TABLE other (id int PRIMARY KEY)",
+        "CREATE FUNCTION tg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$"
+      ],
+      fn a, c ->
+        # A slow read in session A; session B commits the trigger meanwhile.
+        slow =
+          Task.async(fn ->
+            Adapter.execute(c, "SELECT count(*), max(pg_sleep(0.6)::text) FROM public.r", [],
+              selecto_read: true,
+              timeout: 5_000
+            )
+          end)
+
+        Process.sleep(200)
+        exec!(a, trigger)
+        assert {:ok, %{rows: [[5, _]]}} = Task.await(slow, 6_000)
+        exec!(a, "DROP TRIGGER r61 ON other")
+
+        # A stream, batch by batch, across the same commit.
+        fields = ~w(id note)a
+
+        domain = %{
+          name: "r",
+          source: %{
+            source_table: "r",
+            primary_key: :id,
+            fields: fields,
+            redact_fields: [],
+            columns: %{id: %{type: :integer}, note: %{type: :string}},
+            associations: %{}
+          },
+          schemas: %{},
+          joins: %{}
+        }
+
+        {:ok, stream} =
+          domain
+          |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+          |> Selecto.select(["id"])
+          |> Selecto.order_by(["id"])
+          |> Selecto.execute_stream(max_rows: 1, receive_timeout: 5_000)
+
+        seen =
+          Enum.reduce(stream, 0, fn _row, count ->
+            if count == 1, do: exec!(a, trigger)
+            count + 1
+          end)
+
+        assert seen == 5
+
+        # With the trigger committed: reads stand, writes refuse.
+        assert {:ok, %{rows: [[5]]}} =
+                 Adapter.execute(c, "SELECT count(*) FROM public.r", [], selecto_read: true)
+
+        {:ok, command} =
+          Command.new(%{
+            operation: :update,
+            relation: "r",
+            predicate: {:eq, {:field, "id"}, {:literal, 1}},
+            assignments: [%{field: "note", value: {:literal, "x"}}],
+            expected_cardinality: :many
+          })
+
+        assert {:error, %{details: %{reason: :deferred_triggers}}} =
+                 Adapter.execute_write_unsafe(c, command, [])
+      end
+    )
+  end
+
   test "a read cannot write: a function it reaches meets a read-only transaction" do
     {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
     schema = "selecto_ro_#{System.unique_integer([:positive])}"
