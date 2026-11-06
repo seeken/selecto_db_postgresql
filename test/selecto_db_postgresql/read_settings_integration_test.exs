@@ -35,6 +35,18 @@ defmodule SelectoDBPostgreSQL.ReadSettingsIntegrationTest do
     assert log =~ ":statement_cache is ignored"
   end
 
+  test "a read's timeout stands: a failed undo does not replace it (R66)" do
+    {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
+    Process.unlink(c)
+
+    result =
+      Adapter.execute(c, "SELECT pg_catalog.pg_sleep(5)", [], selecto_read: true, timeout: 200)
+
+    assert {:error, error} = result
+    refute match?(%{details: %{reason: :connection_broken}}, error)
+    if Process.alive?(c), do: GenServer.stop(c)
+  end
+
   test "a string cast to a number binds as text, for the server to convert" do
     fragment = %Selecto.Dialect.ComputedValue{
       operation: :cast,
