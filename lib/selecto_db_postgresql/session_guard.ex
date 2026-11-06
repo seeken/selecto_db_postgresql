@@ -96,6 +96,14 @@ defmodule SelectoDBPostgreSQL.SessionGuard.Deferrable do
         "(c.conexclop IS NULL OR " <> catalog_operators("c.conexclop") <> ")))))"
 end
 
+defmodule SelectoDBPostgreSQL.SessionGuard.Control do
+  @moduledoc false
+
+  # See SessionGuard.control/1.
+  @enforce_keys [:sql]
+  defstruct [:sql]
+end
+
 defmodule SelectoDBPostgreSQL.SessionGuard do
   @moduledoc false
 
@@ -215,9 +223,26 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   @doc """
   A transaction statement of the adapter's own, marked: only a statement
   built this way takes the simple protocol, which would run anything after a
-  semicolon. Text is never classified by what it starts with.
+  semicolon. Text is never classified by what it starts with, and the mark
+  carries one of these statements or none: control_sql/1 checks it again.
   """
-  def control(sql) when is_binary(sql), do: {:selecto_control, sql}
+  def control(sql) when is_binary(sql) do
+    true = control_sql?(sql)
+    %__MODULE__.Control{sql: sql}
+  end
+
+  @doc "The text of a marked statement, or nil: a hand-built mark is no mark."
+  def control_sql(%__MODULE__.Control{sql: sql}) when is_binary(sql),
+    do: if(control_sql?(sql), do: sql)
+
+  def control_sql(_other), do: nil
+
+  defp control_sql?(sql),
+    do:
+      Regex.match?(
+        ~r/\A(?:BEGIN|COMMIT|ROLLBACK|(?:SAVEPOINT|RELEASE SAVEPOINT|ROLLBACK TO SAVEPOINT) selecto_[a-z]+_[0-9a-f]{16})\z/,
+        sql
+      )
 
   @doc "The snapshot statement (no parameters)."
   def snapshot_sql, do: @snapshot_sql

@@ -634,7 +634,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
           "SELECT id FROM items WHERE (ci, org) <> ('MIXED', 't1')",
           "SELECT id FROM items WHERE ROW(ci, org) = ROW('MIXED', 't1')",
           # A member for text exists: the operand's type must be named.
-          "SELECT id FROM items WHERE ci LIKE (name || 'x')"
+          "SELECT id FROM items WHERE ci LIKE (n + 1)::text || COALESCE(ci, 'x')"
         ] do
       assert {:error, %{details: %{reason: :operand_type_unknown}}} =
                Adapter.execute(c, sql, [], selecto_read: true),
@@ -731,6 +731,24 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
         ] do
       assert {:ok, %{rows: ^mixed}} = read.(sql), sql
     end
+
+    for sql <- [
+          "SELECT id FROM items WHERE ci LIKE lower(vc) ORDER BY id",
+          "SELECT id FROM items WHERE ci LIKE NULLIF(lower(vc), '') ORDER BY id",
+          "SELECT id FROM items WHERE ci LIKE (SELECT 'mixed') ORDER BY id",
+          "SELECT id FROM items WHERE ci LIKE (SELECT 'mixed'::text) ORDER BY id",
+          "SELECT id FROM items WHERE ci LIKE CASE WHEN id > 0 THEN 'mixed'::text ELSE vc END ORDER BY id",
+          "SELECT id FROM items WHERE ci LIKE ('mix' || 'ed') ORDER BY id"
+        ] do
+      assert {:ok, %{rows: rows}} = read.(sql), sql
+      assert {:ok, %{rows: ^rows}} = Adapter.execute(c, sql, [], []), sql
+    end
+
+    # As text: case-sensitive, as natively.
+    starts = "SELECT id FROM items WHERE ci ^@ 'mix'::ext.citext ORDER BY id"
+    assert {:ok, %{rows: [[3], [5]]}} = read.(starts)
+    assert {:ok, %{rows: [[3], [5]]}} = Adapter.execute(c, starts, [], [])
+    assert {:ok, %{rows: [_ | _]}} = read.("SELECT id FROM items WHERE (ci || ci) <> 'x'")
 
     assert {:ok, %{rows: [[2]]}} = read.("SELECT id FROM items WHERE ci NOT SIMILAR TO 'mixed'")
     assert {:ok, %{rows: [[2]]}} = read.("SELECT id FROM items WHERE ci !~ 'mixed'::varchar")

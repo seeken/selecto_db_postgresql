@@ -148,6 +148,15 @@ defmodule SelectoDBPostgreSQL.Dialect do
        when is_binary(value) and target != "TEXT",
        do: ["CAST(CAST(", expression, " AS TEXT) AS ", target, ")"]
 
+  # A cast of such a literal goes from the text to the target, whatever type
+  # the literal was inferred to have: '1.5' is no integer, as natively.
+  defp computed_cast(
+         ["CAST(CAST(", {:param, value} = param, " AS TEXT) AS ", _inferred, ")"],
+         target
+       )
+       when is_binary(value),
+       do: computed_cast(param, target)
+
   defp computed_cast(expression, target), do: ["CAST(", expression, " AS ", target, ")"]
 
   defp computed_expression?(expression),

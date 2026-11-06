@@ -374,6 +374,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
           {:ok, %{selecto | set: set}}
         else
           {:error, %Error{} = error} -> {:error, read_refusal(error)}
+          {:error, _reason} = error -> error
         end
     end
   end
@@ -529,8 +530,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
         guarded_checkout(connection, query, params, opts)
 
       true ->
-        # A host module with query/2 decides which connection runs each
-        # statement; the checks run through it as the statement does.
+        # A module with query/2 alone is no Postgrex pool:
+        # execute_module_connection/4 hands it to the driver, which exits, so
+        # the read refuses. It never reaches the module's query/2.
         run_guarded_read(
           &execute_module_connection(connection, &1, &2, opts),
           &execute_module_connection(connection, &1, &2, opts),
@@ -663,8 +665,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
           {:ok, result}
         else
           error ->
-            _ = run_all(guard, undo)
-            error
+            case run_all(guard, undo) do
+              :ok -> error
+              {:error, _failed} -> {:error, read_refusal(broken_connection())}
+            end
         end
 
       {:error, _} = error ->
@@ -2762,7 +2766,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp normalize_query({:selecto_control, sql}), do: sql
+  defp normalize_query(%SessionGuard.Control{} = control),
+    do: SessionGuard.control_sql(control) || raise(ArgumentError, "not a transaction statement")
+
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)
 
@@ -2811,6 +2817,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
+  # {Ecto.Adapters.SQL, pool} is Ecto's own process key for a checked-out
+  # connection: private, read here because nothing public gives its status.
+  # Checked on ecto_sql 3.13.4 and 3.14.0. If it moves this returns nil and
+  # transaction_open?/1 asks the server.
   defp ecto_connection(repo) do
     dynamic =
       if module_exports?(repo, :get_dynamic_repo, 0), do: repo.get_dynamic_repo(), else: repo
@@ -2846,8 +2856,15 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # which would take the adapter's savepoints with it.
   defp execute_ecto_query(repo, query, params, opts \\ [])
 
-  defp execute_ecto_query(repo, {:selecto_control, sql}, params, opts),
-    do: execute_ecto_query(repo, sql, params, Keyword.put(opts, :sandbox_subtransaction, false))
+  defp execute_ecto_query(repo, %SessionGuard.Control{} = control, params, opts) do
+    case SessionGuard.control_sql(control) do
+      nil ->
+        {:error, {:invalid_statement, :control}}
+
+      sql ->
+        execute_ecto_query(repo, sql, params, Keyword.put(opts, :sandbox_subtransaction, false))
+    end
+  end
 
   defp execute_ecto_query(repo, query, params, opts) do
     statement = query |> normalize_query() |> SQLRecorder.driver()
@@ -2910,13 +2927,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
     :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
-  defp query_postgrex(connection, {:selecto_control, sql}, [], opts) do
-    run_postgrex(
-      connection,
-      SQLRecorder.driver(sql),
-      [],
-      opts |> unnamed() |> Keyword.put(:query_type, :text)
-    )
+  defp query_postgrex(connection, %SessionGuard.Control{} = control, [], opts) do
+    case SessionGuard.control_sql(control) do
+      nil ->
+        {:error, {:invalid_statement, :control}}
+
+      sql ->
+        run_postgrex(
+          connection,
+          SQLRecorder.driver(sql),
+          [],
+          opts |> unnamed() |> Keyword.put(:query_type, :text)
+        )
+    end
   end
 
   defp query_postgrex(connection, query, params, opts) do
@@ -3668,6 +3691,21 @@ defmodule SelectoDBPostgreSQL.Adapter do
     {:error, write_error(:transaction_failed, {:invalid_connection, connection})}
   end
 
+  # R23: a refused statement that cannot be rolled back. PostgreSQL has
+  # aborted the transaction holding it, or it is out of reach; the session
+  # cannot be trusted either way, and the refusal says so.
+  defp broken_connection do
+    Error.new(
+      :query_enforcement,
+      "PostgreSQL could not undo a refused statement: the connection is broken",
+      details: %{
+        code: :query_rule_not_evaluable,
+        reason: :connection_broken,
+        adapter: :postgresql
+      }
+    )
+  end
+
   defp with_savepoint(query, fun) do
     name = "selecto_write_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
 
@@ -3689,9 +3727,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
             end
 
           error ->
-            _ = query.("ROLLBACK TO SAVEPOINT #{name}")
-            _ = query.("RELEASE SAVEPOINT #{name}")
-            error
+            with {:ok, _} <- query.("ROLLBACK TO SAVEPOINT #{name}"),
+                 {:ok, _} <- query.("RELEASE SAVEPOINT #{name}") do
+              error
+            else
+              _failed -> {:error, broken_connection()}
+            end
         end
 
       {:error, reason} ->
@@ -3707,13 +3748,16 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
+  # Checked out first, so the status decides: after a raw BEGIN on this
+  # connection a managed transaction would disconnect it, and the host's next
+  # statement would autocommit.
   defp with_native_postgres_transaction(connection, opts, fun) do
     if valid_postgrex_connection?(connection) do
-      case postgres_transaction(connection, opts, fun) do
-        {:ok, results} -> {:ok, results}
-        {:error, %Error{} = error} -> {:error, error}
-        {:error, reason} -> {:error, write_error(:transaction_failed, reason)}
-      end
+      DBConnection.run(
+        connection,
+        &with_postgres_transaction(&1, opts, fun),
+        Keyword.take(opts, [:timeout, :deadline, :queue_target, :queue_interval])
+      )
     else
       {:error, write_error(:transaction_failed, {:invalid_connection, connection})}
     end
@@ -3731,16 +3775,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
     transaction_opts = Keyword.take(opts, [:timeout, :log])
     # Only a transaction this call opens can be set READ COMMITTED; inside
     # the host's own transaction the guarded-write check decides.
-    managed? =
-      if module_exports?(repo, :checkout, 1),
-        do: not apply(repo, :checkout, [fn -> ecto_in_transaction?(repo) end]),
-        else:
-          not (module_exports?(repo, :in_transaction?, 0) and apply(repo, :in_transaction?, []))
-
+    # One checkout around the decision and the work: under a shared Sandbox
+    # another process's statements would otherwise land inside the savepoint.
     transaction_result =
-      if managed?,
-        do: managed_ecto_transaction(repo, transaction_opts, fun),
-        else: with_savepoint(&safe_ecto_query(repo, &1), fn -> fun.(repo) end)
+      if module_exports?(repo, :checkout, 1) do
+        apply(repo, :checkout, [
+          fn ->
+            if ecto_in_transaction?(repo),
+              do: with_savepoint(&safe_ecto_query(repo, &1), fn -> fun.(repo) end),
+              else: managed_ecto_transaction(repo, transaction_opts, fun)
+          end
+        ])
+      else
+        if module_exports?(repo, :in_transaction?, 0) and apply(repo, :in_transaction?, []),
+          do: with_savepoint(&safe_ecto_query(repo, &1), fn -> fun.(repo) end),
+          else: managed_ecto_transaction(repo, transaction_opts, fun)
+      end
 
     case transaction_result do
       {:ok, results} -> {:ok, results}
@@ -3896,6 +3946,29 @@ defmodule SelectoDBPostgreSQL.Adapter do
     {:error, %{stream_context: :pool, pool_ref: inspect(pool_ref)}}
   end
 
+  # A stream runs in a transaction of its own, on its producer's process. On
+  # a connection already in the host's transaction that would disconnect it
+  # and the host's next statement would autocommit: it refuses.
+  defp own_stream_transaction(conn, timeout, fun) do
+    DBConnection.run(
+      conn,
+      fn checked_out ->
+        if DBConnection.status(checked_out) == :idle,
+          do: Postgrex.transaction(checked_out, fun, timeout: timeout),
+          else: {:error, stream_in_transaction()}
+      end,
+      timeout: timeout
+    )
+  end
+
+  defp stream_in_transaction do
+    %Selecto.Error{
+      type: :query_error,
+      message: "PostgreSQL cannot stream inside the host's transaction on this connection",
+      details: %{reason: :stream_in_transaction, adapter: :postgresql}
+    }
+  end
+
   defp build_postgrex_cursor_stream(conn, query, params, opts) do
     query = normalize_query(query)
     max_rows = Keyword.get(opts, :max_rows, 500)
@@ -3912,66 +3985,62 @@ defmodule SelectoDBPostgreSQL.Adapter do
         # set_config) and the stream fails.
         guarded? = Keyword.get(opts, :selecto_session_guard) == true
 
-        Postgrex.transaction(
-          conn,
-          fn tx_conn ->
-            check = &guard_statement(tx_conn, &1, &2)
+        own_stream_transaction(conn, stream_timeout, fn tx_conn ->
+          check = &guard_statement(tx_conn, &1, &2)
 
-            refuse = fn
-              {:error, %Error{} = error} -> Postgrex.rollback(tx_conn, read_refusal(error))
-              {:error, reason} -> Postgrex.rollback(tx_conn, reason)
-            end
+          refuse = fn
+            {:error, %Error{} = error} -> Postgrex.rollback(tx_conn, read_refusal(error))
+            {:error, reason} -> Postgrex.rollback(tx_conn, reason)
+          end
 
-            # R30: the cursor runs under the pinned search_path; every batch
-            # is compared with the pin expected in place.
-            {before, pinned, query} =
-              if guarded? do
-                with :ok <- RelationPath.qualified(query),
-                     {:ok, before} <- SessionGuard.check(check, query),
-                     {:ok, pinned} <-
-                       SessionGuard.pin(check, read_path(opts), read_only: read_only?(query)),
-                     {:ok, prepared} <-
-                       ExplicitSQL.prepare(check, query,
-                         isolation: pinned.isolation,
-                         declared_functions: Keyword.get(opts, :selecto_declared_functions, [])
-                       ) do
-                  {before, pinned, prepared}
-                else
-                  error -> refuse.(error)
-                end
-              else
-                {nil, nil, SQLRecorder.host(query)}
-              end
-
-            try do
-              tx_conn
-              |> Postgrex.stream(SQLRecorder.driver(query), params, max_rows: max_rows)
-              |> Enum.each(fn %Postgrex.Result{rows: rows, columns: columns} ->
-                if guarded? do
-                  case SessionGuard.compare(check, before, pinned: pinned) do
-                    :ok -> :ok
-                    error -> refuse.(error)
-                  end
-                end
-
-                send_chunk.(rows, columns)
-              end)
-            rescue
-              error in Postgrex.Error ->
-                if match?(%{postgres: %{code: :read_only_sql_transaction}}, error),
-                  do: refuse.({:error, read_wrote()}),
-                  else: reraise(error, __STACKTRACE__)
-            end
-
+          # R30: the cursor runs under the pinned search_path; every batch
+          # is compared with the pin expected in place.
+          {before, pinned, query} =
             if guarded? do
-              case SessionGuard.unpin(check, pinned, before) do
-                :ok -> :ok
+              with :ok <- RelationPath.qualified(query),
+                   {:ok, before} <- SessionGuard.check(check, query),
+                   {:ok, pinned} <-
+                     SessionGuard.pin(check, read_path(opts), read_only: read_only?(query)),
+                   {:ok, prepared} <-
+                     ExplicitSQL.prepare(check, query,
+                       isolation: pinned.isolation,
+                       declared_functions: Keyword.get(opts, :selecto_declared_functions, [])
+                     ) do
+                {before, pinned, prepared}
+              else
                 error -> refuse.(error)
               end
+            else
+              {nil, nil, SQLRecorder.host(query)}
             end
-          end,
-          timeout: stream_timeout
-        )
+
+          try do
+            tx_conn
+            |> Postgrex.stream(SQLRecorder.driver(query), params, max_rows: max_rows)
+            |> Enum.each(fn %Postgrex.Result{rows: rows, columns: columns} ->
+              if guarded? do
+                case SessionGuard.compare(check, before, pinned: pinned) do
+                  :ok -> :ok
+                  error -> refuse.(error)
+                end
+              end
+
+              send_chunk.(rows, columns)
+            end)
+          rescue
+            error in Postgrex.Error ->
+              if match?(%{postgres: %{code: :read_only_sql_transaction}}, error),
+                do: refuse.({:error, read_wrote()}),
+                else: reraise(error, __STACKTRACE__)
+          end
+
+          if guarded? do
+            case SessionGuard.unpin(check, pinned, before) do
+              :ok -> :ok
+              error -> refuse.(error)
+            end
+          end
+        end)
       end)
 
     Stream.resource(
