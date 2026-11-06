@@ -45,7 +45,11 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
 
   defp citext(fns \\ %{}) do
     %{
-      ops: Map.new(~w(= <> < <= > >= ~~ !~~ ~~* !~~*), &{&1, ~s("ext")}),
+      ops:
+        Map.new(
+          ~w(= <> < <= > >= ~~ !~~ ~~* !~~*),
+          &{&1, [%{schema: ~s("ext"), left: ~s("ext"."citext"), right: ~s("ext"."citext")}]}
+        ),
       fns: fns,
       type: ~s("ext"."citext"),
       elem: nil,
@@ -92,7 +96,14 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
       assert qualify!("SELECT -a, b != 1 FROM s.t") ==
                "SELECT (OPERATOR(pg_catalog.-) (a)) , ((b) OPERATOR(pg_catalog.<>) (1)) FROM s.t"
 
-      assert qualify!(~s|SELECT 1 FROM s.t WHERE (a OPERATOR("ext".=) b)|) =~
+      # An operator outside pg_catalog is verified, not trusted.
+      assert {:error, :operator_not_member, _} =
+               Qualify.qualify(~s|SELECT 1 FROM s.t WHERE (a OPERATOR("ext".=) b)|, %{
+                 functions: functions(),
+                 extension: false
+               })
+
+      assert qualify!(~s|SELECT 1 FROM s.t r WHERE r.ci OPERATOR(ext.=) $1|, ext_facts()) =~
                ~s|OPERATOR("ext".=)|
     end
 
@@ -301,11 +312,10 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
                  Map.put(ext_facts(), :functions, functions())
                )
 
-      assert {:error, :operand_type_unknown, _} =
-               Qualify.qualify(
-                 "SELECT 1 FROM s.t r WHERE r.ci = ANY($1)",
-                 Map.put(ext_facts(), :functions, functions())
-               )
+      assert qualify!(
+               "SELECT 1 FROM s.t r WHERE r.ci = ANY($1)",
+               Map.put(ext_facts(), :functions, functions())
+             ) =~ ~s|OPERATOR("ext".=) ANY (CAST(($1) AS "ext"."citext"[]))|
     end
 
     test "citext passes through CTEs and derived tables; a reused alias is its own scope's" do

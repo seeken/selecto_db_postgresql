@@ -37,6 +37,8 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     for sql <- [
           "CREATE SCHEMA ext",
           "CREATE EXTENSION citext SCHEMA ext",
+          "CREATE EXTENSION hstore SCHEMA ext",
+          "CREATE EXTENSION pgcrypto SCHEMA ext",
           "CREATE TYPE en AS ENUM ('a', 'b')",
           "CREATE DOMAIN dom AS varchar(10)",
           "CREATE DOMAIN cidom AS ext.citext",
@@ -512,6 +514,42 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
      "SELECT id FROM items WHERE dci = 'bob' AND dci <> 'BOBBY' ORDER BY id"},
     {"cast to citext", "SELECT id FROM items WHERE CAST(vc AS ext.citext) = 'MIXED' ORDER BY id"},
     {"citext against text", "SELECT id FROM items WHERE ci = name ORDER BY id"},
+    # M1: `name =` after a comma is an assignment only in a SET list.
+    {"comparison after a comma in the select list",
+     "SELECT id, vc = 'zzz' FROM items ORDER BY id"},
+    {"comparison in a call's second argument",
+     "SELECT id FROM items WHERE coalesce(null, vc = 'zzz') ORDER BY id"},
+    {"comparison after a comma in ORDER BY", "SELECT id FROM items ORDER BY id, vc = 'zzz'"},
+    {"comparison in an ARRAY", "SELECT ARRAY[null, vc = 'zzz'] FROM items ORDER BY id"},
+    {"mode() is a call", "SELECT mode() WITHIN GROUP (ORDER BY vc) FROM items"},
+    # M2.
+    {"dollar quotes", "SELECT id FROM items WHERE vc = $$alpha$$"},
+    {"tagged dollar quotes", "SELECT id FROM items WHERE vc = $t$alpha$t$ ORDER BY id"},
+    {"escape string", "SELECT id FROM items WHERE vc = E'al\\x70ha'"},
+    {"unicode escape string", "SELECT id FROM items WHERE vc = U&'\\0061lpha'"},
+    {"string continuation", "SELECT id FROM items WHERE vc = 'alp'\n 'ha'"},
+    {"overloaded extension function",
+     "SELECT encode(digest(name, 'sha1'), 'hex') FROM items WHERE id = 1"},
+    {"overloaded extension function on literals", "SELECT hstore('a', '1')::text"},
+    {"extension function result's operator", "SELECT hstore('a', '1') -> 'a'"},
+    # M3: citext answered natively, or refused (the next test).
+    {"ALL over a citext array",
+     "SELECT id FROM items WHERE ci <> ALL(ARRAY['MIXED']::ext.citext[]) ORDER BY id"},
+    {"ANY over a citext array",
+     "SELECT id FROM items WHERE ci = ANY(ARRAY['MIXED']::ext.citext[]) ORDER BY id"},
+    {"scalar citext subquery",
+     "SELECT id FROM items WHERE ci <> (SELECT 'MIXED'::ext.citext) ORDER BY id"},
+    {"scalar text subquery",
+     "SELECT id FROM items WHERE ci = (SELECT 'mixed'::text) ORDER BY id"},
+    {"IN over a text subquery",
+     "SELECT id FROM items WHERE ci IN (SELECT name FROM items) ORDER BY id"},
+    {"NOT IN over a citext subquery",
+     "SELECT id FROM items WHERE ci NOT IN (SELECT code FROM codes) ORDER BY id"},
+    {"citext split_part", "SELECT split_part(ci, 'X', 1) FROM items WHERE id = 3"},
+    {"citext strpos", "SELECT strpos(ci, 'M') FROM items WHERE id = 3"},
+    {"citext rowset beside a table",
+     "SELECT x FROM items, regexp_split_to_table(ci, 'I') AS x WHERE id = 3 ORDER BY 1"},
+    {"citext LIKE a pattern", "SELECT id FROM items WHERE ci LIKE 'MIX%' ORDER BY id"},
     {"text against citext", "SELECT id FROM items WHERE name = ci ORDER BY id"}
   ]
 
@@ -554,13 +592,15 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     for sql <- [
           "SELECT id FROM items WHERE COALESCE(ci, 'x') = 'MIXED'",
           "SELECT id FROM items WHERE (CASE WHEN n > 0 THEN ci END) = 'MIXED'",
-          "SELECT id FROM items WHERE ci = ANY($1)",
-          "SELECT max(COALESCE(ci, 'x')) FROM items"
+          "SELECT max(COALESCE(ci, 'x')) FROM items",
+          # M3: no OPERATOR() says "each column by its own type".
+          "SELECT id FROM items WHERE (ci, org) <> ('MIXED', 't1')",
+          "SELECT id FROM items WHERE ROW(ci, org) = ROW('MIXED', 't1')",
+          # A member for text exists: the operand's type must be named.
+          "SELECT id FROM items WHERE ci LIKE (name || 'x')"
         ] do
-      params = if String.contains?(sql, "$1"), do: [["MIXED"]], else: []
-
       assert {:error, %{details: %{reason: :operand_type_unknown}}} =
-               Adapter.execute(c, sql, params, selecto_read: true),
+               Adapter.execute(c, sql, [], selecto_read: true),
              sql
     end
 

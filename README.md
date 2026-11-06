@@ -312,8 +312,9 @@ another schema's relation, function or operator of the same name. So:
 
 - **Every relation of a generated read or write is schema-qualified.** A
   domain relation declares its schema with `source_schema` next to its
-  `source_table` (`source_schema: "pg_temp"` for a host temp table), and a
-  write command with a `"schema.relation"` relation. Any other name is
+  `source_table` (`source_schema: "pg_temp"` for a host temp table): reads
+  and SelectoUpdato writes of that domain both name it. A hand-built write
+  command names it with a `"schema.relation"` relation. Any other name is
   resolved against the connection's **reset** search_path
   (`pg_settings.reset_val`: the server, database, role or startup value,
   which `SET` and `set_config` do not change), which PostgreSQL itself
@@ -339,7 +340,7 @@ another schema's relation, function or operator of the same name. So:
   collision that cannot be scoped (`WITH RECURSIVE`, a nested `WITH`)
   refuses (`reason: :cte_name_collision`).
 - **Each Selecto statement runs under pinned settings**: search_path
-  `pg_catalog, <every schema of the reset search_path>, <declared schemas>,
+  `pg_catalog, <declared schemas>, <every schema of the reset search_path>,
   pg_temp`, and `TimeZone`,
   `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`,
   `standard_conforming_strings` and `timezone_abbreviations` each at its
@@ -396,6 +397,24 @@ another schema's relation, function or operator of the same name. So:
   statement at the driver call and fails if any of Selecto's own, guard and
   catalog SQL included, would resolve by name; the host's SQL is never
   rewritten.
+- **Extension operators are named only as members.** An extension's schema
+  is commonly writable, and an operator planted there resolves as readily as
+  one of the extension's own. So an operator outside pg_catalog is written
+  only when it is a `pg_depend` member of the operand type's extension for
+  those operand types; `hstore < hstore`, which the extension does not define,
+  refuses (`reason: :operator_not_member`) whatever is planted beside it, and
+  an `OPERATOR(ext.op)` already in a statement is verified the same way.
+- **Reads cannot write.** A Selecto read runs with `transaction_read_only`
+  pinned on, so a function or planted operator it reaches cannot write through
+  it; in a host transaction its savepoint ends by ROLLBACK TO, which restores
+  the host's setting. A read that takes row locks (`FOR UPDATE`, `FOR SHARE`)
+  stays writable, since PostgreSQL refuses those read-only. A host function
+  that writes (or `nextval`) in a domain view or custom column therefore
+  refuses in a read.
+- **EXPLAIN is a read.** `Selecto.explain/2`, `explain_analyze/2` and
+  `QueryAnalyzer` run through the same qualification, pin and session checks,
+  with the same refusals: even plain EXPLAIN evaluates operators, since a
+  selectivity estimator such as `eqsel` applies them to most-common values.
 - **uuid columns** take their text value as a uuid in reads and writes,
   whatever the field's declared type. Text that is no uuid refuses
   (`reason: :invalid_uuid`), as does a non-canonical spelling on a tenant

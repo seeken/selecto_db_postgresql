@@ -184,8 +184,14 @@ defmodule SelectoDBPostgreSQL.ExplicitOperatorLintTest do
   end
 
   test "executed-form writes name every comparison operator", %{schema: schema} do
+    # A column the compiler has no operator type for stays plain until the
+    # adapter's last step; no extension type here, so that step needs no
+    # column facts.
+    probe = fn _sql, _params -> {:ok, %{rows: [[false, "read committed", []]]}} end
+
     for sql <- write_sqls(schema) do
-      assert bare_comparisons(sql) == [], sql
+      assert {:ok, prepared} = SelectoDBPostgreSQL.ExplicitSQL.prepare(probe, sql)
+      assert bare_comparisons(prepared) == [], prepared
     end
   end
 end
