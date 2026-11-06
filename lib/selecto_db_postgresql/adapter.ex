@@ -3761,6 +3761,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
     else
       {:error, write_error(:transaction_failed, {:invalid_connection, connection})}
     end
+  catch
+    :exit, reason -> {:error, write_error(:transaction_failed, {:connection_exit, reason})}
   end
 
   defp with_ecto_transaction(repo, opts, fun) do
