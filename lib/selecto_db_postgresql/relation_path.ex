@@ -125,8 +125,8 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   # operators compare it and the operators' argument type: a domain's base
   # type (domains over domains followed), text for varchar, the type itself
   # otherwise; pg_catalog's operators for built-in, enum, range,
-  # multirange, composite and array types, the type's own schema for an
-  # extension or user base type (citext).
+  # multirange, composite and array types, the type's own schema only for
+  # a member of an extension (citext; R47: pg_depend deptype 'e').
   @types_sql """
   WITH RECURSIVE selecto_rel(name, qualified) AS (
     SELECT * FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), pg_catalog.unnest($2::pg_catalog.text[]))
@@ -148,6 +148,9 @@ defmodule SelectoDBPostgreSQL.RelationPath do
          CASE WHEN n.oid OPERATOR(pg_catalog.=) CAST(11 AS pg_catalog.oid)
                 OR t.typtype OPERATOR(pg_catalog.=) ANY (ARRAY['e', 'r', 'm', 'c']::pg_catalog."char"[])
                 OR t.typcategory OPERATOR(pg_catalog.=) 'A'
+                OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                  WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
+                    AND d.objid OPERATOR(pg_catalog.=) t.oid AND d.deptype OPERATOR(pg_catalog.=) 'e')
               THEN 'pg_catalog' ELSE pg_catalog.quote_ident(CAST(n.nspname AS pg_catalog.text)) END
            AS selecto_guard_type_schema,
          CASE WHEN t.oid OPERATOR(pg_catalog.=) CAST(1043 AS pg_catalog.oid) THEN 'pg_catalog.text'

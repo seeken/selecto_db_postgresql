@@ -605,7 +605,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
         with {:ok, before} <- read_check(guard, query),
              {:ok, pinned} <- read_step(SessionGuard.pin(guard, path)),
              :ok <- read_step(RelationPath.qualified(query)),
-             {:ok, query} <- read_step(ExplicitSQL.prepare(guard, query)),
+             {:ok, query} <-
+               read_step(ExplicitSQL.prepare(guard, query, isolation: pinned.isolation)),
              {:ok, result} <- execute.(SQLRecorder.record(query), params),
              :ok <- read_step(SessionGuard.unpin(guard, pinned, before)),
              :ok <- read_compare(guard, before),
@@ -1931,7 +1932,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # qualified (a CTE name excepted).
   defp execute_qualified(connection, sql, params, opts) do
     with :ok <- RelationPath.qualified(sql),
-         {:ok, sql} <- ExplicitSQL.prepare(&guard_statement(connection, &1, &2), sql) do
+         {:ok, sql} <-
+           ExplicitSQL.prepare(&guard_statement(connection, &1, &2), sql,
+             isolation: pinned_isolation(opts)
+           ) do
       execute_statement(connection, SQLRecorder.record(sql), params, opts)
     end
   end
@@ -1978,6 +1982,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
     case Process.get({__MODULE__, :pin, Keyword.get(opts, :selecto_session_key)}) do
       {_path, pinned} -> pinned
       nil -> nil
+    end
+  end
+
+  defp pinned_isolation(opts) do
+    case pinned_value(opts) do
+      %{isolation: isolation} -> isolation
+      _none -> nil
     end
   end
 
@@ -3758,7 +3769,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
                 with :ok <- RelationPath.qualified(query),
                      {:ok, before} <- SessionGuard.check(check, query),
                      {:ok, pinned} <- SessionGuard.pin(check, read_path(opts)),
-                     {:ok, prepared} <- ExplicitSQL.prepare(check, query) do
+                     {:ok, prepared} <-
+                       ExplicitSQL.prepare(check, query, isolation: pinned.isolation) do
                   {before, pinned, SQLRecorder.record(prepared)}
                 else
                   error -> refuse.(error)
