@@ -1476,7 +1476,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
       :materialized_view_refresh,
       :materialized_view_refresh_concurrently,
       :projection_sum,
-      :execute_timeout
+      :execute_timeout,
+      :exact_instant_comparisons
     ]
   end
 

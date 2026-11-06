@@ -32,6 +32,64 @@ defmodule SelectoDBPostgreSQL.Dialect do
     "utc_datetime" => "TIMESTAMPTZ"
   }
 
+  if {:render_instant_comparison, 2} in Selecto.DB.Dialect.behaviour_info(:callbacks) do
+    @impl true
+  end
+
+  def render_instant_comparison(
+        %{
+          __struct__: Selecto.Dialect.Instant.Comparison,
+          operation: operation,
+          expression: expression,
+          value: {:param, decimal},
+          source_type: type,
+          storage: storage
+        } = fragment,
+        _selecto
+      )
+      when map_size(fragment) == 6 and operation in [:eq, :ne, :gt, :gte, :lt, :lte] and
+             type in [:utc_datetime, :timestamptz, :epoch_datetime] and
+             storage in [nil, :naive_utc] and
+             is_binary(decimal) and byte_size(decimal) <= 32 do
+    if computed_expression?(expression) and
+         Regex.match?(~r/\A-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?\z/, decimal) do
+      operator = %{eq: "=", ne: "<>", gt: ">", gte: ">=", lt: "<", lte: "<="}[operation]
+
+      clock =
+        if storage == :naive_utc, do: expression, else: ["(", expression, " AT TIME ZONE 'UTC')"]
+
+      left =
+        if type == :epoch_datetime do
+          ["CAST(", expression, " AS NUMERIC)"]
+        else
+          [
+            "((CAST(TO_CHAR(",
+            clock,
+            ", 'J') AS NUMERIC) - 2440588) * 86400 + CAST(TO_CHAR(",
+            clock,
+            ", 'SSSS.US') AS NUMERIC))"
+          ]
+        end
+
+      # The AST carries canonical decimal text. Postgrex must infer TEXT for
+      # that parameter before PostgreSQL converts it to exact NUMERIC; an
+      # inferred NUMERIC bind requires a driver-native Decimal instead.
+      {:ok,
+       ["(", left, " ", operator, " CAST(CAST(", {:param, decimal}, " AS TEXT) AS NUMERIC))"]}
+    else
+      invalid_instant_comparison()
+    end
+  end
+
+  def render_instant_comparison(_, _), do: invalid_instant_comparison()
+
+  defp invalid_instant_comparison do
+    {:error,
+     Selecto.Error.validation_error("Invalid PostgreSQL exact instant comparison", %{
+       unsupported_feature: :exact_instant_comparisons
+     })}
+  end
+
   # Older Core pins do not declare this optional callback. A module-tagged map
   # with the exact fragment shape lets this companion ship before newer Core.
   if {:render_computed_value, 2} in Selecto.DB.Dialect.behaviour_info(:callbacks) do
