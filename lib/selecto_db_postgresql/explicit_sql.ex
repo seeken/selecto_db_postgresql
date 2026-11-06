@@ -521,7 +521,11 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
 
       expected = Enum.map(pairs, fn {_, _, oid} -> String.to_integer(oid) end)
 
-      case execute.("SELECT ARRAY[#{select}] AS selecto_guard_column_types", []) do
+      # A fresh text each time: a cached prepared statement would keep the
+      # type it was parsed with (a rowtype cast holds no plan dependency).
+      nonce = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+      case execute.("SELECT ARRAY[#{select}] AS selecto_guard_column_types /* #{nonce} */", []) do
         {:ok, %{rows: [[^expected]]}} ->
           :ok
 
