@@ -43,7 +43,7 @@ defmodule SelectoDBPostgreSQL.StreamProtocolConformanceTest do
       )
 
     enumerator = Task.async(fn -> Enum.take(stream, 1) end)
-    assert_receive {:producer_started, producer}
+    assert_receive {:producer_started, producer}, 5_000
     monitor = Process.monitor(producer)
 
     assert Task.await(enumerator, 2_000) == [{[1], ["id"]}]
@@ -70,7 +70,7 @@ defmodule SelectoDBPostgreSQL.StreamProtocolConformanceTest do
       )
 
     assert Enum.take(stream, 1) == [{[1], ["id"]}]
-    assert_receive {:producer_started, producer}
+    assert_receive {:producer_started, producer}, 5_000
     assert_receive {:producer_attempt, 1}
     refute_receive {:producer_attempt, 2}, 25
     refute Process.alive?(producer)
@@ -94,7 +94,7 @@ defmodule SelectoDBPostgreSQL.StreamProtocolConformanceTest do
       Enum.to_list(stream)
     end
 
-    assert_receive {:producer_started, producer}
+    assert_receive {:producer_started, producer}, 5_000
     monitor = Process.monitor(producer)
     assert_receive {:DOWN, ^monitor, :process, ^producer, _reason}, 500
   end

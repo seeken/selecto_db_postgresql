@@ -826,6 +826,9 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       assert {:error, %{details: %{reason: :sql_unprovable}}} = read.(sql), sql
     end
 
+    assert {:ok, %{rows: [[1], [3], [5]]}} =
+             read.("SELECT id FROM items WHERE ('MIXED') = ci ORDER BY id")
+
     # Direct comparisons are proved; a statement with no extension type is free.
     assert {:ok, %{rows: [[1], [3], [5]]}} =
              read.("SELECT id FROM items WHERE ci = 'MIXED' ORDER BY id")
