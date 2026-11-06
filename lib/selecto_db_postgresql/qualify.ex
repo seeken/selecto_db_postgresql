@@ -1124,8 +1124,14 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
     {args, st} =
       Enum.map_reduce(ranges, st, fn {from, to}, st ->
+        # DISTINCT or ALL before an aggregate's argument is syntax.
+        {prefix, from} =
+          if upper(tok(st, from)) in ~w(DISTINCT ALL),
+            do: {text(tok(st, from)) <> " ", from + 1},
+            else: {"", from}
+
         {sql, st} = sequence(%{st | pos: from, limit: to}, nil)
-        {%{sql: sql, lone: st.lone}, st}
+        {%{sql: sql, prefix: prefix, lone: st.lone}, st}
       end)
 
     {args, %{st | limit: saved}}
@@ -1139,6 +1145,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
     {args, st} = arguments(st, argument_ranges(st, open, close))
     st = %{st | pos: close + 1}
     previous = tok(st, here - 1)
+    refuse_open_extension_call(st, names, args, mark)
     from? = upper(previous) in ~w(FROM JOIN LATERAL) or previous == {:punct, ","}
 
     {call, st} =
@@ -1159,10 +1166,42 @@ defmodule SelectoDBPostgreSQL.Qualify do
     postfix(st, Map.put(call, :sql, sql), mark)
   end
 
+  # A call an extension defines for a type read inside its first argument,
+  # when that argument is an expression this emitter cannot type: PostgreSQL
+  # may choose the extension's function. Refused, never pg_catalog's (R49c).
+  defp refuse_open_extension_call(%{scopes: nil}, _names, _args, _mark), do: :ok
+
+  defp refuse_open_extension_call(st, [name], [%{lone: lone} | _], mark)
+       when is_nil(lone) or is_map_key(lone, :refs) do
+    key = String.downcase(unquote_name(name))
+    typed? = lone != nil and match?(%{entry: _}, class_of(st, lone))
+
+    open? =
+      st.refs
+      |> Enum.drop(mark)
+      |> Enum.any?(fn ref ->
+        case ref_class(st, ref.column) do
+          %{entry: entry} -> Map.has_key?(entry.fns, key)
+          _ -> false
+        end
+      end)
+
+    if open? and not typed?,
+      do:
+        refuse(
+          :operand_type_unknown,
+          "a function an extension defines over an expression that could not be typed"
+        )
+
+    :ok
+  end
+
+  defp refuse_open_extension_call(_st, _names, _args, _mark), do: :ok
+
   defp plain_call(names, args),
     do: %{sql: "#{join_names(names)}(#{join_args(args)})"}
 
-  defp join_args(args), do: Enum.map_join(args, ", ", & &1.sql)
+  defp join_args(args), do: Enum.map_join(args, ", ", &(&1.prefix <> &1.sql))
 
   defp bare_call(st, name, args) do
     key = String.downcase(unquote_name(name))
@@ -1325,7 +1364,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
     cast =
       args
       |> Enum.zip(function.args)
-      |> Enum.map_join(", ", fn {arg, type} -> "CAST((#{arg.sql}) AS #{type})" end)
+      |> Enum.map_join(", ", fn {arg, type} -> "#{arg.prefix}CAST((#{arg.sql}) AS #{type})" end)
 
     sql = "#{quote_name(function.schema)}.#{text(name)}(#{cast})"
     if function.self, do: %{sql: sql, entry: entry}, else: %{sql: sql, known: true}
@@ -2151,8 +2190,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
     before = if count >= 2, do: Enum.at(tokens, -2)
 
     alias_name =
-      if count >= 2 and name_token?(last) and (upper(before) == "AS" or before == {:punct, ")"}),
-        do: unquote_name(last)
+      if count >= 2 and name_token?(last) and alias_before?(before), do: unquote_name(last)
 
     body =
       cond do
@@ -2187,6 +2225,12 @@ defmodule SelectoDBPostgreSQL.Qualify do
         computed_entry(st, hd(item), hd(item) + length(body) - 1)
     end
   end
+
+  # `expr AS alias` and the bare `expr alias`.
+  defp alias_before?({:punct, p}), do: p in [")", "]"]
+  defp alias_before?({kind, _}) when kind in [:num, :str, :param, :qid], do: true
+  defp alias_before?({:id, _} = token), do: upper(token) == "AS" or not keyword_token?(token)
+  defp alias_before?(_token), do: false
 
   # A passthrough item: a [b.]c, in any redundant parentheses.
   defp passthrough_chain(body) do
