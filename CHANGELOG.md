@@ -4,6 +4,22 @@ CHANGES
 Unreleased
 ----------
 
+- Every generated statement passes through one qualifying emitter
+  (`SelectoDBPostgreSQL.Qualify`): operators, by-name constructs and functions
+  are written explicitly, and the tagging, hierarchy, OLAP and enhanced-join
+  builders run instead of being refused. Extension-schema operators and
+  functions cast their operands to the member type; an operand that may be an
+  extension type but cannot be resolved refuses (`operand_type_unknown`). Column
+  types are verified through the parser outside READ COMMITTED.
+
+- Selecto's catalog SQL (function verification, column catalog, introspection)
+  names its operators. `column_catalog/2` resolves its relation as the write
+  will: a temp namesake no longer changes the answer, and `pg_temp.<name>`
+  declares a temp table.
+
+- uuid and domain-over-uuid columns accept text in guarded writes and scope
+  compares; text that is no uuid refuses typed (`invalid_uuid`).
+
 - Bind domain-typed ISO temporal values as Postgrex date/time values in writes
   and compare predicates. Date-shaped text fields remain text, and malformed
   temporal literals fail compilation before dispatch.
