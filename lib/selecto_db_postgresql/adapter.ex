@@ -310,7 +310,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     relations =
       case Keyword.get(opts, :selecto_qualified_relations) do
         relations when is_map(relations) ->
-          with_generated_relations(connection, query, relations)
+          {:ok, relations}
 
         _ ->
           # R42 FINAL: hand-built SQL refuses while any temp relation exists,
@@ -338,20 +338,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
     else
       {:error, %Error{} = error} -> {:error, read_refusal(error)}
       {:error, _} = error -> error
-    end
-  end
-
-  # A relation the compile names beyond the domain's own (a tagging join's
-  # junction table, a closure table) resolves by the same rules.
-  defp with_generated_relations(connection, query, relations) do
-    case Enum.reject(RelationPath.names(query), &Map.has_key?(relations, &1)) do
-      [] ->
-        {:ok, relations}
-
-      names ->
-        with {:ok, extra} <- resolve_all(connection, names) do
-          {:ok, Map.merge(extra, relations)}
-        end
     end
   end
 

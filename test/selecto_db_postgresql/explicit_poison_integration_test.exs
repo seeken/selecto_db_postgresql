@@ -742,6 +742,70 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     end
   end
 
+  test "uuid and domain-over-uuid tenants: text binds, no uuid refuses, typed", %{opts: opts} do
+    u1 = "0000000a-0000-0000-0000-000000000001"
+    {:ok, admin} = Adapter.connect(opts)
+
+    for sql <- [
+          "CREATE DOMAIN udom AS uuid",
+          "CREATE TABLE ut (id int PRIMARY KEY, org uuid NOT NULL, d udom, note text)"
+        ],
+        do: exec!(admin, sql)
+
+    try do
+      {:ok, c} = Adapter.connect(opts)
+
+      insert = fn value ->
+        {:ok, command} =
+          Command.new(%{
+            operation: :insert,
+            relation: "ut",
+            assignments: [
+              %{field: "id", value: {:literal, 1}},
+              %{field: "org", value: {:literal, value}},
+              %{field: "d", value: {:literal, value}}
+            ],
+            metadata: %{tenant_fields: ["org"]}
+          })
+
+        Adapter.execute_write_unsafe(c, command, [])
+      end
+
+      for bad <- ["not-a-uuid", String.upcase(u1)] do
+        assert {:error, %{details: %{reason: :invalid_uuid}}} = insert.(bad)
+      end
+
+      assert {:ok, %{affected_rows: 1}} = insert.(u1)
+
+      columns = %{
+        id: %{type: :integer},
+        org: %{type: :string},
+        d: %{type: :string},
+        note: %{type: :string}
+      }
+
+      domain = %{name: "ut", source: rel("ut", columns), schemas: %{}, joins: %{}}
+
+      read = fn tenant ->
+        domain
+        |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
+        |> Selecto.with_tenant(tenant)
+        |> Selecto.select(["id"])
+        |> Selecto.filter({"d", u1})
+        |> run()
+      end
+
+      assert read.(u1) == {:ok, [[1]]}
+      assert read.("0000000a-0000-0000-0000-000000000002") == {:ok, []}
+      assert read.("not-a-uuid") == {:refused, :invalid_uuid}
+      GenServer.stop(c)
+    after
+      exec!(admin, "DROP TABLE ut")
+      exec!(admin, "DROP DOMAIN udom")
+      GenServer.stop(admin)
+    end
+  end
+
   test "Selecto's introspection resolves nothing by name, under plants", %{opts: opts} do
     {:ok, admin} = Adapter.connect(opts)
     for sql <- plants(), do: exec!(admin, sql)
