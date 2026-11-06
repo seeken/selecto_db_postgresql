@@ -21,7 +21,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   # refuses.
 
   alias Selecto.Write.Error
-  alias SelectoDBPostgreSQL.Qualify
+  alias SelectoDBPostgreSQL.{Qualify, SessionGuard}
 
   @op "OPERATOR(pg_catalog.=)"
   @type_class "CAST('pg_catalog.pg_type' AS pg_catalog.regclass)"
@@ -286,6 +286,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   def prepare(execute, sql, opts \\ []) do
     sql = IO.iodata_to_binary(sql)
     verify? = Keyword.get(opts, :isolation) not in [nil, "read committed"]
+    execute = standing(execute)
 
     try do
       hand_built? = Keyword.get(opts, :hand_built) == true
@@ -312,6 +313,16 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
       end
     catch
       {:qualify_refuse, reason, message} -> refuse(reason, message)
+      {:explicit_standing, failure} -> failure
+    end
+  end
+
+  # A cancel or a lost connection during a catalog read is what the caller is
+  # told, not that the catalog could not be read.
+  defp standing(execute) do
+    fn sql, params ->
+      result = execute.(sql, params)
+      if SessionGuard.standing(result), do: throw({:explicit_standing, result}), else: result
     end
   end
 

@@ -4,6 +4,17 @@ CHANGES
 Unreleased
 ----------
 
+- Text is hand-built unless Selecto's executor stamped it `selecto_generated`.
+  A rewrite of hand-built text that PostgreSQL cannot parse refuses
+  `:sql_unprovable`.
+- Generated SQL: citext against `websearch_to_tsquery` and the like resolves to
+  pg_catalog's text `@@`; a column through a `SELECT *` CTE (materialized-path
+  joins) keeps its type; `upper(citext)` and two bare literals under NULLIF are
+  text, so GREATEST, LEAST, COALESCE and CASE mixing them with citext answer.
+- A cancel, a lock timeout or a lost connection during a session or catalog read
+  is what the caller is told, never `relation_unresolved` or
+  `session_state_unavailable`.
+
 - Hand-built SQL and raw text inside a generated read are no longer typed: one
   touching an extension type through a cast, subscript, COALESCE, CASE, GREATEST,
   LEAST, NULLIF, subquery or set operation refuses `:sql_unprovable`; builders

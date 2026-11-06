@@ -1471,6 +1471,10 @@ defmodule SelectoDBPostgreSQL.Qualify do
       untyped? and second[:unknown] == true ->
         %{unknown: true}
 
+      # Two bare literals are text.
+      untyped? and second[:untyped] == true ->
+        %{known: true, type: "pg_catalog.text"}
+
       true ->
         string_result(first)
     end
@@ -1801,6 +1805,13 @@ defmodule SelectoDBPostgreSQL.Qualify do
     }
   end
 
+  # An argument of a string-category extension type reaches pg_catalog's string
+  # overloads through its implicit cast.
+  defp string_category?(st, %{lone: lone}) when not is_nil(lone),
+    do: match?(%{entry: %{category: "S"}}, class_of(st, lone))
+
+  defp string_category?(_st, _arg), do: false
+
   # Strings into a function with overloads for strings: those overloads'
   # result, where the overloads together do not say (lower: text or a range).
   defp string_call(%{type: nil} = call, st, args, candidates) do
@@ -1808,7 +1819,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
       args != [] and
         Enum.all?(args, fn arg ->
           case argument_fact(st, arg) do
-            {:type, type} -> plain_type(type) in @string_types
+            {:type, type} -> plain_type(type) in @string_types or string_category?(st, arg)
             :untyped -> true
             _open -> false
           end
@@ -2506,6 +2517,13 @@ defmodule SelectoDBPostgreSQL.Qualify do
   # both to text's.
   defp string_pair?(name, %{entry: %{category: "S"}}, %{entry: %{category: "S"}}),
     do: name in ["||", "^@"]
+
+  # A text search: pg_catalog's text @@ tsquery is what citext resolves to.
+  defp string_pair?("@@", %{entry: %{category: "S"}}, %{type: type}),
+    do: plain_type(type) == "pg_catalog.tsquery"
+
+  defp string_pair?("@@", %{type: type}, %{entry: %{category: "S"}}),
+    do: plain_type(type) == "pg_catalog.tsquery"
 
   defp string_pair?(_name, _left, _right), do: false
 
@@ -3272,10 +3290,33 @@ defmodule SelectoDBPostgreSQL.Qualify do
   defp output_column(st, scope, cols, column, guard) do
     items = Map.fetch!(st.scopes.scopes, scope).items
 
-    items
-    |> Enum.with_index()
-    |> Enum.find_value(fn {item, index} ->
-      output_item(st, scope, item, index, cols, column, guard)
+    found =
+      items
+      |> Enum.with_index()
+      |> Enum.find_value(fn {item, index} ->
+        output_item(st, scope, item, index, cols, column, guard)
+      end)
+
+    if found == nil and is_nil(cols),
+      do: star_column(st, scope, items, column, guard),
+      else: found
+  end
+
+  # SELECT *, ... : a column no item names comes through the star from the
+  # scope's own sources. A rename list counts positions, which a star hides.
+  defp star_column(st, scope, items, column, guard) do
+    Enum.find_value(items, fn item ->
+      case Enum.map(item, &stok(st.scopes, &1)) do
+        [{:op, "*"}] ->
+          resolve_in(st, scope, nil, column, guard + 1)
+
+        [source, {:punct, "."}, {:op, "*"}] ->
+          if name_token?(source),
+            do: resolve_in(st, scope, unquote_name(source), column, guard + 1)
+
+        _other ->
+          nil
+      end
     end)
   end
 
