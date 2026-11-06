@@ -460,7 +460,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         in_transaction?,
         query,
         params,
-        read_path(opts)
+        read_plan(opts)
       )
     end
 
@@ -508,7 +508,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
           false,
           query,
           params,
-          read_path(opts)
+          read_plan(opts)
         )
     end
   end
@@ -537,7 +537,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
           in_transaction?,
           query,
           params,
-          read_path(opts)
+          read_plan(opts)
         )
       end,
       Keyword.take(opts, [:timeout, :deadline, :queue_target, :queue_interval])
@@ -571,7 +571,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
           in_transaction?,
           query,
           params,
-          read_path(opts)
+          read_plan(opts)
         )
       end,
       # A checked-out connection runs under its checkout's deadline.
@@ -589,13 +589,21 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # same expression that checks the pin held. Both run inside the read's own
   # savepoint (host transaction) or its own transaction (autocommit), so a
   # failure or a refusal rolls back every setting the statement changed.
-  defp run_guarded_read(execute, guard, in_transaction?, query, params, path) do
+  #
+  # A read is READ ONLY (transaction_read_only pinned with the rest), so a
+  # function it reaches cannot write through it; a row-locking read cannot
+  # be. In a host transaction the setting outlives RELEASE, so a read-only
+  # savepoint always ends by ROLLBACK TO: it changed nothing to keep.
+  defp run_guarded_read(execute, guard, in_transaction?, query, params, plan) do
+    read_only? = read_only?(query)
+
     {open, close, undo} =
       if in_transaction? do
         name = "selecto_read_#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}"
+        rollback = ["ROLLBACK TO SAVEPOINT " <> name, "RELEASE SAVEPOINT " <> name]
 
-        {"SAVEPOINT " <> name, ["RELEASE SAVEPOINT " <> name],
-         ["ROLLBACK TO SAVEPOINT " <> name, "RELEASE SAVEPOINT " <> name]}
+        {"SAVEPOINT " <> name, if(read_only?, do: rollback, else: ["RELEASE SAVEPOINT " <> name]),
+         rollback}
       else
         {"BEGIN", ["COMMIT"], ["ROLLBACK"]}
       end
@@ -603,11 +611,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
     case guard.(open, []) do
       {:ok, _} ->
         with {:ok, before} <- read_check(guard, query),
-             {:ok, pinned} <- read_step(SessionGuard.pin(guard, path)),
+             {:ok, pinned} <- read_step(SessionGuard.pin(guard, plan.path, read_only: read_only?)),
              :ok <- read_step(RelationPath.qualified(query)),
              {:ok, query} <-
                read_step(ExplicitSQL.prepare(guard, query, isolation: pinned.isolation)),
-             {:ok, result} <- execute.(query, params),
+             {:ok, result} <- read_result(execute.(plan.prefix <> query, params)),
              :ok <- read_step(SessionGuard.unpin(guard, pinned, before)),
              :ok <- read_compare(guard, before),
              :ok <- run_all(guard, close) do
@@ -621,6 +629,32 @@ defmodule SelectoDBPostgreSQL.Adapter do
       {:error, _} = error ->
         error
     end
+  end
+
+  defp read_only?(query) do
+    not Regex.match?(
+      ~r/\bFOR\s+(?:NO\s+KEY\s+)?(?:KEY\s+)?(?:UPDATE|SHARE)\b/i,
+      IO.iodata_to_binary(query)
+    )
+  end
+
+  # No operator or function for the operands (an extension type without a
+  # member for that operator): typed, like every other refusal of this step.
+  defp read_result({:error, %Postgrex.Error{postgres: %{code: :undefined_function}}}),
+    do: {:error, read_refusal(no_operator())}
+
+  defp read_result(result), do: result
+
+  defp no_operator do
+    Error.new(
+      :query_enforcement,
+      "PostgreSQL has no operator or function for these operands",
+      details: %{
+        code: :query_rule_not_evaluable,
+        reason: :operator_not_member,
+        adapter: :postgresql
+      }
+    )
   end
 
   defp run_all(guard, statements) do
@@ -640,6 +674,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # resolved for it.
   defp read_path(opts),
     do: RelationPath.pinned_path(Keyword.get(opts, :selecto_qualified_relations))
+
+  defp read_plan(opts),
+    do: %{path: read_path(opts), prefix: Keyword.get(opts, :selecto_explain, "")}
+
+  @doc """
+  EXPLAIN of a Selecto read (`explain` the prefix, "EXPLAIN (...) "): the
+  statement is qualified, pinned and checked exactly as the read itself. Even
+  plain EXPLAIN evaluates operators (a selectivity estimator runs them over
+  most-common values), so a plan is no safer to ask for than the rows.
+  """
+  def explain_read(connection, query, params, explain, opts) do
+    execute(connection, query, params, Keyword.put(opts, :selecto_explain, explain))
+  end
 
   # R36: the relation lookup runs its own savepoint or transaction, so all
   # of its statements go to one connection checkout.
@@ -1513,6 +1560,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
     |> case do
       {:ok, result} -> {:ok, result}
+      # A typed refusal stays what it is.
+      {:error, %Error{} = error} -> {:error, error}
       {:error, reason} -> {:error, write_error(:candidate_state_load_failed, reason)}
     end
   end
@@ -1759,16 +1808,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # relation first, returns its rows' keys and is re-read by them
   # after the statement (SelectoDBPostgreSQL.PostImage).
   defp execute_guarded_statement(connection, command, statement, opts) do
-    check = fn sql, params ->
-      execute_statement(
-        connection,
-        sql,
-        params,
-        Keyword.take(opts, [:timeout, :log])
-      )
-    end
-
     guard = &guard_statement(connection, &1, &2)
+
+    # The re-reads carry the scope's predicates: explicit like the statement.
+    check = fn sql, params ->
+      with {:ok, sql} <- ExplicitSQL.prepare(guard, sql) do
+        execute_statement(connection, sql, params, Keyword.take(opts, [:timeout, :log]))
+      end
+    end
 
     with {:ok, session} <- write_session(guard, statement.text, opts) do
       case PostImage.prepare(command) do
@@ -1938,7 +1985,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
            ExplicitSQL.prepare(&guard_statement(connection, &1, &2), sql,
              isolation: pinned_isolation(opts)
            ) do
-      execute_statement(connection, sql, params, opts)
+      case execute_statement(connection, sql, params, opts) do
+        {:error, %Postgrex.Error{postgres: %{code: :undefined_function}}} ->
+          {:error, no_operator()}
+
+        result ->
+          result
+      end
     end
   end
 
@@ -3651,6 +3704,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
     Error.adapter_failure(type, :postgresql, reason, "PostgreSQL write failed")
   end
 
+  defp write_error(type, reason, _command) when not is_struct(reason, Postgrex.Error),
+    do: write_error(type, reason)
+
   defp write_error(type, %Postgrex.Error{} = reason, command) do
     native = Map.get(reason, :postgres) || %{}
     category = normalize_error_category(Map.get(native, :code) || Map.get(native, :pg_code))
@@ -3778,7 +3834,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
               if guarded? do
                 with :ok <- RelationPath.qualified(query),
                      {:ok, before} <- SessionGuard.check(check, query),
-                     {:ok, pinned} <- SessionGuard.pin(check, read_path(opts)),
+                     {:ok, pinned} <-
+                       SessionGuard.pin(check, read_path(opts), read_only: read_only?(query)),
                      {:ok, prepared} <-
                        ExplicitSQL.prepare(check, query, isolation: pinned.isolation) do
                   {before, pinned, prepared}

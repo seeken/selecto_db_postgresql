@@ -4,6 +4,13 @@ CHANGES
 Unreleased
 ----------
 
+- An operator outside pg_catalog is named only when it is a member of the
+  operand type's extension for those operand types; an explicit one is
+  verified. Selecto reads run READ ONLY. `explain/2`, `explain_analyze/2` and
+  QueryAnalyzer run through the read's qualification, pin and checks;
+  `get_query_plan/2` no longer sends TIMING without ANALYZE. The lint exempts
+  `name =` only in SET lists. Overloads of one extension resolve in its schema.
+
 - Every generated statement passes through one qualifying emitter
   (`SelectoDBPostgreSQL.Qualify`): operators, by-name constructs and functions
   are written explicitly, and the tagging, hierarchy, OLAP and enhanced-join

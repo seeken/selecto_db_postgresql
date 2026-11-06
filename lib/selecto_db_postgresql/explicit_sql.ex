@@ -71,7 +71,10 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
              CASE WHEN CAST(p.prorettype AS pg_catalog.regtype) #{@op} ANY (#{@any_result})
                     AND EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) AS a(t)
                       WHERE CAST(a.t AS pg_catalog.regtype) #{@op} ANY (#{@any_argument}))
-               THEN 'polymorphic' ELSE '' END)
+               THEN 'polymorphic' ELSE '' END,
+             (SELECT #{@quoted_argument} FROM pg_catalog.pg_type t
+              JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} t.typnamespace
+              WHERE t.oid #{@op} p.prorettype))
            FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), pg_catalog.unnest($2::pg_catalog.text[])) AS k(sch, name)
            JOIN pg_catalog.pg_proc p ON CAST(p.proname AS pg_catalog.text) #{@op} k.name
            JOIN pg_catalog.pg_namespace n ON n.oid #{@op} p.pronamespace
@@ -126,10 +129,20 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   @none "CAST(NULL AS pg_catalog.text)"
   @no_args "CAST(NULL AS pg_catalog.text[])"
 
+  # An operator's two argument types, quoted.
+  @operator_sides "ARRAY[" <>
+                    "(SELECT #{@quoted_argument} FROM pg_catalog.pg_type t " <>
+                    "JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} t.typnamespace WHERE t.oid #{@op} o.oprleft), " <>
+                    "(SELECT #{@quoted_argument} FROM pg_catalog.pg_type t " <>
+                    "JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} t.typnamespace WHERE t.oid #{@op} o.oprright)]"
+
   @columns_rows """
   SELECT 'col' AS selecto_guard_fact, CAST(a.rel AS pg_catalog.text) AS selecto_guard_fact_relation,
     CAST(a.attname AS pg_catalog.text) AS selecto_guard_fact_column,
-    CAST(a.atttypid AS pg_catalog.text) AS selecto_guard_fact_name, #{@none} AS selecto_guard_fact_schema,
+    CAST(a.atttypid AS pg_catalog.text) AS selecto_guard_fact_name,
+    (SELECT #{@quoted_argument} FROM pg_catalog.pg_type t
+     JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} t.typnamespace
+     WHERE t.oid #{@op} a.atttypid) AS selecto_guard_fact_schema,
     #{@no_args} AS selecto_guard_fact_arguments FROM a
   UNION ALL
   SELECT 'deep', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), #{@none}, #{@none}, #{@no_args}
@@ -137,8 +150,10 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   WHERE c.depth #{@op} 16
   UNION ALL
   SELECT CASE WHEN e.arr THEN 'eop' ELSE 'op' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
-    CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text), #{@no_args}
-  FROM e JOIN pg_catalog.pg_operator o ON o.oprleft #{@op} e.oid AND o.oprright #{@op} e.oid
+    CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text), #{@operator_sides}
+  FROM e JOIN pg_catalog.pg_operator o ON (o.oprleft #{@op} e.oid OR o.oprright #{@op} e.oid)
+    AND o.oprleft OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)
+    AND o.oprright OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)
   JOIN pg_catalog.pg_depend od ON od.classid #{@op} #{@operator_class}
     AND od.objid #{@op} o.oid AND od.deptype #{@op} 'e' AND od.refobjid #{@op} e.refobjid
   JOIN pg_catalog.pg_namespace n ON n.oid #{@op} o.oprnamespace
@@ -224,12 +239,14 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   SELECT 'typ' AS selecto_guard_cast_fact, e.name AS selecto_guard_cast_key,
     pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
       pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))) AS selecto_guard_cast_name,
-    #{@none} AS selecto_guard_cast_schema
+    #{@none} AS selecto_guard_cast_schema, #{@no_args} AS selecto_guard_cast_arguments
   FROM e JOIN pg_catalog.pg_type ty ON ty.oid #{@op} e.oid
   JOIN pg_catalog.pg_namespace tn ON tn.oid #{@op} ty.typnamespace
   UNION ALL
-  SELECT 'op', e.name, CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
-  FROM e JOIN pg_catalog.pg_operator o ON o.oprleft #{@op} e.oid AND o.oprright #{@op} e.oid
+  SELECT 'op', e.name, CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text), #{@operator_sides}
+  FROM e JOIN pg_catalog.pg_operator o ON (o.oprleft #{@op} e.oid OR o.oprright #{@op} e.oid)
+    AND o.oprleft OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)
+    AND o.oprright OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)
     AND o.oprnamespace #{@op} e.typnamespace
   JOIN pg_catalog.pg_depend od ON od.classid #{@op} #{@operator_class}
     AND od.objid #{@op} o.oid AND od.deptype #{@op} 'e' AND od.refobjid #{@op} e.refobjid
@@ -252,7 +269,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
       tokens = Qualify.tokenize(sql)
 
       cond do
-        Qualify.lint(tokens) != [] -> rewrite(execute, tokens)
+        Qualify.rewrite?(tokens) -> rewrite(execute, tokens)
         verify? -> with {:ok, _} <- facts(execute, tokens), do: {:ok, sql}
         true -> {:ok, sql}
       end
@@ -290,6 +307,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     case execute.(@probe_sql, [Enum.map(keys, &elem(&1, 0)), Enum.map(keys, &elem(&1, 1))]) do
       {:ok, %{rows: [[extension_types, isolation, candidates]]}} ->
         functions = functions(candidates)
+        required = Map.update!(required, :casts, &Map.merge(&1, result_types(functions)))
 
         if not extension_types and isolation == "read committed" do
           {:ok, %{functions: functions, extension: false}}
@@ -302,9 +320,20 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     end
   end
 
+  # The non-catalog types candidates return, keyed as a cast is.
+  defp result_types(functions) do
+    for {_key, info} <- functions,
+        %{ret: ret, schema: schema} <- info.candidates,
+        schema != "pg_catalog",
+        not String.starts_with?(ret, "pg_catalog."),
+        into: %{} do
+      {ret |> relation_key(), ret}
+    end
+  end
+
   defp functions(candidates) do
     Enum.reduce(candidates, %{}, fn row, acc ->
-      [sch, name, schema, nargs, defaults, args, variadic, member, extension, polymorphic] =
+      [sch, name, schema, nargs, defaults, args, variadic, member, extension, polymorphic, ret] =
         String.split(row, <<31>>)
 
       key = if sch == "", do: name, else: {sch, name}
@@ -316,7 +345,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
         args: if(args == "", do: [], else: String.split(args, <<30>>)),
         variadic: if(variadic == "", do: nil, else: variadic),
         member: member == "member",
-        extension: if(extension == "", do: nil, else: extension)
+        extension: if(extension == "", do: nil, else: extension),
+        ret: ret
       }
 
       polymorphic? = polymorphic == "polymorphic" and schema == "pg_catalog"
@@ -383,12 +413,12 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
 
   defp decode_row(["deep" | _], _acc), do: :deep
 
-  defp decode_row(["col", relation, column, oid, _, _], acc) do
+  defp decode_row(["col", relation, column, oid, type, _], acc) do
     acc
     |> Map.update!(:types, fn types ->
       Map.update(types, relation, %{column => oid}, &Map.put(&1, column, oid))
     end)
-    |> update_column(relation, column, & &1)
+    |> update_column(relation, column, &Map.put(&1, :type, &1.type || type))
   end
 
   defp decode_row(["fun", _, name, _, state, _], acc) do
@@ -413,9 +443,10 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     end)
   end
 
+  # After its fcol row or before: the type fills in when the rowset finishes.
   defp decode_row(["fop", position, name, op, schema, _], acc) do
     update_rowset_column(acc, name, position, fn entry ->
-      %{entry | ops: Map.put(entry.ops, op, quote_identifier(schema))}
+      %{entry | ops: put_operator(entry.ops, op, schema, :own, :own)}
     end)
   end
 
@@ -425,7 +456,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     update = fn entry ->
       case String.trim_leading(kind, "e") do
         "typ" -> %{entry | type: name}
-        "op" -> %{entry | ops: Map.put(entry.ops, name, quote_identifier(schema))}
+        "op" -> %{entry | ops: put_operator(entry.ops, name, schema, hd(args), List.last(args))}
         "fn" -> %{entry | fns: put_function(entry.fns, name, schema, args)}
       end
     end
@@ -437,6 +468,20 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
         do: %{entry | elem: update.(entry.elem || new_entry())},
         else: update.(entry)
     end)
+  end
+
+  defp put_operator(ops, name, schema, left, right) do
+    operator = %{schema: quote_identifier(schema), left: left, right: right}
+    Map.update(ops, name, [operator], &[operator | &1])
+  end
+
+  defp own_sides(entry) do
+    ops =
+      Map.new(entry.ops, fn {name, operators} ->
+        {name, Enum.map(operators, &%{&1 | left: entry.type, right: entry.type})}
+      end)
+
+    %{entry | ops: ops}
   end
 
   defp put_function(fns, name, schema, args) do
@@ -473,7 +518,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
       cols =
         if map_size(rowset.cols) == 0,
           do: nil,
-          else: rowset.cols |> Enum.sort() |> Enum.map(&elem(&1, 1))
+          else: rowset.cols |> Enum.sort() |> Enum.map(&own_sides(elem(&1, 1)))
 
       {name, %{state: Map.get(rowset, :state, :unknown), cols: cols}}
     end)
@@ -548,12 +593,12 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
       {:ok, %{rows: rows}} when is_list(rows) ->
         {:ok,
          Enum.reduce(rows, %{}, fn
-           ["typ", key, name, _], acc ->
+           ["typ", key, name, _, _], acc ->
              Map.update(acc, key, %{new_entry() | type: name}, &%{&1 | type: name})
 
-           ["op", key, op, schema], acc ->
+           ["op", key, op, schema, [left, right]], acc ->
              entry = Map.get(acc, key, new_entry())
-             Map.put(acc, key, %{entry | ops: Map.put(entry.ops, op, quote_identifier(schema))})
+             Map.put(acc, key, %{entry | ops: put_operator(entry.ops, op, schema, left, right)})
          end)}
 
       _other ->

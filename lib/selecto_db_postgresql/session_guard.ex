@@ -276,8 +276,15 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   `{:ok, pinned}`, each setting's value as the server normalised it, and
   `:isolation`, the transaction's level (R49a).
   """
-  def pin(execute, path) do
+  def pin(execute, path, opts \\ []) do
     names = ["search_path" | @pinned]
+
+    read_only =
+      if Keyword.get(opts, :read_only) == true,
+        do:
+          ", pg_catalog.set_config('transaction_read_only', 'on', true) " <>
+            "AS selecto_guard_pin_read_only",
+        else: ""
 
     reset = fn name ->
       "(SELECT s.reset_val FROM pg_catalog.pg_settings s " <>
@@ -290,12 +297,13 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
         Enum.map_join(Enum.with_index(@pinned, 1), ", ", fn {name, index} ->
           "pg_catalog.set_config('#{name}', #{reset.(name)}, true) AS selecto_guard_pin_#{index}"
         end) <>
-        ", pg_catalog.current_setting('transaction_isolation') AS selecto_guard_pin_isolation"
+        ", pg_catalog.current_setting('transaction_isolation') AS selecto_guard_pin_isolation" <>
+        read_only
 
     # An unreadable reset value (NULL, or an error) fails closed.
     case execute.(sql, [path]) do
-      {:ok, %{rows: [values]}} when length(values) == length(names) + 1 ->
-        {values, [isolation]} = Enum.split(values, length(names))
+      {:ok, %{rows: [values]}} when length(values) > length(names) ->
+        {values, [isolation | _read_only]} = Enum.split(values, length(names))
 
         if Enum.all?(values, &is_binary/1),
           do:

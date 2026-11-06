@@ -36,8 +36,7 @@ defmodule SelectoDBPostgreSQL.QueryAnalyzer do
   def analyze_query(selecto, options \\ []) do
     format = Keyword.get(options, :format, :json)
 
-    with {:ok, explain_query} <- build_explain_query(selecto, options),
-         {:ok, result} <- execute_explain(selecto, explain_query),
+    with {:ok, result} <- execute_explain(selecto, options),
          {:ok, parsed_plan} <- parse_explain_result(result, format),
          {:ok, analysis} <- analyze_plan(parsed_plan) do
       # Record metrics if collector is running
@@ -121,25 +120,17 @@ defmodule SelectoDBPostgreSQL.QueryAnalyzer do
 
   # Private functions
 
-  defp build_explain_query(selecto, options) do
-    {sql, params} = Selecto.to_sql(selecto)
-
-    # Build EXPLAIN options
-    explain_opts = build_explain_options(options)
-    explain_query = "EXPLAIN #{explain_opts} #{sql}"
-
-    {:ok, {explain_query, params}}
-  end
-
   defp build_explain_options(options) do
     format = normalize_explain_format(Keyword.get(options, :format, :json))
 
     opts = []
     opts = if Keyword.get(options, :analyze, true), do: ["ANALYZE" | opts], else: opts
+    # TIMING needs ANALYZE; EXPLAIN without it refuses the option outright.
+    analyze? = Keyword.get(options, :analyze, true)
     opts = if Keyword.get(options, :buffers, true), do: ["BUFFERS" | opts], else: opts
     opts = if Keyword.get(options, :verbose, false), do: ["VERBOSE" | opts], else: opts
     opts = if Keyword.get(options, :costs, true), do: ["COSTS" | opts], else: opts
-    opts = if Keyword.get(options, :timing, true), do: ["TIMING" | opts], else: opts
+    opts = if analyze? and Keyword.get(options, :timing, true), do: ["TIMING" | opts], else: opts
     opts = if Keyword.get(options, :summary, true), do: ["SUMMARY" | opts], else: opts
     opts = if Keyword.get(options, :settings, false), do: ["SETTINGS" | opts], else: opts
 
@@ -170,7 +161,9 @@ defmodule SelectoDBPostgreSQL.QueryAnalyzer do
   defp normalize_explain_format(format),
     do: raise(ArgumentError, "invalid EXPLAIN format #{inspect(format)}")
 
-  defp execute_explain(selecto, {query, params}) do
+  # The statement runs as the read itself would: the adapter qualifies, pins
+  # and checks it, with the same refusals (Selecto.Executor.read_statement/2).
+  defp execute_explain(selecto, options) do
     adapter = runtime_adapter(selecto)
     connection = runtime_connection(selecto)
 
@@ -179,9 +172,14 @@ defmodule SelectoDBPostgreSQL.QueryAnalyzer do
         invalid_runtime_connection?(connection) ->
           {:error, :invalid_connection}
 
-        Selecto.AdapterSupport.callback_available?(adapter, :execute_raw, 3) ->
-          case Kernel.apply(adapter, :execute_raw, [connection, query, params]) do
-            {:ok, result} -> {:ok, result}
+        Selecto.AdapterSupport.callback_available?(adapter, :explain_read, 5) ->
+          prefix = "EXPLAIN #{build_explain_options(options)} "
+
+          with {:ok, sql, params, read_opts} <- Selecto.Executor.read_statement(selecto, []),
+               {:ok, result} <-
+                 Kernel.apply(adapter, :explain_read, [connection, sql, params, prefix, read_opts]) do
+            {:ok, result}
+          else
             {:error, reason} -> {:error, {:explain_failed, reason}}
           end
 
@@ -204,6 +202,10 @@ defmodule SelectoDBPostgreSQL.QueryAnalyzer do
         end
 
       [[plan_data]] when is_map(plan_data) ->
+        {:ok, plan_data}
+
+      # Postgrex decodes a json result column.
+      [[[plan_data | _]]] when is_map(plan_data) ->
         {:ok, plan_data}
 
       _ ->

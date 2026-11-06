@@ -676,14 +676,16 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
         "<=" => "<="
       }[operator]
 
-    {schema, arg} =
-      opts
-      |> Keyword.get(:operator_types, %{})
-      |> Map.get(to_string(field), {"pg_catalog", nil})
+    case opts |> Keyword.get(:operator_types, %{}) |> Map.get(to_string(field)) do
+      {schema, arg} ->
+        cast = fn operand -> if arg, do: "CAST(#{operand} AS #{arg})", else: operand end
+        "(#{cast.(quote_field(field, opts))} OPERATOR(#{schema}.#{pg_operator}) #{cast.(right)})"
 
-    cast = fn operand -> if arg, do: "CAST(#{operand} AS #{arg})", else: operand end
-
-    "(#{cast.(quote_field(field, opts))} OPERATOR(#{schema}.#{pg_operator}) #{cast.(right)})"
+      # A column of an extension type, or one not read: the adapter's last
+      # step names the operator, or refuses (SelectoDBPostgreSQL.Qualify).
+      nil ->
+        "(#{quote_field(field, opts)} #{pg_operator} #{right})"
+    end
   end
 
   defp quote_field(field, opts) do

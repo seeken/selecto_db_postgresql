@@ -180,8 +180,13 @@ defmodule SelectoDBPostgreSQL.RelationPath do
     else
       case execute.(@types_sql, [Enum.map(pairs, &elem(&1, 0)), Enum.map(pairs, &elem(&1, 1))]) do
         {:ok, %{rows: rows}} when is_list(rows) ->
+          # A column of an extension member type is left out: its operator
+          # depends on the operands, and only the qualifier, with the
+          # type's member operators in hand, may name one (H1).
           {:ok,
-           Enum.reduce(rows, %{}, fn [name, column, schema, arg], acc ->
+           rows
+           |> Enum.filter(fn [_name, _column, schema, _arg] -> schema == "pg_catalog" end)
+           |> Enum.reduce(%{}, fn [name, column, schema, arg], acc ->
              Map.update(
                acc,
                name,
@@ -268,7 +273,7 @@ defmodule SelectoDBPostgreSQL.RelationPath do
             {:halt,
              refusal(
                :relation_ambiguous,
-               "PostgreSQL resolves a domain relation differently under the session's search_path " <>
+               "resolves a domain relation differently under the session's search_path " <>
                  "than under its reset search_path; declare the schema on the domain",
                [name]
              )}
