@@ -61,23 +61,45 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
   defp plain, do: %{ops: %{}, fns: %{}, type: nil, elem: nil, unknown: false}
 
   defp ext_facts(extra \\ %{}) do
-    max = %{schema: "ext", self: true, nargs: 1, args: [~s("ext"."citext")]}
+    ci = ~s("ext"."citext")
+    member = %{member: true, extension: "1", ret: ci}
 
-    replace = %{
-      schema: "ext",
-      self: false,
-      nargs: 3,
-      args: [~s("ext"."citext"), ~s("ext"."citext"), ~s("ext"."citext")]
-    }
+    extension =
+      functions(%{
+        "max" => %{
+          candidates: [
+            candidate("pg_catalog", %{args: ["pg_catalog.text"], ret: "pg_catalog.text"}),
+            candidate("ext", Map.merge(member, %{args: [ci]}))
+          ],
+          polymorphic: true
+        },
+        "replace" => %{
+          candidates: [
+            candidate("pg_catalog", %{
+              nargs: 3,
+              args: ~w(pg_catalog.text pg_catalog.text pg_catalog.text),
+              ret: "pg_catalog.text"
+            }),
+            candidate(
+              "ext",
+              Map.merge(member, %{nargs: 3, args: [ci, ci, ci], ret: "pg_catalog.text"})
+            )
+          ],
+          polymorphic: false
+        }
+      })
 
     Map.merge(
       %{
         extension: true,
+        functions: extension,
+        implicit: MapSet.new([{"ext.citext", "pg_catalog.text"}]),
+        casts: %{"ext.citext" => citext()},
         relations: %{
           "s.t" => %{
             "id" => plain(),
-            "name" => plain(),
-            "ci" => citext(%{"max" => [max], "replace" => [replace]}),
+            "name" => %{plain() | type: "pg_catalog.text"},
+            "ci" => citext(),
             "ci2" => citext()
           }
         }
@@ -112,7 +134,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
       for {sql, part} <- [
             {"a IN ($1, $2)",
              "((a) OPERATOR(pg_catalog.=) ($1)) OR ((a) OPERATOR(pg_catalog.=) ($2))"},
-            {"a NOT IN ($1)", "(NOT (((a) OPERATOR(pg_catalog.=) ($1))))"},
+            {"a NOT IN ($1)", "((a) OPERATOR(pg_catalog.<>) ($1))"},
+            {"a NOT IN ($1, $2)", "(NOT (((a) OPERATOR(pg_catalog.=) ($1)) OR"},
             {"a IN (SELECT 1)", "((a) OPERATOR(pg_catalog.=) ANY (SELECT 1))"},
             {"a NOT IN (SELECT 1)", "((a) OPERATOR(pg_catalog.<>) ALL (SELECT 1))"},
             {"a BETWEEN 1 AND 2",
@@ -192,7 +215,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
                 candidate("ext", %{
                   nargs: 2,
                   args: ["pg_catalog.text", "pg_catalog.text"],
-                  member: false
+                  member: true,
+                  extension: "1"
                 })
               ],
               polymorphic: false
@@ -200,8 +224,9 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
           })
       }
 
+      # `a` has no known type here: left as written, never cast to fit.
       assert qualify!("SELECT similarity(a, $1) FROM s.t", facts) =~
-               ~s|"ext"."similarity"(CAST((a) AS pg_catalog.text), CAST(($1) AS pg_catalog.text))|
+               ~s|"ext"."similarity"(a, CAST(($1) AS pg_catalog.text))|
     end
 
     test "VARIADIC: fixed arguments cast, the rest passed as VARIADIC ARRAY" do
@@ -213,7 +238,9 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
                 candidate("ext", %{
                   nargs: 2,
                   args: ["pg_catalog.int4", "pg_catalog._text"],
-                  variadic: "pg_catalog.text"
+                  variadic: "pg_catalog.text",
+                  member: true,
+                  extension: "1"
                 })
               ],
               polymorphic: false
@@ -221,8 +248,8 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
           })
       }
 
-      assert qualify!("SELECT pick(1, a, b) FROM s.t", facts) =~
-               ~s|CAST((1) AS pg_catalog.int4), VARIADIC ARRAY[CAST((a) AS pg_catalog.text), CAST((b) AS pg_catalog.text)]|
+      assert qualify!("SELECT pick(1, 'a', $1) FROM s.t", facts) =~
+               ~s|1, VARIADIC ARRAY[CAST(('a') AS pg_catalog.text), CAST(($1) AS pg_catalog.text)]|
     end
 
     test "no candidate, or two beside no catalog function, refuses" do
@@ -240,7 +267,91 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
       }
 
       assert {:error, :function_ambiguous, _} =
-               Qualify.qualify("SELECT f(a) FROM s.t", %{functions: two, extension: false})
+               Qualify.qualify("SELECT f(a) FROM s.t", %{
+                 functions: two,
+                 declared_functions: ["f"],
+                 extension: false
+               })
+    end
+
+    test "a non-member runs only as the domain declared it (R58, R60)" do
+      int = "pg_catalog.int4"
+
+      plant = %{
+        "f" => %{
+          candidates: [
+            candidate("public", %{args: [int]}),
+            candidate("lib", %{args: ["pg_catalog.int8"]})
+          ],
+          polymorphic: false
+        }
+      }
+
+      assert {:error, :function_not_member, _} =
+               Qualify.qualify("SELECT f(1::int) FROM s.t", %{functions: plant})
+
+      # A declaration of lib.f never lets public.f answer as the exact match.
+      assert {:ok, sql} =
+               Qualify.qualify("SELECT f(1::int8) FROM s.t", %{
+                 functions: plant,
+                 declared_functions: ["lib.f"]
+               })
+
+      assert sql =~ ~s("lib"."f"(CAST((1::int8)
+    end
+
+    test "a candidate is named only by exact match or as the sole one (R62)" do
+      geo = ~s("g"."geography")
+      geom = ~s("g"."geometry")
+      text = "pg_catalog.text"
+
+      entry = fn type -> %{citext() | type: type, ops: %{}} end
+
+      over = fn args -> candidate("g", %{nargs: 2, args: args, member: true, extension: "2"}) end
+
+      facts = %{
+        extension: true,
+        functions: %{
+          "st_d" => %{
+            candidates: [over.([geom, geom]), over.([geo, geo]), over.([text, text])],
+            polymorphic: false
+          }
+        },
+        implicit: MapSet.new([{"g.geography", text}, {"g.geometry", text}, {text, "g.geometry"}]),
+        casts: %{},
+        relations: %{"s.t" => %{"gg" => entry.(geo), "g2" => entry.(geo), "gm" => entry.(geom)}}
+      }
+
+      assert qualify!("SELECT st_d(r.gg, r.g2) FROM s.t r", facts) =~
+               ~s|"g"."st_d"(CAST((r.gg) AS "g"."geography"), CAST((r.g2) AS "g"."geography"))|
+
+      # The sole candidate that can take them: named, nothing cast to fit it.
+      assert qualify!("SELECT st_d(r.gg, r.gm) FROM s.t r", facts) =~ ~s|"g"."st_d"(r.gg, r.gm)|
+
+      assert {:error, :function_ambiguous, _} =
+               Qualify.qualify("SELECT st_d('a', 'b') FROM s.t r", facts)
+    end
+
+    test "a candidate that cannot take the arguments does not count (R58)" do
+      text = "pg_catalog.text"
+
+      facts = %{
+        extension: true,
+        functions: %{
+          "digest" => %{
+            candidates: [
+              candidate("ext", %{nargs: 2, args: [text, text], extension: "3"}),
+              candidate("ext", %{nargs: 2, args: ["pg_catalog.bytea", text], extension: "3"}),
+              candidate("public", %{nargs: 2, args: ["pg_catalog.int4", "pg_catalog.int4"]})
+            ],
+            polymorphic: false
+          }
+        },
+        relations: %{"s.t" => %{"note" => %{plain() | type: text}}}
+      }
+
+      assert qualify!("SELECT digest(r.note, 'sha1') FROM s.t r", facts) =~
+               ~s|"ext"."digest"(CAST((r.note) AS pg_catalog.text), CAST(('sha1') AS pg_catalog.text))|
     end
 
     test "a member function beside an unrelated plant is ambiguous" do
@@ -291,16 +402,16 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
       out =
         qualify!(
           "SELECT 1 FROM s.t r GROUP BY r.id HAVING max(r.ci) = $1",
-          ext_facts(%{functions: functions()})
+          ext_facts()
         )
 
-      assert out =~ ~s|"ext".max(CAST((r.ci) AS "ext"."citext"))|
+      assert out =~ ~s|"ext"."max"(CAST((r.ci) AS "ext"."citext"))|
       assert out =~ ~s|OPERATOR("ext".=)|
     end
 
     test "a citext overload with untyped arguments; a text argument keeps pg_catalog's" do
       assert qualify!("SELECT replace(r.ci, $1, 'x') FROM s.t r", ext_facts()) =~
-               ~s|"ext".replace(CAST((r.ci) AS "ext"."citext"), CAST(($1) AS "ext"."citext")|
+               ~s|"ext"."replace"(CAST((r.ci) AS "ext"."citext"), CAST(($1) AS "ext"."citext")|
 
       assert qualify!("SELECT replace(r.ci, r.name, 'x') FROM s.t r", ext_facts()) =~
                "pg_catalog.replace("
@@ -310,12 +421,12 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
       assert {:error, :operand_type_unknown, _} =
                Qualify.qualify(
                  "SELECT 1 FROM s.t r WHERE COALESCE(r.ci, 'x') = $1",
-                 Map.put(ext_facts(), :functions, functions())
+                 ext_facts()
                )
 
       assert qualify!(
                "SELECT 1 FROM s.t r WHERE r.ci = ANY($1)",
-               Map.put(ext_facts(), :functions, functions())
+               ext_facts()
              ) =~ ~s|OPERATOR("ext".=) ANY (CAST(($1) AS "ext"."citext"[]))|
     end
 
@@ -376,7 +487,53 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
 
     test "unicode strings and identifiers keep their UESCAPE" do
       assert [{:str, "U&'d!0061' UESCAPE '!'"}] = Qualify.tokenize("U&'d!0061' UESCAPE '!'")
-      assert qualify!(~s|SELECT 1 FROM s.t WHERE U&"d\\0061" = 1|) =~ ~s|U&"d\\0061"|
+      assert qualify!(~s|SELECT 1 FROM s.t WHERE U&"d\\0061" = 1|) =~ ~s|("da")|
+    end
+
+    test "a function is told from syntax by its position, not by its word (R60)" do
+      plant = %{
+        functions:
+          functions(%{
+            "cube" => %{
+              candidates: [
+                candidate("lib", %{args: ["pg_catalog.int4"], member: true, extension: "1"})
+              ],
+              polymorphic: false
+            },
+            "explain" => %{
+              candidates: [candidate("public", %{args: ["pg_catalog.int4"]})],
+              polymorphic: false
+            }
+          })
+      }
+
+      assert qualify!("SELECT cube(1) FROM s.t", plant) =~ ~s("lib"."cube"()
+      assert qualify!("SELECT x FROM s.t GROUP BY CUBE (x, y)", plant) =~ "CUBE (x , y)"
+
+      assert {:error, :function_not_member, _} =
+               Qualify.qualify(
+                 "SELECT explain(1) FROM s.t",
+                 Map.merge(%{extension: false}, plant)
+               )
+
+      assert Qualify.lint(~s|SELECT cube(1) FROM s.t|) != []
+    end
+
+    test "U& identifiers are decoded before qualification and lint (R60)" do
+      assert qualify!(~s|SELECT U&"lower"(a) FROM s.t|) =~ ~s(pg_catalog."lower"()
+      assert qualify!(~s|SELECT U&"l\\006Fwer"(a) FROM s.t|) =~ ~s(pg_catalog."lower"()
+      assert Qualify.lint(~s|SELECT U&"lower"(a) FROM s.t|) != []
+
+      assert {:error, :operator_not_member, _} =
+               Qualify.qualify(~s|SELECT 1 FROM s.t WHERE a OPERATOR(U&"public".=) 'x'|, %{
+                 functions: functions(),
+                 extension: false
+               })
+    end
+
+    test "a column named set is not the SET of an UPDATE" do
+      out = qualify!("SELECT k.update, k.set = 'other' AS r FROM s.t AS k")
+      assert out =~ "OPERATOR(pg_catalog.=)"
     end
 
     test "a row lock is read from tokens, not from text" do
@@ -392,6 +549,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
 
       for sql <- [
             "SELECT 'x FOR UPDATE' FROM t",
+            "SELECT substring(name for share) FROM t",
             ~s|SELECT 1 AS "for share" FROM t|,
             "SELECT 1 /* for update */ FROM t",
             "SELECT 1 -- for no key update\n FROM t"

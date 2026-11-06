@@ -241,12 +241,27 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
             ],
             do: exec!(a, sql)
 
-        for sql <- [digest, scope, word, text_digest] do
+        for sql <- [digest, scope, word, delete] do
           assert {:refused, :function_ambiguous} = guarded(c, sql), sql
         end
 
-        # delete(hstore, varchar) has a member for its first argument's type.
-        assert [[%{"a" => "1"}]] = guarded(c, delete)
+        # A plant that cannot take the arguments does not count (R58).
+        assert guarded(c, text_digest) == native_text
+
+        exec!(
+          a,
+          "CREATE FUNCTION public.digest(int, int) RETURNS bytea LANGUAGE sql AS $$ SELECT 'F'::bytea $$"
+        )
+
+        assert guarded(c, text_digest) == native_text
+
+        # Spelled out, a call is verified the same way.
+        assert {:refused, :function_ambiguous} =
+                 guarded(c, "SELECT id FROM public.ht WHERE public.similarity(c, 'zzz') > 0.5")
+
+        # delete(h, ARRAY['a']): which overload is PostgreSQL's to say (R62).
+        assert {:refused, :function_ambiguous} =
+                 guarded(c, "SELECT delete(h, ARRAY['a']) FROM public.ht WHERE id = 1")
       end
     )
   end
@@ -498,7 +513,10 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
 
     try do
       read = fn conn ->
-        Adapter.execute(conn, "SELECT #{schema}.w() FROM #{schema}.ro", [], selecto_read: true)
+        Adapter.execute(conn, "SELECT #{schema}.w() FROM #{schema}.ro", [],
+          selecto_read: true,
+          selecto_declared_functions: ["#{schema}.w"]
+        )
       end
 
       assert {:error, %{details: %{reason: :read_only_read}}} = read.(c)
@@ -511,7 +529,10 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
             "SELECT #{schema}.w() FROM #{schema}.ro WHERE 'x FOR UPDATE' OPERATOR(pg_catalog.<>) ''"
           ] do
         assert {:error, %{details: %{reason: :read_only_read}}} =
-                 Adapter.execute(c, sql, [], selecto_read: true)
+                 Adapter.execute(c, sql, [],
+                   selecto_read: true,
+                   selecto_declared_functions: ["#{schema}.w"]
+                 )
       end
 
       # In a host transaction too, which stays writable afterwards.

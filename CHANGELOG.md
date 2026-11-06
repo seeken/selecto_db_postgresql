@@ -4,6 +4,17 @@ CHANGES
 Unreleased
 ----------
 
+- A function outside pg_catalog is named only as the exact match for its
+  arguments' known types or the sole candidate that can take them; an argument
+  is never cast to a type it lacks, and anything else is `:function_ambiguous`
+  (R62). A function no extension owns, bare or schema-qualified, refuses
+  `:function_not_member` unless the domain declares it as a UDF. Whether a word
+  before `(` is a function is decided by its position, and `U&"..."` identifiers
+  are decoded before qualification and lint. A relation with no schema under a
+  root that declares one resolves in the root's schema. An extension's
+  composite type (topogeometry) compares through the qualifier, which refuses
+  where PostgreSQL has no unique operator. A `read_only_reads` that is no
+  boolean refuses at connect.
 - A non-member operator on an extension operand refuses in Selecto, except a
   string-category type against a pg_catalog string. A non-member function beside
   an extension's members is ambiguous. Keyword-named functions are qualified.

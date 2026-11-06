@@ -253,6 +253,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
       Keyword.has_key?(opts, :url) ->
         {:error, {:invalid_connection_options, :url_option_not_supported}}
 
+      not read_only_setting_valid?() ->
+        {:error, {:invalid_configuration, :read_only_reads}}
+
       true ->
         connect_postgrex(opts)
     end
@@ -379,10 +382,34 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # `source_schema` declared next to a `source_table`, per table, across the
   # read's domains; a table declared with two schemas refuses.
   defp declared_schemas(selecto) do
-    [selecto | Selecto.Executor.set_operands(selecto)]
-    |> Enum.map(&Map.get(&1, :domain))
-    |> Enum.reduce(%{}, &collect_declared/2)
+    queries = [selecto | Selecto.Executor.set_operands(selecto)]
+    declared = queries |> Enum.map(&Map.get(&1, :domain)) |> Enum.reduce(%{}, &collect_declared/2)
+    Enum.reduce(queries, declared, &inherit_root_schema/2)
   end
+
+  # R59: under a root that declares its schema, a relation that declares
+  # none resolves there, never by the connection's path.
+  defp inherit_root_schema(selecto, declared) do
+    domain = Map.get(selecto, :domain) || %{}
+    source = Map.get(domain, :source) || %{}
+
+    case schema_name(Map.get(source, :source_schema) || Map.get(source, "source_schema")) do
+      nil ->
+        declared
+
+      schema ->
+        selecto
+        |> domain_tables()
+        |> Enum.reject(&String.contains?(&1, "."))
+        |> Enum.reduce(declared, &Map.put_new(&2, &1, schema))
+    end
+  end
+
+  defp domain_tables(selecto), do: Selecto.Executor.domain_relations(%{selecto | set: %{}})
+
+  defp schema_name(schema) when is_binary(schema) and schema != "", do: schema
+  defp schema_name(schema) when is_atom(schema) and not is_nil(schema), do: Atom.to_string(schema)
+  defp schema_name(_schema), do: nil
 
   defp collect_declared(map, acc) when is_map(map) and not is_struct(map) do
     table = Map.get(map, :source_table) || Map.get(map, "source_table")
@@ -615,7 +642,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
              {:ok, pinned} <- read_step(SessionGuard.pin(guard, plan.path, read_only: read_only?)),
              :ok <- read_step(RelationPath.qualified(query)),
              {:ok, query} <-
-               read_step(ExplicitSQL.prepare(guard, query, isolation: pinned.isolation)),
+               read_step(
+                 ExplicitSQL.prepare(guard, query,
+                   isolation: pinned.isolation,
+                   declared_functions: plan.declared_functions
+                 )
+               ),
              {:ok, result} <- read_result(execute.(plan.prefix <> query, params)),
              :ok <- read_step(SessionGuard.unpin(guard, pinned, before)),
              :ok <- read_compare(guard, before),
@@ -635,9 +667,15 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # R55 awaits a decision: `config :selecto_db_postgresql, read_only_reads:
   # false` turns the pin off in this one place.
   defp read_only?(query) do
-    Application.get_env(:selecto_db_postgresql, :read_only_reads, true) and
-      not row_lock?(query)
+    read_only_reads() and not row_lock?(query)
   end
+
+  # Anything but false keeps reads read-only; connect/1 refuses a bad value.
+  defp read_only_reads,
+    do: Application.get_env(:selecto_db_postgresql, :read_only_reads, true) != false
+
+  defp read_only_setting_valid?,
+    do: Application.get_env(:selecto_db_postgresql, :read_only_reads, true) in [true, false]
 
   # Text that cannot be read as SQL refuses later, in ExplicitSQL.
   defp row_lock?(query) do
@@ -693,7 +731,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
     do: RelationPath.pinned_path(Keyword.get(opts, :selecto_qualified_relations))
 
   defp read_plan(opts),
-    do: %{path: read_path(opts), prefix: Keyword.get(opts, :selecto_explain, "")}
+    do: %{
+      path: read_path(opts),
+      prefix: Keyword.get(opts, :selecto_explain, ""),
+      declared_functions: Keyword.get(opts, :selecto_declared_functions, [])
+    }
 
   @doc """
   EXPLAIN of a Selecto read (`explain` the prefix, "EXPLAIN (...) "): the
@@ -3854,7 +3896,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
                      {:ok, pinned} <-
                        SessionGuard.pin(check, read_path(opts), read_only: read_only?(query)),
                      {:ok, prepared} <-
-                       ExplicitSQL.prepare(check, query, isolation: pinned.isolation) do
+                       ExplicitSQL.prepare(check, query,
+                         isolation: pinned.isolation,
+                         declared_functions: Keyword.get(opts, :selecto_declared_functions, [])
+                       ) do
                   {before, pinned, prepared}
                 else
                   error -> refuse.(error)
@@ -3918,6 +3963,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
           {^ref, {:done, {:ok, _}}} ->
             {:halt, state}
+
+          {^ref, {:done, {:error, %Selecto.Error{} = refusal}}} ->
+            raise Selecto.Error.to_exception(refusal)
 
           {^ref, {:done, {:error, reason}}} ->
             raise "PostgreSQL stream transaction failed: #{inspect(reason)}"
