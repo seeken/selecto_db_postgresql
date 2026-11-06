@@ -272,11 +272,8 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
       {:ok, %{rows: [[shadowed | _]]}} when is_integer(shadowed) and shadowed > 0 ->
         shadowed()
 
-      {:ok, _other} ->
-        unavailable()
-
-      {:error, _reason} ->
-        unavailable()
+      other ->
+        unavailable(other)
     end
   end
 
@@ -290,8 +287,8 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
           settings: Enum.zip(@settings, settings)
         })
 
-      _other ->
-        unavailable()
+      other ->
+        unavailable(other)
     end
   end
 
@@ -348,7 +345,7 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
     # An unreadable reset value (NULL, or an error) fails closed.
     case execute.(sql, [path]) do
       {:ok, %{rows: [values]}} -> pinned(values)
-      _other -> unavailable()
+      other -> unavailable(other)
     end
   end
 
@@ -391,8 +388,8 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
             end
         end
 
-      _other ->
-        unavailable()
+      other ->
+        unavailable(other)
     end
   end
 
@@ -426,8 +423,8 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
       {:ok, %{rows: [[snapshot | _]]}} when is_binary(snapshot) ->
         changed()
 
-      _other ->
-        unavailable()
+      other ->
+        unavailable(other)
     end
   end
 
@@ -478,7 +475,7 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
     case execute.("SELECT " <> sql, params) do
       {:ok, %{rows: [[value]]}} when is_binary(value) -> :ok
       {:ok, %{rows: [[nil]]}} -> changed()
-      _other -> unavailable()
+      other -> unavailable(other)
     end
   end
 
@@ -579,7 +576,7 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
 
     case execute.(sql, []) do
       {:ok, %{rows: [[count]]}} when is_integer(count) -> {:ok, count}
-      _other -> unavailable()
+      other -> unavailable(other)
     end
   end
 
@@ -641,6 +638,28 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   end
 
   def relation_tokens(sql), do: sql |> IO.iodata_to_binary() |> relation_tokens()
+
+  # What failed the check stands: a cancel or a lost connection says nothing
+  # about the session, and is what the host must hear.
+  @standing [
+    :query_canceled,
+    :in_failed_sql_transaction,
+    :lock_not_available,
+    :deadlock_detected,
+    :serialization_failure,
+    :admin_shutdown,
+    :crash_shutdown,
+    :cannot_connect_now
+  ]
+
+  @doc false
+  def standing({:error, %Postgrex.Error{postgres: %{code: code}}}) when code in @standing,
+    do: true
+
+  def standing({:error, %DBConnection.ConnectionError{}}), do: true
+  def standing(_other), do: false
+
+  defp unavailable(result), do: if(standing(result), do: result, else: unavailable())
 
   defp unavailable,
     do:

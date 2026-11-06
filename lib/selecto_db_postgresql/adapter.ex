@@ -330,10 +330,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp hand_built_bound(query, opts),
     do: if(hand_built?(opts), do: ExplicitSQL.bounded(query), else: :ok)
 
-  # Text Selecto did not generate, whole or in part: a builder marked it, or no
-  # compile named its relations.
+  # Text is hand-built unless Selecto's executor stamped it generated: the
+  # compile saw no mark, and it named the statement's relations.
   defp hand_built?(opts) do
     Keyword.get(opts, :selecto_raw_sql) == true or
+      Keyword.get(opts, :selecto_generated) != true or
       not is_map(Keyword.get(opts, :selecto_qualified_relations))
   end
 
@@ -692,7 +693,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
                    hand_built: plan.hand_built
                  )
                ),
-             {:ok, result} <- read_result(execute.(plan.prefix <> query, params)),
+             {:ok, result} <- read_result(execute.(plan.prefix <> query, params), plan.hand_built),
              :ok <- read_step(SessionGuard.close(guard, before, pinned)),
              :ok <- run_all(guard, close) do
           {:ok, result}
@@ -731,6 +732,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   # No operator or function for the operands (an extension type without a
   # member for that operator): typed, like every other refusal of this step.
+  # Hand-built text a rewrite could not keep valid: typed, like the rest.
+  defp read_result({:error, %Postgrex.Error{postgres: %{code: :syntax_error}}}, true),
+    do: {:error, read_refusal(unwritable())}
+
+  defp read_result(result, _hand_built?), do: read_result(result)
+
   defp read_result({:error, %Postgrex.Error{postgres: %{code: :undefined_function}}}),
     do: {:error, read_refusal(no_operator())}
 
@@ -738,6 +745,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
     do: {:error, read_refusal(read_wrote())}
 
   defp read_result(result), do: result
+
+  defp unwritable do
+    Error.new(:query_enforcement, "PostgreSQL refuses hand-built SQL it cannot prove",
+      details: %{code: :query_rule_not_evaluable, reason: :sql_unprovable, adapter: :postgresql}
+    )
+  end
 
   defp read_wrote do
     Error.new(:query_enforcement, "PostgreSQL refuses a read that tried to write",
@@ -770,6 +783,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp read_step({:ok, _} = ok), do: ok
   defp read_step({:ok, _, _} = ok), do: ok
   defp read_step({:error, %Error{} = error}), do: {:error, read_refusal(error)}
+  defp read_step({:error, _} = error), do: error
 
   # The search_path a read pins (R30), from the relations prepare_read/2
   # resolved for it.
@@ -4095,9 +4109,17 @@ defmodule SelectoDBPostgreSQL.Adapter do
             end)
           rescue
             error in Postgrex.Error ->
-              if match?(%{postgres: %{code: :read_only_sql_transaction}}, error),
-                do: refuse.({:error, read_wrote()}),
-                else: reraise(error, __STACKTRACE__)
+              cond do
+                match?(%{postgres: %{code: :read_only_sql_transaction}}, error) ->
+                  refuse.({:error, read_wrote()})
+
+                match?(%{postgres: %{code: :syntax_error}}, error) and
+                    Keyword.get(opts, :selecto_hand_built, false) ->
+                  refuse.({:error, unwritable()})
+
+                true ->
+                  reraise(error, __STACKTRACE__)
+              end
           end
 
           if guarded? do

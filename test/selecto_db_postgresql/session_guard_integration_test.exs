@@ -801,6 +801,7 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
       assert {:error, %{details: %{reason: :relation_unresolved}}} =
                Adapter.execute(c, sql, ["t1"],
                  selecto_read: true,
+                 selecto_generated: true,
                  selecto_qualified_relations: %{}
                )
     end

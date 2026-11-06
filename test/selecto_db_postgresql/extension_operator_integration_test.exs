@@ -125,7 +125,11 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
             "ht" => ~s("public"."ht")
           }
 
-          Adapter.execute(c, sql, [], selecto_read: true, selecto_qualified_relations: relations)
+          Adapter.execute(c, sql, [],
+            selecto_read: true,
+            selecto_generated: true,
+            selecto_qualified_relations: relations
+          )
         end
 
         assert {:ok, %{rows: [[1], [2]]}} =
@@ -214,6 +218,7 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
 
     case Adapter.execute(c, sql, params,
            selecto_read: true,
+           selecto_generated: true,
            selecto_qualified_relations: relations
          ) do
       {:ok, %{rows: rows}} -> rows

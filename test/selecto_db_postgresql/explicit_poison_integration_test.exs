@@ -9,7 +9,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
   use ExUnit.Case, async: false
 
   alias Selecto.Write.Command
-  alias SelectoDBPostgreSQL.Adapter
+  alias SelectoDBPostgreSQL.{Adapter, ExplicitSQL}
 
   @moduletag :postgres
 
@@ -587,7 +587,11 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       "items" => ~s("public"."items")
     }
 
-    Adapter.execute(c, sql, [], selecto_read: true, selecto_qualified_relations: relations)
+    Adapter.execute(c, sql, [],
+      selecto_read: true,
+      selecto_generated: true,
+      selecto_qualified_relations: relations
+    )
   end
 
   defp summary({:ok, %{rows: rows}}), do: rows
@@ -844,6 +848,64 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
              )
 
     assert {:ok, %{rows: [[1]]}} = read.("SELECT (SELECT 1)::int FROM cats WHERE id = 10")
+    GenServer.stop(c)
+  end
+
+  test "generated citext forms answer as PostgreSQL does (tenth review M2)", %{opts: opts} do
+    {:ok, c} = Adapter.connect(opts)
+
+    for sql <- [
+          "SELECT id FROM items WHERE ci @@ websearch_to_tsquery('mixed') ORDER BY id",
+          "SELECT min(greatest(upper(ci), ci)) FROM items",
+          "SELECT min(coalesce(upper(ci), ci)) FROM items",
+          "SELECT max(CASE WHEN id > 1 THEN upper(ci) ELSE ci END) FROM items",
+          "SELECT id FROM items WHERE greatest(upper(ci), ci) = 'MIXED' ORDER BY id",
+          "SELECT max(coalesce(nullif('', 'a%'), ci)) FROM items",
+          "SELECT min(least(nullif('a%', 'x'), ci)) FROM items",
+          "WITH q AS (SELECT *, 1 AS depth FROM items) SELECT id FROM q WHERE ci = 'mixed' ORDER BY id",
+          "WITH q AS (SELECT items.*, 1 AS depth FROM items) SELECT id FROM q WHERE ci = 'mixed' ORDER BY id"
+        ] do
+      assert {:ok, %{rows: rows}} = Adapter.execute(c, sql, [], [])
+      assert {:ok, %{rows: ^rows}} = typed(c, sql), sql
+    end
+
+    GenServer.stop(c)
+  end
+
+  test "a cancel during a catalog or session read stands as itself (tenth review M3)" do
+    canceled = {:error, %Postgrex.Error{postgres: %{code: :query_canceled, pg_code: "57014"}}}
+    lost = {:error, %DBConnection.ConnectionError{message: "closed"}}
+
+    for failure <- [canceled, lost] do
+      execute = fn _sql, _params -> failure end
+
+      assert SelectoDBPostgreSQL.RelationPath.resolve(execute, ["t"], false) == failure
+      assert SelectoDBPostgreSQL.RelationPath.resolve(execute, ["t"], true) == failure
+      assert SelectoDBPostgreSQL.SessionGuard.pin(execute, "pg_catalog") == failure
+      assert ExplicitSQL.prepare(execute, "SELECT lower(name) FROM items") == failure
+    end
+
+    # Anything else is still the typed refusal.
+    other = fn _sql, _params -> {:error, %Postgrex.Error{postgres: %{code: :undefined_table}}} end
+
+    assert {:error, %{details: %{reason: :relation_unresolved}}} =
+             SelectoDBPostgreSQL.RelationPath.resolve(other, ["t"], false)
+  end
+
+  test "text without the executor's stamp is hand-built, whatever it is passed with", %{
+    opts: opts
+  } do
+    {:ok, c} = Adapter.connect(opts)
+    sql = "SELECT id FROM public.items WHERE COALESCE(ci, 'x') = 'MIXED' ORDER BY id"
+    relations = %{SelectoDBPostgreSQL.RelationPath.path_key() => ["public", "ext"]}
+    read = &Adapter.execute(c, sql, [], [selecto_read: true] ++ &1)
+
+    assert {:error, %{details: %{reason: :sql_unprovable}}} =
+             read.(selecto_qualified_relations: relations)
+
+    assert {:ok, %{rows: [[1], [3], [5]]}} =
+             read.(selecto_generated: true, selecto_qualified_relations: relations)
+
     GenServer.stop(c)
   end
 

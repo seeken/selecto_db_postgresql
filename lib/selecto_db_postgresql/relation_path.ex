@@ -132,6 +132,9 @@ defmodule SelectoDBPostgreSQL.RelationPath do
       {:ok, rows, schemas, temps} ->
         decide(rows, own |> Map.put(@path_key, schemas) |> Map.put(@temp_key, temps))
 
+      {:failed, error} ->
+        error
+
       :error ->
         unavailable()
     end
@@ -213,8 +216,8 @@ defmodule SelectoDBPostgreSQL.RelationPath do
              )
            end)}
 
-        _ ->
-          unavailable()
+        other ->
+          if SessionGuard.standing(other), do: other, else: unavailable()
       end
     end
   end
@@ -254,8 +257,8 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
         result
 
-      _ ->
-        :error
+      other ->
+        lookup_failure(other)
     end
   end
 
@@ -269,10 +272,14 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
         {:ok, rows, Enum.reject(schemas, &String.starts_with?(&1, "pg_temp")), temps}
 
-      _ ->
-        :error
+      other ->
+        lookup_failure(other)
     end
   end
+
+  # A cancel or a lost connection is not an unresolved relation.
+  defp lookup_failure(result),
+    do: if(SessionGuard.standing(result), do: {:failed, result}, else: :error)
 
   defp decide(rows, own) do
     Enum.reduce_while(rows, {:ok, own}, fn
