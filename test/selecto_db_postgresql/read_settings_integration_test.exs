@@ -22,6 +22,35 @@ defmodule SelectoDBPostgreSQL.ReadSettingsIntegrationTest do
     assert {:error, {:invalid_configuration, :read_only_reads}} = Adapter.connect(options())
   end
 
+  test "a statement_cache left in the configuration warns: it is ignored" do
+    Application.put_env(:selecto_db_postgresql, :statement_cache, 1024)
+    on_exit(fn -> Application.delete_env(:selecto_db_postgresql, :statement_cache) end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
+        GenServer.stop(c)
+      end)
+
+    assert log =~ ":statement_cache is ignored"
+  end
+
+  test "a string cast to a number binds as text, for the server to convert" do
+    fragment = %Selecto.Dialect.ComputedValue{
+      operation: :cast,
+      expression: {:param, "1"},
+      type: "integer"
+    }
+
+    assert {:ok, sql} = SelectoDBPostgreSQL.Dialect.render_computed_value(fragment, nil)
+    assert sql == ["CAST(CAST(", {:param, "1"}, " AS TEXT) AS ", "BIGINT", ")"]
+
+    number = %{fragment | expression: {:param, 1}}
+
+    assert {:ok, ["CAST(", {:param, 1}, " AS ", "BIGINT", ")"]} =
+             SelectoDBPostgreSQL.Dialect.render_computed_value(number, nil)
+  end
+
   test "a stream that writes refuses with its message, not a wrapped driver error" do
     {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
     Process.unlink(c)

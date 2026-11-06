@@ -212,6 +212,13 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
 
   @shadow_sql "SELECT " <> @shadow_count <> ", " <> @snapshot_columns
 
+  @doc """
+  A transaction statement of the adapter's own, marked: only a statement
+  built this way takes the simple protocol, which would run anything after a
+  semicolon. Text is never classified by what it starts with.
+  """
+  def control(sql) when is_binary(sql), do: {:selecto_control, sql}
+
   @doc "The snapshot statement (no parameters)."
   def snapshot_sql, do: @snapshot_sql
 

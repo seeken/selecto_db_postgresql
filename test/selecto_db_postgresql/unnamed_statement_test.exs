@@ -7,20 +7,10 @@ defmodule SelectoDBPostgreSQL.UnnamedStatementTest do
   alias SelectoDBPostgreSQL.Adapter
   alias SelectoDBPostgreSQL.Verification.ConnectionOptions
 
-  describe "unnamed/3" do
+  describe "unnamed/1" do
     test "drops a statement name, from the caller's options too" do
-      assert Adapter.unnamed("SELECT 1", [], timeout: 5) == [timeout: 5]
-      assert Adapter.unnamed("SELECT $1", [1], cache_statement: "x") == []
-    end
-
-    test "a transaction statement takes the simple protocol, one round trip" do
-      for sql <- ["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT s", "RELEASE SAVEPOINT s"] do
-        assert Adapter.unnamed(sql, [], []) == [query_type: :text]
-      end
-
-      for sql <- ["SELECT 1", "COMMITTED", "BEGINNING"] do
-        assert Adapter.unnamed(sql, [], []) == []
-      end
+      assert Adapter.unnamed(timeout: 5) == [timeout: 5]
+      assert Adapter.unnamed(cache_statement: "x") == []
     end
   end
 
@@ -91,6 +81,34 @@ defmodule SelectoDBPostgreSQL.UnnamedStatementTest do
 
       assert length(Enum.to_list(stream)) == 2
       assert prepared(ctx.connection) == []
+    end
+
+    test "text is never sent over the simple protocol", ctx do
+      c = ctx.connection
+      table = "public.#{ctx.table}"
+      rows = fn -> elem(Adapter.execute(c, "SELECT count(*) FROM #{table}", [], []), 1).rows end
+
+      for sql <- [
+            "COMMIT; DELETE FROM #{table} WHERE id = 2",
+            "COMMIT; DELETE FROM #{table} WHERE id = 2; BEGIN",
+            "ROLLBACK; DELETE FROM #{table} WHERE id = 2",
+            "BEGIN; DELETE FROM #{table} WHERE id = 2",
+            "SAVEPOINT s; DELETE FROM #{table} WHERE id = 2"
+          ] do
+        assert {:error, _} = Adapter.execute(c, sql, [], selecto_read: true)
+        assert {:error, _} = Adapter.execute(c, sql, [], [])
+        assert rows.() == [[2]]
+        assert DBConnection.run(c, &DBConnection.status/1) == :idle
+      end
+
+      for sql <- ["COMMIT", "ROLLBACK", "BEGIN", "SAVEPOINT q", "SELECT 1; SELECT 2"] do
+        assert {:error, %{details: %{reason: :sql_unqualifiable}}} =
+                 Adapter.execute(c, sql, [], selecto_read: true)
+
+        assert DBConnection.run(c, &DBConnection.status/1) == :idle
+      end
+
+      assert {:ok, %{rows: [[1]]}} = Adapter.execute(c, "SELECT 1;", [], selecto_read: true)
     end
 
     test "every name a statement could have, planted, stays unbound", ctx do

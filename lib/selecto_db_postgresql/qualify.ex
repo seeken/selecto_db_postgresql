@@ -81,7 +81,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
   # A parameter, or a string literal in any spelling but N'' (bpchar), B''
   # and X'' (bit): PostgreSQL leaves its type to the context.
-  @untyped_literal ~r/\A(?:\$\d+|(?:[Ee]|[Uu]&)?'(?:[^']|'')*'(?:\s*UESCAPE\s*'.')?|\$([^$]*)\$.*\$\1\$)\z/is
+  @untyped_literal ~r/\A(?:\$\d+|[Ee]'(?:[^'\\]|\\.|'')*'|(?:[Uu]&)?'(?:[^']|'')*'(?:\s*UESCAPE\s*'.')?|\$([^$]*)\$.*\$\1\$)\z/is
 
   @boolean_op ~w(= <> != < > <= >= ~~ ~~* !~~ !~~* ~ ~* !~ !~* @> <@ && ^@ ? ?| ?& @? @@)
 
@@ -735,8 +735,12 @@ defmodule SelectoDBPostgreSQL.Qualify do
       do: refuse(:sql_unqualifiable, "SIMILAR TO ... ESCAPE is not generated")
 
     op = if negate, do: "!~", else: "~"
-    {op, _cast, st} = op_sql(st, %{kind: :op, op: op}, %{known: true}, %{known: true})
-    sql = "((#{left}) #{op} (pg_catalog.similar_to_escape(#{pattern})))"
+    # similar_to_escape gives text: the operand's own ~ for text, if it has one.
+    {op, cast, st} =
+      op_sql(st, %{kind: :op, op: op}, operand, %{known: true, type: "pg_catalog.text"})
+
+    right = right_cast("pg_catalog.similar_to_escape(#{pattern})", cast)
+    sql = "((#{left_cast(left, cast)}) #{op} (#{right}))"
     {%{kind: :atom, sql: sql}, head, st}
   end
 
@@ -2154,7 +2158,7 @@ defmodule SelectoDBPostgreSQL.Qualify do
     # A comparison's operands do not type an expression around it (a CASE
     # WHEN tier = 'gold' THEN 'G' ...): their references are consumed.
     st =
-      if name in @boolean_op,
+      if name in @boolean_op or (name == "||" and string_operand?(l) and string_operand?(r)),
         do: Enum.reduce([left, right], st, &consume(&2, &1)),
         else: st
 
@@ -2166,6 +2170,11 @@ defmodule SelectoDBPostgreSQL.Qualify do
   # compares as text, as PostgreSQL resolves it). Anything else an implicit
   # cast could make resolve and compare the wrong thing: box3d = compares
   # areas, geometry = text compares text.
+  defp string_operand?(%{entry: %{category: "S"}}), do: true
+  defp string_operand?(%{untyped: true}), do: true
+  defp string_operand?(%{type: type}) when is_binary(type), do: plain_type(type) in @string_types
+  defp string_operand?(_class), do: false
+
   defp string_fallback?(%{entry: %{category: "S"}}, other), do: plain_string?(other)
   defp string_fallback?(other, %{entry: %{category: "S"}}), do: plain_string?(other)
   defp string_fallback?(_left, _right), do: false
@@ -2227,7 +2236,8 @@ defmodule SelectoDBPostgreSQL.Qualify do
 
     cond do
       other_type != nil ->
-        Enum.find(candidates, &(Map.get(&1, other) == other_type))
+        Enum.find(candidates, &(Map.get(&1, other) == other_type)) ||
+          binary_coerced(candidates, other, other_type)
 
       candidates == [] ->
         nil
@@ -2238,6 +2248,14 @@ defmodule SelectoDBPostgreSQL.Qualify do
           "an operand's type could not be named for an extension operator"
         )
     end
+  end
+
+  # Every pg_catalog string reaches text by an implicit cast, so where the
+  # operand's first argument is an exact match PostgreSQL takes the member
+  # for text (citext ~~ varchar is citext's, not pg_catalog's).
+  defp binary_coerced(candidates, other, type) do
+    if plain_type(type) in @string_types,
+      do: Enum.find(candidates, &(Map.get(&1, other) == "pg_catalog.text"))
   end
 
   defp consume(st, %{atom: atom}) do
@@ -2258,8 +2276,17 @@ defmodule SelectoDBPostgreSQL.Qualify do
   defp consume(st, _node), do: st
 
   defp operand_class(_st, nil), do: %{untyped: true}
+  defp operand_class(_st, %{known: true, type: type}), do: %{type: type}
   defp operand_class(_st, %{known: true}), do: %{}
   defp operand_class(st, %{atom: atom}), do: class_of(st, atom)
+
+  # R51 amendment 3: strings concatenated are text, citext among them.
+  defp operand_class(st, %{binary: %{op: "||"}, left: left, right: right}) do
+    if string_operand?(operand_class(st, left)) and string_operand?(operand_class(st, right)),
+      do: %{type: "pg_catalog.text"},
+      else: %{}
+  end
+
   defp operand_class(_st, _node), do: %{}
 
   # What is known of an atom's type: %{untyped: true} (a bare parameter or
@@ -2287,6 +2314,10 @@ defmodule SelectoDBPostgreSQL.Qualify do
           Regex.match?(@untyped_literal, atom.sql) ->
         %{untyped: true}
 
+      # N'' is 'x'::bpchar.
+      Map.get(atom, :column) == nil and Regex.match?(~r/\A[Nn]'(?:[^']|'')*'\z/, atom.sql) ->
+        %{type: "pg_catalog.bpchar"}
+
       Map.get(atom, :entry) != nil ->
         %{entry: atom.entry}
 
@@ -2307,12 +2338,19 @@ defmodule SelectoDBPostgreSQL.Qualify do
   defp quantified_class(st, _atom, %{subquery: open}) when is_integer(open),
     do: subquery_class(st, open)
 
-  defp quantified_class(st, atom, %{lone: nil}), do: expression_class(st, atom)
+  defp quantified_class(st, atom, %{lone: nil} = quantified) do
+    if string_array?(quantified.inner),
+      do: %{type: "pg_catalog.text"},
+      else: expression_class(st, atom)
+  end
 
-  defp quantified_class(st, atom, %{lone: lone}) do
+  defp quantified_class(st, atom, %{lone: lone} = quantified) do
     cond do
       Map.get(lone, :array_entry) != nil ->
         %{entry: lone.array_entry}
+
+      string_array?(quantified.inner) ->
+        %{type: "pg_catalog.text"}
 
       st.scopes != nil and is_map(Map.get(lone, :column)) ->
         case resolve_column(st, lone.column.at, lone.column.names) do
@@ -2329,6 +2367,40 @@ defmodule SelectoDBPostgreSQL.Qualify do
         end
     end
   end
+
+  # ARRAY[...] of string literals, or anything cast to a pg_catalog string
+  # array: text[], as PostgreSQL types it (R51 amendment 3).
+  defp string_array?(sql) do
+    tokens = tokenize(sql)
+
+    Enum.take(tokens, -3) |> string_array_cast?(tokens) or literal_array?(tokens)
+  catch
+    {:qualify_refuse, _reason, _message} -> false
+  end
+
+  defp string_array_cast?([type, {:punct, "["}, {:punct, "]"}], tokens) do
+    at = length(tokens) - 3
+    word = type |> upper() |> to_string()
+    before = tokens |> Enum.take(at) |> Enum.take(-3)
+
+    word in ~w(TEXT VARCHAR) and
+      (List.last(before) == {:punct, "::"} or
+         match?([{:punct, "::"}, {:id, "pg_catalog"}, {:punct, "."}], before))
+  end
+
+  defp string_array_cast?(_tail, _tokens), do: false
+
+  defp literal_array?([array, {:punct, "["} | rest]) do
+    upper(array) == "ARRAY" and List.last(rest) == {:punct, "]"} and
+      rest |> Enum.drop(-1) |> Enum.chunk_every(2) |> Enum.all?(&literal_element?/1)
+  end
+
+  defp literal_array?(_tokens), do: false
+
+  defp literal_element?([{:str, text} | tail]) when tail in [[], [{:punct, ","}]],
+    do: Regex.match?(@untyped_literal, text)
+
+  defp literal_element?(_element), do: false
 
   # A scalar or IN subquery: the type of its one output column.
   defp subquery_class(%{scopes: nil}, _open), do: %{}

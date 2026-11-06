@@ -19,6 +19,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   setting for the repository's queries; the adapter's run unnamed there too.
   """
 
+  require Logger
+
   @behaviour Selecto.DB.Adapter
   @behaviour Selecto.DB.WriteAdapter
 
@@ -246,12 +248,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
         {:error, {:invalid_configuration, :read_only_reads}}
 
       true ->
+        warn_statement_cache()
         connect_postgrex(opts)
     end
   end
 
   def connect(_other),
     do: {:error, {:invalid_connection_options, :expected_options_or_connection}}
+
+  # R63 removed the setting; a host that still sets it should know.
+  defp warn_statement_cache do
+    if match?({:ok, _}, Application.fetch_env(:selecto_db_postgresql, :statement_cache)) do
+      Logger.warning(
+        "selecto_db_postgresql: :statement_cache is ignored; every statement runs unnamed"
+      )
+    end
+  end
 
   @impl true
   def disconnect(connection) when is_pid(connection) do
@@ -522,7 +534,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         run_guarded_read(
           &execute_module_connection(connection, &1, &2, opts),
           &execute_module_connection(connection, &1, &2, opts),
-          false,
+          transaction_open?(&execute_module_connection(connection, &1, &2, opts)),
           query,
           params,
           read_plan(opts)
@@ -579,8 +591,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
     apply(repo, :checkout, [
       fn ->
-        in_transaction? =
-          module_exports?(repo, :in_transaction?, 0) and apply(repo, :in_transaction?, [])
+        in_transaction? = ecto_in_transaction?(repo)
 
         run_guarded_read(
           &execute_ecto_query(repo, &1, &2, Keyword.take(opts, [:timeout])),
@@ -625,6 +636,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
         {"BEGIN", ["COMMIT"], ["ROLLBACK"]}
       end
 
+    open = SessionGuard.control(open)
+    close = Enum.map(close, &SessionGuard.control/1)
+    undo = Enum.map(undo, &SessionGuard.control/1)
+
     case guard.(open, []) do
       {:ok, _} ->
         with {:ok, before, pinned} <-
@@ -637,6 +652,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
              {:ok, query} <-
                read_step(
                  ExplicitSQL.prepare(guard, query,
+                   read: true,
                    isolation: pinned.isolation,
                    declared_functions: plan.declared_functions
                  )
@@ -778,11 +794,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       ecto_repo?(connection) ->
         apply(connection, :checkout, [
           fn ->
-            in_transaction? =
-              module_exports?(connection, :in_transaction?, 0) and
-                apply(connection, :in_transaction?, [])
-
-            fun.(&execute_ecto_query(connection, &1, &2), in_transaction?)
+            fun.(&execute_ecto_query(connection, &1, &2), ecto_in_transaction?(connection))
           end
         ])
 
@@ -790,7 +802,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
         checkout_run(connection, fun)
 
       true ->
-        fun.(&execute_module_connection(connection, &1, &2, []), false)
+        guard = &execute_module_connection(connection, &1, &2, [])
+        fun.(guard, transaction_open?(guard))
     end
   rescue
     exception -> {:error, safe_exception(exception)}
@@ -2749,6 +2762,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
+  defp normalize_query({:selecto_control, sql}), do: sql
   defp normalize_query(query) when is_binary(query), do: query
   defp normalize_query(query), do: IO.iodata_to_binary(query)
 
@@ -2786,7 +2800,56 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp execute_ecto_query(repo, query, params, opts \\ []) do
+  # Whether the checked-out connection is in a transaction, as the server
+  # reported it: Repo.in_transaction?/0 only knows of Repo.transaction/1, and
+  # is false under the SQL Sandbox and after a raw BEGIN. Selecto must never
+  # COMMIT a transaction it did not open.
+  defp ecto_in_transaction?(repo) do
+    case ecto_connection(repo) do
+      %DBConnection{} = connection -> DBConnection.status(connection) != :idle
+      nil -> transaction_open?(&execute_ecto_query(repo, &1, &2))
+    end
+  end
+
+  defp ecto_connection(repo) do
+    dynamic =
+      if module_exports?(repo, :get_dynamic_repo, 0), do: repo.get_dynamic_repo(), else: repo
+
+    case apply(Ecto.Adapter, :lookup_meta, [dynamic]) do
+      %{pid: pool} -> Process.get({Ecto.Adapters.SQL, pool})
+      _other -> nil
+    end
+  rescue
+    _no_repo -> nil
+  end
+
+  # A connection with no status to read: the server's answer. SAVEPOINT works
+  # in a transaction and fails outside one; anything else counts as a
+  # transaction, whose savepoint then refuses rather than COMMIT.
+  defp transaction_open?(execute) do
+    name = "selecto_probe_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    case execute.(SessionGuard.control("SAVEPOINT " <> name), []) do
+      {:ok, _} ->
+        _ = execute.(SessionGuard.control("RELEASE SAVEPOINT " <> name), [])
+        true
+
+      {:error, %{postgres: %{code: :no_active_sql_transaction}}} ->
+        false
+
+      _other ->
+        true
+    end
+  end
+
+  # The Sandbox wraps each query in a savepoint of its own and releases it,
+  # which would take the adapter's savepoints with it.
+  defp execute_ecto_query(repo, query, params, opts \\ [])
+
+  defp execute_ecto_query(repo, {:selecto_control, sql}, params, opts),
+    do: execute_ecto_query(repo, sql, params, Keyword.put(opts, :sandbox_subtransaction, false))
+
+  defp execute_ecto_query(repo, query, params, opts) do
     statement = query |> normalize_query() |> SQLRecorder.driver()
 
     case apply(ecto_sql_module(), :query, [repo, statement, params, opts]) do
@@ -2847,12 +2910,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
     :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
-  @transaction_statement ~r/\A(?:BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/
+  defp query_postgrex(connection, {:selecto_control, sql}, [], opts) do
+    run_postgrex(
+      connection,
+      SQLRecorder.driver(sql),
+      [],
+      opts |> unnamed() |> Keyword.put(:query_type, :text)
+    )
+  end
 
   defp query_postgrex(connection, query, params, opts) do
     statement = query |> normalize_query() |> SQLRecorder.driver()
+    run_postgrex(connection, statement, params, unnamed(opts))
+  end
 
-    case Postgrex.query(connection, statement, params, unnamed(statement, params, opts)) do
+  defp run_postgrex(connection, statement, params, opts) do
+    case Postgrex.query(connection, statement, params, opts) do
       {:ok, result} -> {:ok, normalize_result(result)}
       {:error, reason} -> {:error, reason}
     end
@@ -2868,15 +2941,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # and survive ROLLBACK, and Postgrex binds a name without parsing it again,
   # so a named guard, or a named business statement, can be swapped for
   # another under the same name. An unnamed statement is parsed from the text
-  # sent with it. A transaction statement takes no parameters and returns no
-  # rows: the simple protocol sends it in one round trip.
-  def unnamed(statement, params, opts) do
-    opts = Keyword.delete(opts, :cache_statement)
-
-    if params == [] and Regex.match?(@transaction_statement, IO.iodata_to_binary(statement)),
-      do: Keyword.put(opts, :query_type, :text),
-      else: opts
-  end
+  # sent with it. Only the adapter's own transaction statements, marked by
+  # SessionGuard.control/1, take the simple protocol.
+  def unnamed(opts), do: Keyword.delete(opts, :cache_statement)
 
   defp introspection_query(connection, query, params) do
     case connection do
@@ -3463,7 +3530,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       if cache_key do
         execute_with_prepared_cache(pool_pid, query, params, cache_key, query_opts)
       else
-        Postgrex.query(pool_pid, query, params, unnamed(query, params, query_opts))
+        Postgrex.query(pool_pid, query, params, unnamed(query_opts))
       end
     rescue
       e ->
@@ -3480,7 +3547,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_with_prepared_cache(pool_pid, query, params, cache_key, query_opts) do
     case Selecto.ConnectionPool.prepared_statement_cached?(pool_pid, cache_key) do
       false ->
-        result = Postgrex.query(pool_pid, query, params, unnamed(query, params, query_opts))
+        result = Postgrex.query(pool_pid, query, params, unnamed(query_opts))
 
         if match?({:ok, _}, result) do
           Selecto.ConnectionPool.mark_prepared_statement(pool_pid, cache_key)
@@ -3489,7 +3556,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         result
 
       true ->
-        Postgrex.query(pool_pid, query, params, unnamed(query, params, query_opts))
+        Postgrex.query(pool_pid, query, params, unnamed(query_opts))
     end
   end
 
@@ -3665,7 +3732,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
     # Only a transaction this call opens can be set READ COMMITTED; inside
     # the host's own transaction the guarded-write check decides.
     managed? =
-      not (module_exports?(repo, :in_transaction?, 0) and apply(repo, :in_transaction?, []))
+      if module_exports?(repo, :checkout, 1),
+        do: not apply(repo, :checkout, [fn -> ecto_in_transaction?(repo) end]),
+        else:
+          not (module_exports?(repo, :in_transaction?, 0) and apply(repo, :in_transaction?, []))
 
     transaction_result =
       if managed?,
@@ -3708,7 +3778,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp safe_ecto_query(repo, sql) do
-    apply(ecto_sql_module(), :query, [repo, sql, []])
+    apply(ecto_sql_module(), :query, [repo, sql, [], [sandbox_subtransaction: false]])
   rescue
     exception -> {:error, exception}
   end
