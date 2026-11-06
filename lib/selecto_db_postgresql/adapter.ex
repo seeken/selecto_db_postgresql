@@ -387,6 +387,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp collect_declared(map, acc) when is_map(map) and not is_struct(map) do
     table = Map.get(map, :source_table) || Map.get(map, "source_table")
     schema = Map.get(map, :source_schema) || Map.get(map, "source_schema")
+    schema = if is_atom(schema) and not is_nil(schema), do: Atom.to_string(schema), else: schema
 
     acc =
       if table && is_binary(schema) && schema != "" do
@@ -631,11 +632,18 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
+  # R55 awaits a decision: `config :selecto_db_postgresql, read_only_reads:
+  # false` turns the pin off in this one place.
   defp read_only?(query) do
-    not Regex.match?(
-      ~r/\bFOR\s+(?:NO\s+KEY\s+)?(?:KEY\s+)?(?:UPDATE|SHARE)\b/i,
-      IO.iodata_to_binary(query)
-    )
+    Application.get_env(:selecto_db_postgresql, :read_only_reads, true) and
+      not row_lock?(query)
+  end
+
+  # Text that cannot be read as SQL refuses later, in ExplicitSQL.
+  defp row_lock?(query) do
+    query |> SelectoDBPostgreSQL.Qualify.tokenize() |> SelectoDBPostgreSQL.Qualify.row_lock?()
+  catch
+    {:qualify_refuse, _reason, _message} -> false
   end
 
   # No operator or function for the operands (an extension type without a
@@ -643,7 +651,16 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp read_result({:error, %Postgrex.Error{postgres: %{code: :undefined_function}}}),
     do: {:error, read_refusal(no_operator())}
 
+  defp read_result({:error, %Postgrex.Error{postgres: %{code: :read_only_sql_transaction}}}),
+    do: {:error, read_refusal(read_wrote())}
+
   defp read_result(result), do: result
+
+  defp read_wrote do
+    Error.new(:query_enforcement, "PostgreSQL refuses a read that tried to write",
+      details: %{code: :query_rule_not_evaluable, reason: :read_only_read, adapter: :postgresql}
+    )
+  end
 
   defp no_operator do
     Error.new(
@@ -3846,18 +3863,25 @@ defmodule SelectoDBPostgreSQL.Adapter do
                 {nil, nil, SQLRecorder.host(query)}
               end
 
-            tx_conn
-            |> Postgrex.stream(SQLRecorder.driver(query), params, max_rows: max_rows)
-            |> Enum.each(fn %Postgrex.Result{rows: rows, columns: columns} ->
-              if guarded? do
-                case SessionGuard.compare(check, before, pinned: pinned) do
-                  :ok -> :ok
-                  error -> refuse.(error)
+            try do
+              tx_conn
+              |> Postgrex.stream(SQLRecorder.driver(query), params, max_rows: max_rows)
+              |> Enum.each(fn %Postgrex.Result{rows: rows, columns: columns} ->
+                if guarded? do
+                  case SessionGuard.compare(check, before, pinned: pinned) do
+                    :ok -> :ok
+                    error -> refuse.(error)
+                  end
                 end
-              end
 
-              send_chunk.(rows, columns)
-            end)
+                send_chunk.(rows, columns)
+              end)
+            rescue
+              error in Postgrex.Error ->
+                if match?(%{postgres: %{code: :read_only_sql_transaction}}, error),
+                  do: refuse.({:error, read_wrote()}),
+                  else: reraise(error, __STACKTRACE__)
+            end
 
             if guarded? do
               case SessionGuard.unpin(check, pinned, before) do

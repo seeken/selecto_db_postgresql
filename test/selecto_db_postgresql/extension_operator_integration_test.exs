@@ -180,6 +180,231 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
     end
   end
 
+  defp in_database(setup, fun) do
+    prefix = System.get_env("SELECTO_TEST_DATABASE_PREFIX", "selecto")
+    database = "#{prefix}_gate_#{System.unique_integer([:positive])}"
+    {:ok, admin} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
+    exec!(admin, ~s|CREATE DATABASE "#{database}"|)
+    opts = options() |> Keyword.put(:pool_size, 1) |> Keyword.put(:database, database)
+
+    try do
+      {:ok, a} = Adapter.connect(opts)
+      for sql <- setup, do: exec!(a, sql)
+      {:ok, c} = Adapter.connect(opts)
+      fun.(a, c)
+      GenServer.stop(c)
+      GenServer.stop(a)
+    after
+      exec!(admin, ~s|DROP DATABASE IF EXISTS "#{database}" WITH (FORCE)|)
+      GenServer.stop(admin)
+    end
+  end
+
+  defp guarded(c, sql, params \\ []) do
+    case Adapter.execute(c, sql, params, selecto_read: true) do
+      {:ok, %{rows: rows}} -> rows
+      {:error, %{details: %{reason: reason}}} -> {:refused, reason}
+      other -> other
+    end
+  end
+
+  test "a plant beside an extension's members is ambiguous, never the choice (R58, R60)" do
+    in_database(
+      [
+        "CREATE EXTENSION hstore",
+        "CREATE EXTENSION citext",
+        "CREATE EXTENSION pgcrypto",
+        "CREATE EXTENSION pg_trgm",
+        "CREATE TABLE ht (id int PRIMARY KEY, h hstore, c citext, note text, vc varchar(20))",
+        "INSERT INTO ht VALUES (1, 'a=>1', 'Abc', 'n', 'abc'), (2, 'b=>2', 'xyz', 'n', 'xyz')"
+      ],
+      fn a, c ->
+        digest = "SELECT encode(digest(c, 'sha1'), 'hex') FROM public.ht WHERE id = 1"
+        text_digest = "SELECT encode(digest(note, 'sha1'), 'hex') FROM public.ht WHERE id = 1"
+        scope = "SELECT id FROM public.ht WHERE similarity(c, 'zzz') > 0.5 ORDER BY id"
+        word = "SELECT word_similarity('a', c) FROM public.ht WHERE id = 1"
+        delete = "SELECT delete(h, vc) FROM public.ht WHERE id = 1"
+
+        clean = guarded(c, digest)
+        assert [[hex]] = clean
+        assert is_binary(hex)
+        assert guarded(c, scope) == []
+        native_text = guarded(c, text_digest)
+        assert [[_]] = native_text
+        assert [[%{"a" => "1"}]] = guarded(c, delete)
+
+        for sql <- [
+              "CREATE FUNCTION public.digest(citext, text) RETURNS bytea LANGUAGE sql AS $$ SELECT 'FORGED'::bytea $$",
+              "CREATE FUNCTION public.delete(hstore, varchar) RETURNS hstore LANGUAGE sql AS $$ SELECT 'forged=>1'::hstore $$",
+              "CREATE FUNCTION public.similarity(citext, text) RETURNS real LANGUAGE sql AS $$ SELECT 1.0::real $$",
+              "CREATE FUNCTION public.word_similarity(text, citext) RETURNS real LANGUAGE sql AS $$ SELECT 9.0::real $$"
+            ],
+            do: exec!(a, sql)
+
+        for sql <- [digest, scope, word, text_digest] do
+          assert {:refused, :function_ambiguous} = guarded(c, sql), sql
+        end
+
+        # delete(hstore, varchar) has a member for its first argument's type.
+        assert [[%{"a" => "1"}]] = guarded(c, delete)
+      end
+    )
+  end
+
+  test "an operator no extension owns for its operands refuses, except on strings (R51)" do
+    in_database(
+      [
+        "CREATE EXTENSION citext",
+        "CREATE EXTENSION isn",
+        "CREATE DOMAIN cidom AS citext",
+        "CREATE DOMAIN tdom AS text",
+        "CREATE TABLE s (id int PRIMARY KEY, c citext, d cidom, t text, v varchar(10), td tdom, n int)",
+        "INSERT INTO s VALUES (1, 'Abc', 'Abc', 'abc', 'Abc', 'Abc', 1)",
+        "CREATE TABLE bk (id int PRIMARY KEY, a isbn13, e ean13)",
+        "INSERT INTO bk VALUES (1, '978-0-306-40615-7', '9780306406157')"
+      ],
+      fn _a, c ->
+        # String category against a pg_catalog string: as native, text.
+        assert guarded(c, "SELECT id FROM public.s WHERE c = t") == []
+        assert guarded(c, "SELECT id FROM public.s WHERE t = c") == []
+        assert guarded(c, "SELECT id FROM public.s WHERE c = v") == [[1]]
+        assert guarded(c, "SELECT id FROM public.s WHERE d = v") == [[1]]
+        assert guarded(c, "SELECT id FROM public.s WHERE c = td") == [[1]]
+        assert guarded(c, "SELECT id FROM public.s WHERE c = lower(t)") == []
+        assert guarded(c, "SELECT id FROM public.s WHERE c = 'abc'::text") == []
+        assert [["Abcx"]] = guarded(c, "SELECT c || 'x' FROM public.s")
+
+        # Against anything else: refused, not left to the server.
+        assert {:refused, :operator_not_member} =
+                 guarded(c, "SELECT id FROM public.s WHERE c = n")
+
+        # Cross-type members answer.
+        assert guarded(c, "SELECT id FROM public.bk WHERE a = e") == [[1]]
+        assert guarded(c, "SELECT id FROM public.bk WHERE e = a") == [[1]]
+        assert guarded(c, "SELECT id FROM public.bk WHERE a = '978-0-306-40615-7'") == [[1]]
+      end
+    )
+  end
+
+  test "postgis: an implicit cast never stands in for a member (R51 amendment)" do
+    {:ok, probe} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
+
+    %{rows: rows} =
+      exec!(probe, "SELECT 1 FROM pg_available_extensions WHERE name = 'postgis'")
+
+    GenServer.stop(probe)
+
+    if rows != [] do
+      in_database(
+        [
+          "CREATE EXTENSION postgis",
+          "CREATE TABLE geo (id int PRIMARY KEY, b box3d, b2 box3d, g geometry, gg geography, " <>
+            "gg2 geography, tx text, note text)",
+          "INSERT INTO geo VALUES (1, 'BOX3D(0 0 0,1 1 0)', 'BOX3D(5 5 0,6 6 0)', 'POINT(1 1)', " <>
+            "'POINT(1 1)', 'POINT(1 1)', 'POINT(1 1)', 'n'), " <>
+            "(2, 'BOX3D(5 5 0,6 6 0)', 'BOX3D(5 5 0,6 6 0)', 'POINT(2 2)', 'POINT(2 2)', " <>
+            "'POINT(1 1)', 'POINT(2 2)', 'n')"
+        ],
+        fn a, c ->
+          for sql <- [
+                "SELECT id FROM public.geo WHERE b = b2",
+                "SELECT id FROM public.geo WHERE b <> b2",
+                "SELECT id FROM public.geo WHERE b = 'BOX3D(5 5 0,6 6 0)'",
+                "SELECT id FROM public.geo WHERE g = tx",
+                "SELECT id FROM public.geo WHERE tx = g",
+                "SELECT id FROM public.geo WHERE gg <> gg2"
+              ] do
+            assert {:refused, :operator_not_member} = guarded(c, sql), sql
+          end
+
+          assert guarded(c, "SELECT id FROM public.geo WHERE g = g ORDER BY id") == [[1], [2]]
+
+          {:ok, command} =
+            Command.new(%{
+              operation: :update,
+              relation: "geo",
+              predicate: {:neq, {:field, "gg"}, {:literal, "POINT(1 1)"}},
+              assignments: [%{field: "note", value: {:literal, "x"}}],
+              expected_cardinality: :many
+            })
+
+          assert {:error, %{details: %{reason: :operator_not_member}}} =
+                   Adapter.execute_write_unsafe(c, command, [])
+
+          assert %{rows: []} = exec!(a, "SELECT id FROM geo WHERE note = 'x'")
+        end
+      )
+    end
+  end
+
+  test "catalog facts key columns exactly (R56)" do
+    in_database(
+      [
+        "CREATE EXTENSION citext",
+        ~s|CREATE TABLE cv (id int PRIMARY KEY, org text NOT NULL, "ORG" citext, note text)|,
+        ~s|INSERT INTO cv VALUES (1, 't1', 'x', 'n'), (2, 'T1', 'x', 'n'), (3, 't2', 'x', 'n')|,
+        ~s|CREATE TABLE cm (id int PRIMARY KEY, org citext, "ORG" text NOT NULL, note text)|,
+        ~s|INSERT INTO cm VALUES (1, 'x', 't1', 'n'), (2, 'x', 'T1', 'n'), (3, 'x', 't2', 'n')|
+      ],
+      fn _a, c ->
+        for {sql, rows} <- [
+              {"SELECT id FROM public.cv WHERE org = 't1'", [[1]]},
+              {"SELECT id FROM public.cv WHERE cv.org = 't1'", [[1]]},
+              {~s|SELECT id FROM public.cv WHERE "ORG" = 'X' ORDER BY id|, [[1], [2], [3]]},
+              {~s|SELECT id FROM public.cm WHERE "ORG" = 't1'|, [[1]]},
+              {"SELECT id FROM public.cm WHERE org = 'X' ORDER BY id", [[1], [2], [3]]},
+              {~s|SELECT id FROM public.cm c WHERE c."ORG" = 't1'|, [[1]]},
+              {~s|SELECT s.id FROM (SELECT id, "ORG" AS k, org AS j FROM public.cm) s WHERE s.k = 't1'|,
+               [[1]]},
+              {~s|WITH m AS (SELECT id, "ORG" FROM public.cm) SELECT id FROM m WHERE "ORG" = 't1'|,
+               [[1]]},
+              {~s|WITH m AS (SELECT id, org, "ORG" FROM public.cm) SELECT id FROM m WHERE org = 'X' ORDER BY id|,
+               [[1], [2], [3]]}
+            ] do
+          assert guarded(c, sql) == rows, sql
+        end
+      end
+    )
+  end
+
+  test "a derived output of a literal or parameter is text, not untyped (R57)" do
+    in_database(
+      [
+        "CREATE EXTENSION citext",
+        "CREATE TABLE t (id int PRIMARY KEY, c citext, vc varchar(10))",
+        "INSERT INTO t VALUES (1, 'Abc', 'Abc'), (2, 'ABC', 'ABC'), (3, 'xyz', 'xyz')"
+      ],
+      fn _a, c ->
+        for sql <- [
+              "WITH lc AS (SELECT 'ABC' AS v) SELECT t.id FROM public.t, lc WHERE t.c = lc.v",
+              "WITH lc AS (SELECT 'ABC' AS v) SELECT t.id FROM public.t JOIN lc ON lc.v = t.c",
+              "WITH lc(v) AS (VALUES ('ABC')) SELECT t.id FROM public.t, lc WHERE t.c = lc.v",
+              "WITH RECURSIVE lc(v, n) AS (SELECT 'ABC', 1 UNION ALL SELECT v, n + 1 FROM lc WHERE n < 1) " <>
+                "SELECT DISTINCT t.id FROM public.t, lc WHERE t.c = lc.v",
+              "WITH l1 AS (SELECT 'ABC' AS v), l2 AS (SELECT v AS w FROM l1) " <>
+                "SELECT t.id FROM public.t, l2 WHERE t.c = l2.w",
+              "SELECT t.id FROM public.t, (SELECT 'ABC' AS v) d WHERE t.c = d.v",
+              "SELECT t.id FROM public.t, LATERAL (SELECT 'ABC' AS v) d WHERE t.c = d.v",
+              "SELECT t.id FROM public.t WHERE t.c = (SELECT 'ABC')",
+              "SELECT t.id FROM public.t WHERE t.c IN (SELECT 'ABC')"
+            ] do
+          assert guarded(c, sql) == [[2]], sql
+        end
+
+        # Only the bare literal or parameter is untyped: citext's operator.
+        assert guarded(c, "SELECT id FROM public.t WHERE c = 'ABC' ORDER BY id") == [[1], [2]]
+
+        assert guarded(c, "SELECT id FROM public.t WHERE c = $1 ORDER BY id", ["ABC"]) == [
+                 [1],
+                 [2]
+               ]
+
+        assert guarded(c, "SELECT id FROM public.t WHERE c = vc ORDER BY id") ==
+                 [[1], [2], [3]]
+      end
+    )
+  end
+
   test "a read cannot write: a function it reaches meets a read-only transaction" do
     {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
     schema = "selecto_ro_#{System.unique_integer([:positive])}"
@@ -198,8 +423,18 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
         Adapter.execute(conn, "SELECT #{schema}.w() FROM #{schema}.ro", [], selecto_read: true)
       end
 
-      assert {:error, _} = read.(c)
+      assert {:error, %{details: %{reason: :read_only_read}}} = read.(c)
       assert %{rows: [["n"]]} = exec!(c, "SELECT note FROM #{schema}.ro")
+
+      # What merely says "for share" takes no lock.
+      for sql <- [
+            ~s|SELECT #{schema}.w() AS "for share" FROM #{schema}.ro|,
+            "SELECT #{schema}.w() /* for update */ FROM #{schema}.ro",
+            "SELECT #{schema}.w() FROM #{schema}.ro WHERE 'x FOR UPDATE' OPERATOR(pg_catalog.<>) ''"
+          ] do
+        assert {:error, %{details: %{reason: :read_only_read}}} =
+                 Adapter.execute(c, sql, [], selecto_read: true)
+      end
 
       # In a host transaction too, which stays writable afterwards.
       Postgrex.transaction(c, fn conn ->

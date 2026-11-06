@@ -52,6 +52,7 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
         ),
       fns: fns,
       type: ~s("ext"."citext"),
+      category: "S",
       elem: nil,
       unknown: false
     }
@@ -364,7 +365,85 @@ defmodule SelectoDBPostgreSQL.ExplicitSQLTest do
     end
   end
 
+  describe "tokens" do
+    test "numeric forms stay one token" do
+      for literal <- ~w(1_000 0x10 0b11 0o17 1_000.5 1e3 .5) do
+        assert Qualify.tokenize(literal) == [{:num, literal}]
+      end
+
+      assert qualify!("SELECT 1 FROM s.t WHERE a = 1_000") =~ "(1_000)"
+    end
+
+    test "unicode strings and identifiers keep their UESCAPE" do
+      assert [{:str, "U&'d!0061' UESCAPE '!'"}] = Qualify.tokenize("U&'d!0061' UESCAPE '!'")
+      assert qualify!(~s|SELECT 1 FROM s.t WHERE U&"d\\0061" = 1|) =~ ~s|U&"d\\0061"|
+    end
+
+    test "a row lock is read from tokens, not from text" do
+      lock? = &(&1 |> Qualify.tokenize() |> Qualify.row_lock?())
+
+      for sql <- [
+            "SELECT 1 FROM t FOR UPDATE",
+            "SELECT 1 FROM t for share",
+            "SELECT 1 FROM t FOR NO KEY UPDATE",
+            "SELECT 1 FROM t FOR KEY SHARE"
+          ],
+          do: assert(lock?.(sql), sql)
+
+      for sql <- [
+            "SELECT 'x FOR UPDATE' FROM t",
+            ~s|SELECT 1 AS "for share" FROM t|,
+            "SELECT 1 /* for update */ FROM t",
+            "SELECT 1 -- for no key update\n FROM t"
+          ],
+          do: refute(lock?.(sql), sql)
+    end
+  end
+
+  describe "assignments" do
+    test "a SET list's first = per item, at its own level, is the assignment" do
+      for sql <- [
+            ~s|UPDATE s.t SET a = 1, b = CASE WHEN c THEN 2 END, d = 3 WHERE (e OPERATOR(pg_catalog.=) 1)|,
+            "UPDATE s.t SET (a, b) = (1, 2) WHERE (e OPERATOR(pg_catalog.=) 1)",
+            "UPDATE s.t SET arr[1] = 5 WHERE (e OPERATOR(pg_catalog.=) 1)"
+          ] do
+        assert Qualify.lint(sql) == [], sql
+        assert {:ok, out} = Qualify.qualify(sql, %{functions: functions(), extension: false})
+        assert Qualify.lint(out) == [], out
+      end
+
+      assert [{:operator, "="}] = Qualify.lint("SELECT id AS set, b = c FROM s.t")
+      assert [{:operator, "="}] = Qualify.lint("UPDATE s.t SET a = b = c")
+      assert [{:operator, "="}] = Qualify.lint("UPDATE s.t SET a = (b = c)")
+
+      merge =
+        "MERGE INTO s.t USING s.u ON (a OPERATOR(pg_catalog.=) b) WHEN MATCHED THEN UPDATE SET c = 1 WHEN MATCHED AND d = 1 THEN DELETE"
+
+      assert [{:operator, "="}] = Qualify.lint(merge)
+    end
+  end
+
   describe "lint" do
+    test "an operator without a schema, or a foreign one in any case" do
+      assert [{:operator, "="}] = Qualify.lint("SELECT 1 FROM s.t WHERE a OPERATOR(=) 1")
+      assert qualify!("SELECT 1 FROM s.t WHERE a OPERATOR(=) 1") =~ "OPERATOR(pg_catalog.=)"
+
+      for word <- ~w(OPERATOR operator Operator) do
+        assert Qualify.rewrite?(Qualify.tokenize("SELECT a #{word}(public.=) 1"))
+      end
+
+      refute Qualify.rewrite?(Qualify.tokenize("SELECT a Operator(pg_catalog.=) 1"))
+    end
+
+    test "a function named like a keyword is a function (R60)" do
+      for name <- ~w(delete last key update first share) do
+        assert [{:function, ^name}] = Qualify.lint("SELECT #{name}(a) FROM s.t")
+      end
+
+      assert Qualify.lint("SELECT 1 FROM s.t ORDER BY a NULLS LAST FETCH FIRST (1) ROWS ONLY") ==
+               []
+    end
+
     test "any bare operator, by-name construct or unqualified function" do
       assert Qualify.lint("SELECT 1 WHERE (2 & 3) <> 0") ==
                [{:operator, "&"}, {:operator, "<>"}]

@@ -180,6 +180,8 @@ defmodule SelectoDBPostgreSQL.QueryAnalyzer do
                  Kernel.apply(adapter, :explain_read, [connection, sql, params, prefix, read_opts]) do
             {:ok, result}
           else
+            # A typed refusal stays what it is.
+            {:error, %Selecto.Error{} = error} -> {:error, error}
             {:error, reason} -> {:error, {:explain_failed, reason}}
           end
 

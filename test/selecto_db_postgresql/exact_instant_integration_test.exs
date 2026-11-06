@@ -38,6 +38,7 @@ defmodule SelectoDBPostgreSQL.ExactInstantIntegrationTest do
       name: "Owned exact instant integration",
       source: %{
         source_table: "selecto_exact_instant_live",
+        source_schema: "pg_temp",
         primary_key: :id,
         fields: Map.keys(columns),
         columns: columns,
