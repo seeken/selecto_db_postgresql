@@ -564,9 +564,53 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
 
       assert {:error, %{details: %{reason: :relation_ambiguous}}} = read.([])
 
-      # Raw text on the same route resolves as the host's session does.
-      assert {:ok, {[[99]], _, _}} = read.([{:raw_sql_filter, "selecto_root.id > 0"}])
+      # A host fragment does not make the statement the host's (R71).
+      assert {:error, %{details: %{reason: :relation_ambiguous}}} =
+               read.([{:raw_sql_filter, "selecto_root.id > 0"}])
+
       sql!(c, "SET search_path TO DEFAULT")
+    end
+
+    test "a statement carrying a host fragment keeps its relation, pin and tenant scope", ctx do
+      c = ctx.connection
+
+      domain = %{
+        name: "D",
+        source: %{
+          source_table: ctx.table,
+          source_schema: "public",
+          primary_key: :id,
+          tenant_field: :org,
+          fields: [:id, :org],
+          redact_fields: [],
+          columns: %{id: %{type: :integer}, org: %{type: :string}},
+          associations: %{}
+        },
+        schemas: %{},
+        joins: %{}
+      }
+
+      read = fn extra ->
+        domain
+        |> Selecto.configure(c, adapter: Adapter, validate: false)
+        |> Selecto.with_tenant("t1")
+        |> Selecto.select(["id", extra])
+        |> Selecto.order_by("id")
+        |> Selecto.execute()
+      end
+
+      sql!(c, "SET search_path = #{ctx.schema}, public")
+
+      # Declared public.table, not the namesake the host's path finds first, and
+      # the fragment runs under the pin: public.who(), verbatim.
+      assert {:ok, {[[1, "public"], [2, "public"]], _, _}} = read.({:raw_sql, "who() AS w"})
+      sql!(c, "SET search_path TO DEFAULT")
+
+      # A host TEMP namesake does not capture it either.
+      sql!(c, "CREATE TEMP TABLE #{ctx.table} (id int, org text)")
+      sql!(c, "INSERT INTO pg_temp.#{ctx.table} VALUES (42, 't1')")
+      assert {:ok, {[[1, 1], [2, 1]], _, _}} = read.({:raw_sql, "1 AS one"})
+      sql!(c, "DROP TABLE pg_temp.#{ctx.table}")
     end
   end
 

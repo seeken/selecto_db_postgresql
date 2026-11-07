@@ -398,21 +398,26 @@ another schema's relation, function or operator of the same name. So:
   pg_catalog string type, which compares as text as PostgreSQL does. Any other
   pair refuses in Selecto, not at the server: an implicit cast could make it
   resolve and compare the wrong thing (box3d `=` by area, geometry as text).
-- **Hand-built SQL.** Hand-built reads run exactly as written, in the host's
+- **Hand-built SQL.** Text wholly the host's runs exactly as written, in the host's
   session: no qualification, no rewriting, no catalog proof, no search_path or
-  settings pin and no relation guard, so their answers are the driver's, under
-  the host's search_path, `SET LOCAL`s and temporary tables. A statement is
-  generated only when Selecto's executor stamped it (`selecto_generated`); text
-  with no stamp is hand-built, and a generated statement that carries any such
-  text, a custom column's `select:`, a `raw_sql_filter`, a `{:ref, text}` or an
-  `{:exists, sql}` say, is hand-built as a whole. Of those, a compile keeps the
-  schema its domain declares for a relation, which is not in the text; every
-  other name resolves as the session resolves it. Three things still apply: the
-  text must be a read by its first word (SELECT, WITH, VALUES, TABLE, SHOW,
-  EXPLAIN, or `reason: :hand_built_not_a_read`), it always runs READ ONLY,
+  settings pin and no relation guard, so its answers are the driver's, under the
+  host's search_path, `SET LOCAL`s and temporary tables. A statement is generated
+  only when Selecto's executor stamped it (`selecto_generated`). Three things still
+  apply: the text must be a read by its first word (SELECT, WITH, VALUES, TABLE,
+  SHOW, EXPLAIN, or `reason: :hand_built_not_a_read`), it always runs READ ONLY,
   whatever `read_only_reads` says, so what it would write refuses
   (`reason: :read_only_read`, SQLSTATE 25006), and a session that is not UTF8
   refuses. So `transaction_read_only` reads `on` inside such a read.
+- **Host fragments.** A statement Selecto built that carries a host fragment, a
+  custom column's `select:`, a `raw_sql_filter`, a `{:ref, text}` or an
+  `{:exists, sql}` say, stays generated: its relations, filters and tenant scope
+  keep their pin and guards, and declared schemas hold. Only the fragment is
+  verbatim: no operator of such a statement is rewritten, and it runs READ ONLY.
+  Under the pin a fragment's bare names resolve as the pin does, not as the host's
+  search_path would. Tenant scope depends on a `raw_sql_filter` being well-formed:
+  one that closes its own parenthesis escapes the scope.
+- **Never build hand-built text or a raw fragment from end-user input.** It is the
+  host's own code: the write check stops honest mistakes, not evasion.
 - **Row locks.** Hand-built text and raw text cannot take row locks, on any
   route: `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE` and `FOR KEY SHARE` refuse
   `:read_only_read`. Take row locks through your own driver.
@@ -453,10 +458,9 @@ another schema's relation, function or operator of the same name. So:
   server that does not answer at all. Should a read's undo itself fail, the
   connection closes and the holder's next statement says so; Selecto never sends
   ROLLBACK or COMMIT for a transaction it does not own. A transaction begun with
-  text `BEGIN` on a pid or pool has no holder to tell: the pool's next connection
-  is a new one, so the host's following statements autocommit. Hold the connection
-  (`DBConnection.run/3` or `Postgrex.transaction/3`) for a transaction you need
-  ended visibly.
+  text `BEGIN` on a pool pid is host misuse: a pool can reconnect between statements
+  with or without Selecto, and the host's following statements would autocommit.
+  Use a transaction handle (`DBConnection.run/3` or `Postgrex.transaction/3`).
   `config :selecto_db_postgresql, read_only_reads: false` turns this off.
 - **EXPLAIN is a read.** `Selecto.explain/2`, `explain_analyze/2` and
   `QueryAnalyzer` run through the same qualification, pin and session checks,

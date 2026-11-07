@@ -55,7 +55,7 @@ defmodule SelectoDBPostgreSQL.ReadEndingIntegrationTest do
           needle = prefix <> " selecto_read_"
 
           if left > 0 and :binary.match(data, needle) != :nomatch do
-            broken = prefix <> " selecto_gone_"
+            broken = prefix <> Agent.get(:selecto_end_mode, & &1)
             {:binary.replace(data, needle, broken), Map.put(map, prefix, left - 1)}
           else
             {data, map}
@@ -66,6 +66,12 @@ defmodule SelectoDBPostgreSQL.ReadEndingIntegrationTest do
   end
 
   setup do
+    # A name the server cannot parse fails as an undo that cannot run.
+    start_supervised!(%{
+      id: :selecto_end_mode,
+      start: {Agent, :start_link, [fn -> " 1electo_read_" end, [name: :selecto_end_mode]]}
+    })
+
     opts = ConnectionOptions.options()
     {local, rules} = Proxy.start(~c"127.0.0.1", Keyword.fetch!(opts, :port))
 
@@ -107,7 +113,7 @@ defmodule SelectoDBPostgreSQL.ReadEndingIntegrationTest do
              Postgrex.transaction(ctx.c, fn t ->
                {:ok, _} = insert(t, ctx, 1)
 
-               assert {:error, %Postgrex.Error{postgres: %{pg_code: "3B001"}}} =
+               assert {:error, %Postgrex.Error{postgres: %{code: :syntax_error}}} =
                         Adapter.execute(t, "SELECT 1", [], selecto_read: true)
 
                {:ok, _} = insert(t, ctx, 2)
@@ -137,6 +143,48 @@ defmodule SelectoDBPostgreSQL.ReadEndingIntegrationTest do
 
     Proxy.break(ctx.rules, %{})
     assert {:ok, %{rows: [[1]]}} = wait_for_read(ctx.c, 40)
+  end
+
+  test "3B001 on the undo is a savepoint never taken: no close", ctx do
+    Agent.update(:selecto_end_mode, fn _ -> " selecto_gone_" end)
+    Proxy.break(ctx.rules, %{"RELEASE SAVEPOINT" => 9, "ROLLBACK TO SAVEPOINT" => 9})
+    [[backend]] = Postgrex.query!(ctx.c, "SELECT pg_backend_pid()", []).rows
+
+    assert {:error, _} =
+             Postgrex.transaction(ctx.c, fn t ->
+               assert {:error, _} = Adapter.execute(t, "SELECT 1", [], selecto_read: true)
+               Postgrex.rollback(t, :host_ends_it)
+             end)
+
+    Proxy.break(ctx.rules, %{})
+    assert [[^backend]] = Postgrex.query!(ctx.c, "SELECT pg_backend_pid()", []).rows
+  end
+
+  test "a cancel on a catalog read's ROLLBACK TO is retried, and keeps nothing aborted" do
+    canceled = {:error, %Postgrex.Error{postgres: %{code: :query_canceled, pg_code: "57014"}}}
+    {:ok, left} = Agent.start_link(fn -> 2 end)
+    {:ok, sent} = Agent.start_link(fn -> [] end)
+
+    execute = fn statement, _params ->
+      text = SelectoDBPostgreSQL.SessionGuard.control_sql(statement) || statement
+      Agent.update(sent, &[text | &1])
+
+      if String.starts_with?(text, "ROLLBACK TO") and
+           Agent.get_and_update(left, &{&1 > 0, &1 - 1}),
+         do: canceled,
+         else: {:ok, %{rows: []}}
+    end
+
+    assert :ok =
+             SelectoDBPostgreSQL.SessionGuard.undo_savepoint(
+               execute,
+               "selecto_path_0000000000000000"
+             )
+
+    assert length(Enum.filter(Agent.get(sent, & &1), &String.starts_with?(&1, "ROLLBACK TO"))) ==
+             3
+
+    assert Enum.any?(Agent.get(sent, & &1), &String.starts_with?(&1, "RELEASE"))
   end
 
   test "on a pid in a text BEGIN the failure is returned, not raised", ctx do

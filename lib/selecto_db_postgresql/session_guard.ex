@@ -239,6 +239,29 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
     %__MODULE__.Control{sql: sql}
   end
 
+  @doc """
+  Returns to savepoint `name` and releases it: `:ok`, or the failure that stayed.
+  A cancel is retried: it must not leave the transaction aborted for the next
+  statement (R72). 3B001 is a savepoint never taken.
+  """
+  def undo_savepoint(execute, name, attempts \\ 20) do
+    undo = fn sql -> execute.(control(sql <> name), []) end
+
+    with {:ok, _} <- undo.("ROLLBACK TO SAVEPOINT "),
+         {:ok, _} <- undo.("RELEASE SAVEPOINT ") do
+      :ok
+    else
+      {:error, %Postgrex.Error{postgres: %{pg_code: "3B001"}}} ->
+        :ok
+
+      {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} when attempts > 1 ->
+        undo_savepoint(execute, name, attempts - 1)
+
+      {:error, _} = failure ->
+        failure
+    end
+  end
+
   @doc "The text of a marked statement, or nil: a hand-built mark is no mark."
   def control_sql(%__MODULE__.Control{sql: sql}) when is_binary(sql),
     do: if(control_sql?(sql), do: sql)

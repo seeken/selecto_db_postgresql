@@ -257,12 +257,10 @@ defmodule SelectoDBPostgreSQL.RelationPath do
       {:ok, _} ->
         result = lookup(execute, plain, false)
 
-        Enum.each(
-          ["ROLLBACK TO SAVEPOINT " <> name, "RELEASE SAVEPOINT " <> name],
-          &execute.(SessionGuard.control(&1), [])
-        )
-
-        result
+        case SessionGuard.undo_savepoint(execute, name) do
+          :ok -> result
+          failure -> if match?({:ok, _, _, _}, result), do: lookup_failure(failure), else: result
+        end
 
       other ->
         lookup_failure(other)

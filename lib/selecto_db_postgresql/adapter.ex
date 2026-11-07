@@ -322,50 +322,46 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # A read that reaches the adapter without them (R39: no domain, or an
   # entry point that skipped prepare_read) resolves the relations its own
   # text names, with the same rules.
-  defp qualify_read(connection, query, opts) do
-    if hand_built?(opts),
-      do: hand_built_read(connection, query, opts),
-      else: generated_read(query, opts)
-  end
+  defp qualify_read(_connection, query, opts) do
+    case read_kind(opts) do
+      :hand_built ->
+        with :ok <- hand_built_read(query) do
+          {:ok, query, Keyword.put(opts, :selecto_read_kind, :hand_built)}
+        end
 
-  # Text is hand-built unless Selecto's executor stamped it generated: the
-  # compile saw no mark, and it named the statement's relations.
-  defp hand_built?(opts) do
-    Keyword.get(opts, :selecto_raw_sql) == true or
-      Keyword.get(opts, :selecto_generated) != true or
-      not is_map(Keyword.get(opts, :selecto_qualified_relations))
-  end
-
-  defp generated_read(query, opts) do
-    case RelationPath.qualify(query, Keyword.fetch!(opts, :selecto_qualified_relations)) do
-      {:ok, query} -> {:ok, query, Keyword.put(opts, :selecto_hand_built, false)}
-      {:error, %Error{} = error} -> {:error, read_refusal(error)}
+      kind ->
+        case RelationPath.qualify(query, Keyword.fetch!(opts, :selecto_qualified_relations)) do
+          {:ok, query} -> {:ok, query, Keyword.put(opts, :selecto_read_kind, kind)}
+          {:error, %Error{} = error} -> {:error, read_refusal(error)}
+        end
     end
   end
 
-  # R68, R71: hand-built text runs exactly as written, in the host's session:
-  # nothing types, proves or rewrites it, no search_path or setting is pinned and
-  # no relation guard reads the session, so its answers are the driver's. It must
-  # be a read, runs in a READ ONLY transaction that refuses what it would write,
-  # and refuses a session that is not UTF8 (R65). A compile carrying raw text
-  # keeps the schema its domain declares for a relation, which is not in the text;
-  # every other name resolves as the host's session resolves it.
-  defp hand_built_read(_connection, query, opts) do
-    with :ok <- ExplicitSQL.hand_built_read(query),
-         {:ok, query} <- declared_relations(query, opts) do
-      {:ok, query, Keyword.put(opts, :selecto_hand_built, true)}
-    else
-      {:error, %Error{} = error} -> {:error, read_refusal(error)}
+  # R71: what a read is, from what Selecto's executor said about its compile.
+  #
+  # `:generated`: every part of it is Selecto's. `:mixed`: Selecto built it and
+  # it carries a host fragment: its relations, filters and tenant scope keep the
+  # pin and guards, and no operator of it is rewritten, since the fragment must
+  # stay verbatim. `:hand_built`: the text is wholly the host's, and runs in the
+  # host's session, exactly as written (R68): no search_path or setting is pinned
+  # and no relation guard reads the session, so its answers are the driver's.
+  #
+  # Mixed and hand-built reads run READ ONLY, which refuses what they would write;
+  # hand-built text must also be a read by its first word, and any read refuses a
+  # session that is not UTF8 (R65).
+  defp read_kind(opts) do
+    relations? = is_map(Keyword.get(opts, :selecto_qualified_relations))
+
+    cond do
+      relations? and Keyword.get(opts, :selecto_raw_sql) == true -> :mixed
+      relations? and Keyword.get(opts, :selecto_generated) == true -> :generated
+      true -> :hand_built
     end
   end
 
-  defp declared_relations(query, opts) do
-    case Keyword.get(opts, :selecto_qualified_relations) do
-      relations when is_map(relations) and map_size(relations) > 0 ->
-        RelationPath.qualify(query, relations)
-
-      _none ->
-        {:ok, query}
+  defp hand_built_read(query) do
+    with {:error, %Error{} = error} <- ExplicitSQL.hand_built_read(query) do
+      {:error, read_refusal(error)}
     end
   end
 
@@ -388,54 +384,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
         # R46 FINAL-2: the catalog operator types of the relations' columns,
         # so every generated comparison names its operator and casts both
         # operands (Selecto.Builder.TypedOperator).
-        case with_declared(resolve_relations(connection, names), declared) do
-          {:ok, relations} ->
-            with {:ok, types} <- operator_types(connection, relations) do
-              set =
-                (Map.get(selecto, :set) || %{})
-                |> Map.put(:qualified_relations, relations)
-                |> Map.put(:declared_relations, declared_only(relations, declared))
-                |> Map.put(:pg_operator_types, types)
+        with {:ok, relations} <- with_declared(resolve_relations(connection, names), declared),
+             {:ok, types} <- operator_types(connection, relations) do
+          set =
+            (Map.get(selecto, :set) || %{})
+            |> Map.put(:qualified_relations, relations)
+            |> Map.put(:pg_operator_types, types)
 
-              {:ok, %{selecto | set: set}}
-            else
-              {:error, %Error{} = error} -> {:error, read_refusal(error)}
-              {:error, _reason} = error -> error
-            end
-
-          {:error, %Error{details: %{reason: reason}} = error}
-          when reason in [:relation_ambiguous, :relation_unresolved] ->
-            # R71: a guard of generated SQL. The compile decides whether it
-            # applies: raw text resolves as the host's session does.
-            set =
-              (Map.get(selecto, :set) || %{})
-              |> Map.put(:declared_relations, declared_relations_map(declared))
-              |> Map.put(:generated_read_refusal, read_refusal(error))
-
-            {:ok, %{selecto | set: set}}
-
-          {:error, %Error{} = error} ->
-            {:error, read_refusal(error)}
-
-          {:error, _reason} = error ->
-            error
+          {:ok, %{selecto | set: set}}
+        else
+          {:error, %Error{} = error} -> {:error, read_refusal(error)}
+          {:error, _reason} = error -> error
         end
     end
   end
 
   def prepare_read(selecto, _connection), do: {:ok, selecto}
-
-  defp declared_only(relations, declared),
-    do: Map.take(relations, Map.keys(declared_relations_map(declared)))
-
-  defp declared_relations_map(declared) do
-    for {table, schema} <- declared, is_binary(schema), into: %{} do
-      {table, quote_relation_name(schema, table)}
-    end
-  end
-
-  defp quote_relation_name(schema, table),
-    do: ~s("#{String.replace(schema, "\"", "\"\"")}"."#{String.replace(table, "\"", "\"\"")}")
 
   # `source_schema` declared next to a `source_table`, per table, across the
   # read's domains; a table declared with two schemas refuses.
@@ -703,7 +667,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # read_only_reads setting does not reach it. In a host transaction the setting outlives RELEASE, so a read-only
   # savepoint always ends by ROLLBACK TO: it changed nothing to keep.
   defp run_guarded_read(execute, guard, in_transaction?, query, params, plan) do
-    read_only? = plan.hand_built or read_only?(query)
+    read_only? = plan.kind != :generated or read_only?(query)
 
     {open, close, undo} =
       if in_transaction? do
@@ -731,7 +695,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       with {:ok, prior} <- arm_deadline(guard, keeps_savepoint?, ms),
            {:ok, state} <- open_read(guard, query, read_only?, keeps_savepoint?, ms, plan),
            {:ok, query} <- read_statement(guard, query, state, plan),
-           {:ok, result} <- read_result(execute.(plan.prefix <> query, params), plan.hand_built),
+           {:ok, result} <- read_result(execute.(plan.prefix <> query, params), plan.kind),
            :ok <- close_read(guard, state, plan),
            :ok <- disarm_deadline(guard, prior),
            :ok <- run_all(guard, close) do
@@ -744,15 +708,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   # What a read's own statement could not finish, it undoes here. The original
   # stands: a read kept nothing, and what failed it (a timeout) may be why the
-  # undo fails too. A statement this read cannot undo closes the connection, the
-  # last resort, so nothing it did stays in the host's transaction, and the
-  # holder's next statement says so.
-  defp undo_read(guard, undo, error, plan, attempts \\ 3) do
+  # undo fails too. A cancel is retried; 3B001 is a savepoint never taken, with
+  # nothing to undo. An undo that cannot run closes the connection, the last
+  # resort, so nothing it did stays in the host's transaction, and the holder's
+  # next statement says so.
+  defp undo_read(guard, undo, error, plan, attempts \\ 20) do
     case run_all(guard, undo) do
       :ok ->
         error
 
-      {:error, _} when attempts > 1 ->
+      {:error, %Postgrex.Error{postgres: %{pg_code: "3B001"}}} ->
+        error
+
+      {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} when attempts > 1 ->
         undo_read(guard, undo, error, plan, attempts - 1)
 
       {:error, _} ->
@@ -761,7 +729,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp open_read(guard, _query, _read_only?, _keeps?, ms, %{hand_built: true}) do
+  defp open_read(guard, _query, _read_only?, _keeps?, ms, %{kind: :hand_built}) do
     with {:ok, _} <- read_step(SessionGuard.open_hand_built(guard, statement_timeout: ms)) do
       {:ok, :hand_built}
     end
@@ -786,9 +754,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp close_read(guard, {before, pinned}, _plan),
     do: read_step(SessionGuard.close(guard, before, pinned))
 
-  # The text a read sends: hand-built text as written (R68), generated text
-  # with every relation qualified and every operator and function explicit.
-  defp read_statement(_guard, query, :hand_built, %{prefix: prefix}) do
+  # The text a read sends: hand-built text as written (R68), a mixed statement
+  # with its fragment verbatim, generated text with every relation qualified and
+  # every operator and function explicit.
+  defp read_statement(_guard, query, _state, %{kind: kind, prefix: prefix})
+       when kind in [:hand_built, :mixed] do
     text = IO.iodata_to_binary(query)
     _ = SQLRecorder.host(prefix <> text)
     {:ok, text}
@@ -884,7 +854,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
              {:ok, _} <- guard.(savepoint, []) do
           with {:ok, prior} <- arm_deadline(guard, is_integer(ms), ms),
                {:ok, result} <- guard.(sql, params) do
-            if plan.hand_built and not plan_reads?(result) do
+            if plan.kind != :generated and not plan_reads?(result) do
               undo_read(guard, undo, :ok, plan)
             else
               with :ok <- disarm_deadline(guard, prior),
@@ -905,7 +875,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp hold_statement(query, params, %{hand_built: true}) do
+  defp hold_statement(query, params, %{kind: kind}) when kind in [:hand_built, :mixed] do
     text = IO.iodata_to_binary(query)
 
     if ExplicitSQL.planned?(text),
@@ -955,19 +925,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
     {:qualify_refuse, _reason, _message} -> false
   end
 
-  # A read that wrote refuses, typed. Whatever else hand-built text fails with
+  # A read that wrote refuses, typed. Whatever else text with host SQL in it fails with
   # is the driver's answer, as written.
   defp read_result({:error, %Postgrex.Error{postgres: %{code: :read_only_sql_transaction}}}, _),
     do: {:error, read_refusal(read_wrote())}
 
-  defp read_result(result, true), do: result
+  defp read_result(result, kind) when kind in [:hand_built, :mixed], do: result
 
   # No operator or function for the operands (an extension type without a
   # member for that operator): typed, like every other refusal of this step.
-  defp read_result({:error, %Postgrex.Error{postgres: %{code: :undefined_function}}}, false),
+  defp read_result({:error, %Postgrex.Error{postgres: %{code: :undefined_function}}}, :generated),
     do: {:error, read_refusal(no_operator())}
 
-  defp read_result(result, false), do: result
+  defp read_result(result, :generated), do: result
 
   defp read_wrote do
     Error.new(:query_enforcement, "PostgreSQL refuses a read that tried to write",
@@ -1005,7 +975,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # The search_path a read pins (R30), from the relations prepare_read/2
   # resolved for it.
   defp read_path(opts) do
-    if Keyword.get(opts, :selecto_hand_built, false),
+    if Keyword.get(opts, :selecto_read_kind) == :hand_built,
       do: nil,
       else: RelationPath.pinned_path(Keyword.get(opts, :selecto_qualified_relations))
   end
@@ -1017,7 +987,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       path: read_path(opts),
       prefix: Keyword.get(opts, :selecto_explain, ""),
       declared_functions: Keyword.get(opts, :selecto_declared_functions, []),
-      hand_built: Keyword.get(opts, :selecto_hand_built, false),
+      kind: Keyword.get(opts, :selecto_read_kind, :generated),
       deadline: deadline,
       timeout: timeout
     }
@@ -1068,13 +1038,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
     with {:ok, _} <- guard.(SessionGuard.control("SAVEPOINT " <> name), []) do
       result = fun.()
 
-      _ =
-        run_all(guard, [
-          SessionGuard.control("ROLLBACK TO SAVEPOINT " <> name),
-          SessionGuard.control("RELEASE SAVEPOINT " <> name)
-        ])
-
-      result
+      case SessionGuard.undo_savepoint(guard, name) do
+        :ok -> result
+        {:error, _} = failure -> if match?({:error, _}, result), do: result, else: failure
+      end
     end
   end
 
@@ -4076,12 +4043,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp undo_savepoint(query, name, error) do
+  defp undo_savepoint(query, name, error, attempts \\ 20) do
     with {:ok, _} <- query.("ROLLBACK TO SAVEPOINT #{name}"),
          {:ok, _} <- query.("RELEASE SAVEPOINT #{name}") do
       error
     else
-      _failed -> broken(error)
+      {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} when attempts > 1 ->
+        undo_savepoint(query, name, error, attempts - 1)
+
+      {:error, %Postgrex.Error{postgres: %{pg_code: "3B001"}}} ->
+        error
+
+      _failed ->
+        broken(error)
     end
   end
 
@@ -4336,24 +4310,32 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   # What a stream runs under: `{before, pinned, statement}`, the session
-  # snapshot and pin of generated SQL, or none for hand-built text (R71).
+  # snapshot and pin, or none for text wholly the host's (R71).
   defp stream_guards(check, query, opts) do
-    if Keyword.get(opts, :selecto_hand_built, false) do
-      with {:ok, _} <- SessionGuard.open_hand_built(check) do
-        {:ok, {nil, nil, SQLRecorder.host(query)}}
-      end
-    else
-      with :ok <- RelationPath.qualified(query),
-           {:ok, before} <- SessionGuard.check(check, query),
-           {:ok, pinned} <-
-             SessionGuard.pin(check, read_path(opts), read_only: read_only?(query)),
-           {:ok, prepared} <-
-             ExplicitSQL.prepare(check, query,
-               isolation: pinned.isolation,
-               declared_functions: Keyword.get(opts, :selecto_declared_functions, [])
-             ) do
-        {:ok, {before, pinned, prepared}}
-      end
+    case Keyword.get(opts, :selecto_read_kind) do
+      :hand_built ->
+        with {:ok, _} <- SessionGuard.open_hand_built(check) do
+          {:ok, {nil, nil, SQLRecorder.host(query)}}
+        end
+
+      :mixed ->
+        with {:ok, before} <- SessionGuard.check(check, query),
+             {:ok, pinned} <- SessionGuard.pin(check, read_path(opts), read_only: true) do
+          {:ok, {before, pinned, SQLRecorder.host(query)}}
+        end
+
+      _generated ->
+        with :ok <- RelationPath.qualified(query),
+             {:ok, before} <- SessionGuard.check(check, query),
+             {:ok, pinned} <-
+               SessionGuard.pin(check, read_path(opts), read_only: read_only?(query)),
+             {:ok, prepared} <-
+               ExplicitSQL.prepare(check, query,
+                 isolation: pinned.isolation,
+                 declared_functions: Keyword.get(opts, :selecto_declared_functions, [])
+               ) do
+          {:ok, {before, pinned, prepared}}
+        end
     end
   end
 
@@ -4473,7 +4455,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
             {:halt, state}
 
           {^ref, {:done, {:error, %Selecto.Error{} = refusal}}} ->
-            raise Selecto.Error.to_exception(refusal)
+            raise Selecto.Error.Refused, refusal
 
           {^ref, {:done, {:error, reason}}} ->
             raise "PostgreSQL stream transaction failed: #{inspect(reason)}"
