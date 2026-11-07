@@ -365,7 +365,12 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
         @reset_values <>
         " SELECT b.*, " <> pin_columns("$3", opts) <> " FROM selecto_before b"
 
-    params = [Enum.uniq(relation_tokens(sql)), tokens(sql), path]
+    deadline = Keyword.get(opts, :statement_timeout)
+
+    params =
+      [Enum.uniq(relation_tokens(sql)), tokens(sql), path] ++
+        if(deadline, do: [Integer.to_string(deadline)], else: [])
+
     width = length(@settings) + 2
 
     case execute.(statement, params) do
@@ -387,6 +392,50 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
               {:ok, state, pinned}
             end
         end
+
+      other ->
+        unavailable(other)
+    end
+  end
+
+  @current_timeout "CAST(pg_catalog.current_setting('statement_timeout') AS pg_catalog.interval)"
+
+  @doc """
+  SQL arming a read's deadline, `param` in milliseconds, local to the current
+  transaction or savepoint. A shorter statement_timeout of the host's stands.
+  """
+  def deadline_sql(param) do
+    wanted = "CAST(pg_catalog.concat(#{param}::pg_catalog.text, ' ms') AS pg_catalog.interval)"
+
+    "pg_catalog.set_config('statement_timeout', CASE WHEN #{@current_timeout} " <>
+      "OPERATOR(pg_catalog.=) CAST('0' AS pg_catalog.interval) OR #{@current_timeout} " <>
+      "OPERATOR(pg_catalog.>) #{wanted} THEN #{param}::pg_catalog.text " <>
+      "ELSE pg_catalog.current_setting('statement_timeout') END, true)"
+  end
+
+  @doc """
+  What a hand-built read runs under, in its own transaction or savepoint (R71):
+  the UTF8 check (R65) and READ ONLY (R55), and `statement_timeout:` when it has
+  a deadline. Nothing else of the host's session changes.
+  """
+  def open_hand_built(execute, opts \\ []) do
+    {deadline, params} =
+      case Keyword.get(opts, :statement_timeout) do
+        nil ->
+          {"", []}
+
+        ms ->
+          {", #{deadline_sql("$1")} AS selecto_guard_deadline", [Integer.to_string(ms)]}
+      end
+
+    statement =
+      "SELECT CAST(pg_catalog.pg_client_encoding() AS pg_catalog.text) AS selecto_guard_encoding, " <>
+        "pg_catalog.set_config('transaction_read_only', 'on', true) AS selecto_guard_pin_read_only" <>
+        deadline
+
+    case execute.(statement, params) do
+      {:ok, %{rows: [[encoding | _]]}} when is_binary(encoding) ->
+        utf8(%{settings: [{"client_encoding", encoding}]})
 
       other ->
         unavailable(other)
@@ -428,6 +477,8 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
     end
   end
 
+  # A read's deadline (`statement_timeout:`, ms) rides on the search_path pin: it
+  # is $4 of open_read/4 and local to the read's own scope, like the rest.
   defp pin_columns(path, opts) do
     read_only =
       if Keyword.get(opts, :read_only) == true,
@@ -436,8 +487,17 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
             "AS selecto_guard_pin_read_only",
         else: ""
 
-    "pg_catalog.set_config('search_path', #{path}::pg_catalog.text, true) " <>
-      "AS selecto_guard_pin_0, " <>
+    search_path = "pg_catalog.set_config('search_path', #{path}::pg_catalog.text, true)"
+
+    search_path =
+      if Keyword.get(opts, :statement_timeout) do
+        "CASE WHEN #{deadline_sql("$4")} IS NOT NULL THEN #{search_path} END"
+      else
+        search_path
+      end
+
+    search_path <>
+      " AS selecto_guard_pin_0, " <>
       Enum.map_join(Enum.with_index(@pinned, 1), ", ", fn {name, index} ->
         reset =
           "(SELECT r.reset_val FROM selecto_reset_values r " <>
