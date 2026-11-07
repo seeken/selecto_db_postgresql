@@ -404,7 +404,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # `source_schema` declared next to a `source_table`, per table, across the
   # read's domains; a table declared with two schemas refuses.
   defp declared_schemas(selecto) do
-    queries = [selecto | Selecto.Executor.set_operands(selecto)]
+    queries = Selecto.Executor.read_queries(selecto)
     declared = queries |> Enum.map(&Map.get(&1, :domain)) |> Enum.reduce(%{}, &collect_declared/2)
     Enum.reduce(queries, declared, &inherit_root_schema/2)
   end
@@ -427,7 +427,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp domain_tables(selecto), do: Selecto.Executor.domain_relations(%{selecto | set: %{}})
+  # Its own tables, and those its ad-hoc joins name; a subquery join's query
+  # has a root of its own.
+  defp domain_tables(selecto),
+    do:
+      Selecto.Executor.domain_relations(%{selecto | set: %{}}) ++
+        Selecto.Executor.dynamic_sources(selecto)
 
   defp schema_name(schema) when is_binary(schema) and schema != "", do: schema
   defp schema_name(schema) when is_atom(schema) and not is_nil(schema), do: Atom.to_string(schema)
