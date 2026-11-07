@@ -4,6 +4,11 @@ CHANGES
 Unreleased
 ----------
 
+- An ad-hoc join's table and a subquery join's tables resolve, pin and guard like
+  the domain's own: on default settings they answer, under a root that declares
+  its schema an ad-hoc source resolves there (R59), a subquery's own declared
+  schema holds, and a host path that would read another table refuses with
+  `relation_ambiguous`.
 - Text wholly the host's runs exactly as written, in the host's session (R68, R71):
   no qualification, rewriting or catalog proof, no search_path or settings pin, no
   `temporary_relations` or `relation_ambiguous` guard, and `:sql_unprovable` and the
