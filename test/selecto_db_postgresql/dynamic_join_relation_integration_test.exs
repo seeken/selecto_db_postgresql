@@ -109,6 +109,23 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
     assert rows(Selecto.execute(ad_hoc(ctx, products(ctx)))) == [["a", "public"]]
   end
 
+  test "an ad-hoc join on a VALUES list the statement defines answers", ctx do
+    query =
+      Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.with_values([[1, "first"]], columns: ["product_id", "label"], as: "labels")
+      |> Selecto.join(:labels,
+        source: "labels",
+        type: :left,
+        owner_key: :id,
+        related_key: :product_id,
+        fields: %{label: %{type: :string}}
+      )
+      |> Selecto.select(["name", "labels.label"])
+      |> Selecto.order_by("name")
+
+    assert rows(Selecto.execute(query)) == [["a", "first"], ["b", nil]]
+  end
+
   test "under a root that declares its schema, an ad-hoc join resolves there", ctx do
     assert rows(Selecto.execute(ad_hoc(ctx, products(ctx, ctx.alt)))) == [["alt-a", "alt"]]
   end
