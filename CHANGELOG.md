@@ -4,16 +4,16 @@ CHANGES
 Unreleased
 ----------
 
-- Hand-built reads and raw text run exactly as written, in the host's session
-  (R68, R71): no qualification, rewriting or catalog proof, no search_path or
-  settings pin, no `temporary_relations` or `relation_ambiguous` guard, and
-  `:sql_unprovable` and the statement size bound on them are gone. Text is
-  hand-built unless Selecto's executor stamped it `selecto_generated`, and a
-  compile carrying raw text keeps only the schemas its domain declares. It must
-  be a read by its first word (`:hand_built_not_a_read`; SHOW and EXPLAIN are
-  reads), refuses a non-UTF8 session and always runs READ ONLY, so hand-built
-  writes and row locks, on every route, refuse `:read_only_read`. Whatever else
-  fails is the driver's error.
+- Text wholly the host's runs exactly as written, in the host's session (R68, R71):
+  no qualification, rewriting or catalog proof, no search_path or settings pin, no
+  `temporary_relations` or `relation_ambiguous` guard, and `:sql_unprovable` and the
+  statement size bound on it are gone. It must be a read by its first word
+  (`:hand_built_not_a_read`; SHOW and EXPLAIN are reads), refuses a non-UTF8 session
+  and always runs READ ONLY, so hand-built writes and row locks, on every route,
+  refuse `:read_only_read`. Whatever else fails is the driver's error.
+- A statement Selecto built that carries a host fragment stays generated: its
+  relations, filters and tenant scope keep their pin and guards, only the fragment
+  is verbatim, and it runs READ ONLY.
 - A read's `:timeout` on a connection the host holds is the server's
   `statement_timeout`: no process is killed, the reply is read, the read is
   undone and the host's transaction goes on.
@@ -36,8 +36,8 @@ Unreleased
   is what the caller is told, never `relation_unresolved` or
   `session_state_unavailable`.
 
-- Builders mark any statement carrying text they did not generate, and it counts
-  as hand-built whole. CTE names are read from tokens, SEARCH and CYCLE included,
+- Builders mark any statement carrying text they did not generate, and its
+  fragment stays verbatim. CTE names are read from tokens, SEARCH and CYCLE included,
   and a WITH list that cannot be read refuses, on every generated statement.
   NULLIF's result is coerced to the type its equality took; a volatile first
   operand of NULLIF or a simple CASE refuses `:volatile_operand`. Anything

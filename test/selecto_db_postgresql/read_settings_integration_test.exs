@@ -80,7 +80,7 @@ defmodule SelectoDBPostgreSQL.ReadSettingsIntegrationTest do
 
     # Selecto.Error.to_exception/1's form: the refusal's own message, with no
     # driver error dumped into it.
-    assert_raise(RuntimeError, "PostgreSQL refuses a read that tried to write", fn ->
+    assert_raise(Selecto.Error.Refused, "PostgreSQL refuses a read that tried to write", fn ->
       Enum.to_list(stream)
     end)
   end
@@ -105,6 +105,16 @@ defmodule SelectoDBPostgreSQL.ReadSettingsIntegrationTest do
 
       rows = Task.await(Task.async(fn -> Enum.map(stream, fn {[g], _} -> g end) end))
       assert rows == [1, 2, 3]
+    end
+
+    test "opened idle and enumerated after a host BEGIN: typed, and the host goes on", %{c: c} do
+      {:ok, stream} = Adapter.stream(c, "SELECT 1", [], selecto_read: true)
+      {:ok, _} = Adapter.execute(c, "BEGIN", [], [])
+
+      error = assert_raise Selecto.Error.Refused, fn -> Enum.to_list(stream) end
+      assert error.details.reason == :stream_in_transaction
+      assert {:ok, %{rows: [[1]]}} = Adapter.execute(c, "SELECT 1", [], [])
+      {:ok, _} = Adapter.execute(c, "ROLLBACK", [], [])
     end
 
     test "a refusal is the call's, typed", %{c: c} do
