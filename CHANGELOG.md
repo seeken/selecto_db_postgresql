@@ -4,21 +4,30 @@ CHANGES
 Unreleased
 ----------
 
-- Hand-built reads run exactly as written (R68): no qualification, rewriting or
-  catalog proof, and `:sql_unprovable` and the statement size bound on them are
-  gone. Text is hand-built unless Selecto's executor stamped it
-  `selecto_generated`, and a compile carrying raw text keeps only its domain's
-  relation names. It must be a read by its first word
-  (`:hand_built_not_a_read`) and always runs READ ONLY, so hand-built writes,
-  `FOR UPDATE` included, refuse `:read_only_read`. A relation or function that
-  does not resolve is the driver's error, not a Selecto refusal.
+- Hand-built reads and raw text run exactly as written, in the host's session
+  (R68, R71): no qualification, rewriting or catalog proof, no search_path or
+  settings pin, no `temporary_relations` or `relation_ambiguous` guard, and
+  `:sql_unprovable` and the statement size bound on them are gone. Text is
+  hand-built unless Selecto's executor stamped it `selecto_generated`, and a
+  compile carrying raw text keeps only the schemas its domain declares. It must
+  be a read by its first word (`:hand_built_not_a_read`; SHOW and EXPLAIN are
+  reads), refuses a non-UTF8 session and always runs READ ONLY, so hand-built
+  writes and row locks, on every route, refuse `:read_only_read`. Whatever else
+  fails is the driver's error.
+- A read's `:timeout` on a connection the host holds is the server's
+  `statement_timeout`: no process is killed, the reply is read, the read is
+  undone and the host's transaction goes on.
 - A read in a host transaction takes its relation locks before its savepoint, so
-  they last to the host's commit, for tables and views alike (R69).
-- `stream/4` of a Selecto read opens at the call: a refusal or a failed first
-  fetch is returned, not raised on enumeration. A stream left unenumerated gives
-  its connection back after `:receive_timeout`.
-- A write whose RELEASE SAVEPOINT fails goes back to the savepoint, or reports the
-  connection broken (R70).
+  they last to the host's commit, for tables and views alike (R69). Hand-built
+  text is judged by its plan, `EXPLAIN (FORMAT JSON)`, under the read's deadline.
+- A failed RELEASE or ROLLBACK TO at the end of a read reaches the caller: it is
+  retried, then the connection closes. Selecto sends no ROLLBACK or COMMIT for a
+  transaction the host owns. A write whose RELEASE SAVEPOINT fails goes back to
+  the savepoint, or reports the connection broken (R70).
+- `stream/4` of a Selecto read returns its refusals at the call, typed, and stays
+  lazy: it holds nothing until enumerated.
+- A catalog read in a host transaction runs in a savepoint of its own, so a cancel
+  keeps its type and leaves the host's transaction alive.
 - Generated SQL: citext against `websearch_to_tsquery` and the like resolves to
   pg_catalog's text `@@`; a column through a `SELECT *` CTE (materialized-path
   joins) keeps its type; `upper(citext)` and two bare literals under NULLIF are

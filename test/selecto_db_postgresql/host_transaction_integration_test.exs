@@ -193,6 +193,34 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       end
     end
 
+    test "the plan decides, not the words", ctx do
+      words = "selecto_host_words_#{System.unique_integer([:positive])}"
+
+      sql!(
+        ctx.other,
+        ~s|CREATE TABLE public.#{words} (id int PRIMARY KEY, update int, "delete" int)|
+      )
+
+      try do
+        for sql <- [
+              "SELECT update FROM public.#{words}",
+              ~s|SELECT "delete" FROM public.#{words}|,
+              "SELECT id AS merge FROM public.#{words}",
+              "SELECT id FROM public.#{words} WHERE 'x\nModifyTable' <> ''"
+            ] do
+          {:ok, blocked?} =
+            Postgrex.transaction(ctx.connection, fn conn ->
+              assert {:ok, _} = Adapter.execute(conn, sql, [], selecto_read: true)
+              ddl_blocked?(ctx.other, words)
+            end)
+
+          assert blocked?, sql
+        end
+      after
+        sql!(ctx.other, "DROP TABLE public.#{words}")
+      end
+    end
+
     test "text that writes is not planned for a write lock, and refuses", ctx do
       {:ok, locks} =
         Postgrex.transaction(ctx.connection, fn conn ->
@@ -244,6 +272,301 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
 
       sql!(ctx.other, "ROLLBACK")
       assert rows == [[1]]
+    end
+  end
+
+  describe "a read with a deadline on a connection the host holds (H-A)" do
+    setup ctx do
+      slow = "selecto_host_slow_#{System.unique_integer([:positive])}"
+
+      sql!(
+        ctx.connection,
+        "CREATE VIEW public.#{slow} AS SELECT id, pg_catalog.pg_sleep(0.2)::text AS z FROM public.#{ctx.table}"
+      )
+
+      on_exit(fn ->
+        {:ok, d} = Adapter.connect(Keyword.put(ConnectionOptions.options(), :pool_size, 1))
+        Adapter.execute(d, "DROP VIEW IF EXISTS public.#{slow}", [], [])
+        GenServer.stop(d)
+      end)
+
+      %{slow: slow}
+    end
+
+    defp timed_out(conn, slow) do
+      assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} =
+               Adapter.execute(conn, "SELECT z FROM public.#{slow}", [],
+                 selecto_read: true,
+                 timeout: 60
+               )
+    end
+
+    defp session(conn) do
+      Postgrex.query!(
+        conn,
+        "SELECT current_setting('transaction_read_only'), current_setting('search_path'), " <>
+          "current_setting('statement_timeout')",
+        []
+      ).rows
+    end
+
+    test "Postgrex.transaction: the host's work and settings survive", ctx do
+      c = ctx.connection
+      native = session(c)
+
+      assert {:ok, :done} =
+               Postgrex.transaction(c, fn t ->
+                 Postgrex.query!(t, "INSERT INTO public.#{ctx.table} VALUES (7, 't1', 'a')", [])
+                 timed_out(t, ctx.slow)
+                 assert session(t) == native
+                 Postgrex.query!(t, "INSERT INTO public.#{ctx.table} VALUES (8, 't1', 'b')", [])
+                 :done
+               end)
+
+      assert sql!(c, "SELECT count(*) FROM public.#{ctx.table} WHERE id IN (7, 8)") == [[2]]
+    end
+
+    test "Selecto.transaction: the same", ctx do
+      c = ctx.connection
+      native = session(c)
+
+      domain = %{
+        name: "D",
+        source: %{
+          source_table: ctx.slow,
+          primary_key: :id,
+          fields: [:id, :z],
+          redact_fields: [],
+          columns: %{id: %{type: :integer}, z: %{type: :string}},
+          associations: %{}
+        },
+        schemas: %{},
+        joins: %{}
+      }
+
+      selecto = Selecto.configure(domain, c, adapter: Adapter, validate: false)
+
+      assert {:ok, _} =
+               Selecto.transaction(selecto, fn tx ->
+                 conn = Selecto.Runtime.Context.connection(tx)
+
+                 Postgrex.query!(
+                   conn,
+                   "INSERT INTO public.#{ctx.table} VALUES (7, 't1', 'a')",
+                   []
+                 )
+
+                 assert {:error, %Selecto.Error{type: :timeout_error}} =
+                          tx |> Selecto.select(["z"]) |> Selecto.execute(timeout: 60)
+
+                 assert session(conn) == native
+                 {:ok, :done}
+               end)
+
+      assert sql!(c, "SELECT count(*) FROM public.#{ctx.table} WHERE id = 7") == [[1]]
+    end
+
+    test "an idle DBConnection.run handle stays idle and the pool stays clean", ctx do
+      c = ctx.connection
+
+      DBConnection.run(c, fn k ->
+        timed_out(k, ctx.slow)
+        assert DBConnection.status(k) == :idle
+        Postgrex.query!(k, "INSERT INTO public.#{ctx.table} VALUES (7, 't1', 'a')", [])
+      end)
+
+      assert sql!(c, "SELECT count(*) FROM public.#{ctx.table} WHERE id = 7") == [[1]]
+      assert DBConnection.run(c, &DBConnection.status/1) == :idle
+    end
+
+    test "a shorter statement_timeout of the host's stands", ctx do
+      c = ctx.connection
+
+      assert {:ok, _} =
+               Postgrex.transaction(c, fn t ->
+                 Postgrex.query!(t, "SET LOCAL statement_timeout = 40", [])
+
+                 for opts <- [[], [selecto_generated: true]] do
+                   {micros, result} =
+                     :timer.tc(fn ->
+                       Adapter.execute(
+                         t,
+                         "SELECT z FROM public.#{ctx.slow}",
+                         [],
+                         [
+                           selecto_read: true,
+                           timeout: 5_000,
+                           selecto_qualified_relations: %{
+                             SelectoDBPostgreSQL.RelationPath.path_key() => ["public"]
+                           }
+                         ] ++ opts
+                       )
+                     end)
+
+                   assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} = result
+                   assert micros < 2_000_000
+                 end
+
+                 assert [["40ms"]] =
+                          Postgrex.query!(t, "SELECT current_setting('statement_timeout')", []).rows
+               end)
+    end
+
+    test "a text BEGIN on a pid survives it too", ctx do
+      c = ctx.connection
+      [[backend]] = sql!(c, "SELECT pg_backend_pid()")
+      sql!(c, "BEGIN")
+      sql!(c, "INSERT INTO public.#{ctx.table} VALUES (7, 't1', 'a')")
+      timed_out(c, ctx.slow)
+      assert sql!(c, "SELECT pg_backend_pid()") == [[backend]]
+      sql!(c, "COMMIT")
+      assert sql!(c, "SELECT count(*) FROM public.#{ctx.table} WHERE id = 7") == [[1]]
+    end
+
+    test "the deadline covers planning: a lock wait ends, and the host lives", ctx do
+      {:ok, other} = Adapter.connect(Keyword.put(ConnectionOptions.options(), :pool_size, 1))
+      Process.unlink(other)
+      sql!(other, "BEGIN")
+      sql!(other, "LOCK TABLE public.#{ctx.table} IN ACCESS EXCLUSIVE MODE")
+
+      assert {:ok, rows} =
+               Postgrex.transaction(ctx.connection, fn t ->
+                 assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} =
+                          Adapter.execute(t, "SELECT id FROM public.#{ctx.table}", [],
+                            selecto_read: true,
+                            timeout: 80
+                          )
+
+                 assert [["0"]] =
+                          Postgrex.query!(t, "SELECT current_setting('statement_timeout')", []).rows
+
+                 Postgrex.query!(t, "SELECT 1", []).rows
+               end)
+
+      sql!(other, "ROLLBACK")
+      GenServer.stop(other)
+      assert rows == [[1]]
+    end
+  end
+
+  describe "hand-built reads run in the host's session (R71)" do
+    setup ctx do
+      schema = "selecto_host_app_#{System.unique_integer([:positive])}"
+
+      for sql <- [
+            "CREATE SCHEMA #{schema}",
+            "CREATE FUNCTION #{schema}.who() RETURNS text LANGUAGE sql AS $$SELECT 'app'$$",
+            "CREATE FUNCTION public.who() RETURNS text LANGUAGE sql AS $$SELECT 'public'$$",
+            "CREATE TABLE #{schema}.#{ctx.table} (id int)",
+            "INSERT INTO #{schema}.#{ctx.table} VALUES (99)"
+          ],
+          do: sql!(ctx.connection, sql)
+
+      on_exit(fn ->
+        {:ok, d} = Adapter.connect(Keyword.put(ConnectionOptions.options(), :pool_size, 1))
+        Adapter.execute(d, "DROP SCHEMA #{schema} CASCADE", [], [])
+        Adapter.execute(d, "DROP FUNCTION IF EXISTS public.who()", [], [])
+        GenServer.stop(d)
+      end)
+
+      %{schema: schema}
+    end
+
+    defp same_as_driver(conn, sql) do
+      assert {:ok, %{rows: native}} = Adapter.execute(conn, sql, [], [])
+      assert {:ok, %{rows: ^native}} = Adapter.execute(conn, sql, [], selecto_read: true), sql
+      native
+    end
+
+    test "under a host search_path, functions, relations and settings are the driver's", ctx do
+      c = ctx.connection
+      sql!(c, "SET search_path = #{ctx.schema}, public")
+
+      assert same_as_driver(c, "SELECT who()") == [["app"]]
+      assert same_as_driver(c, "SELECT id FROM #{ctx.table}") == [[99]]
+      assert [[_]] = same_as_driver(c, "SELECT current_schema()")
+      assert [[_]] = same_as_driver(c, "SHOW search_path")
+      sql!(c, "SET search_path TO DEFAULT")
+    end
+
+    test "SET LOCAL in a host transaction, and DateStyle", ctx do
+      c = ctx.connection
+
+      assert {:ok, _} =
+               Postgrex.transaction(c, fn t ->
+                 Postgrex.query!(t, "SET LOCAL search_path = #{ctx.schema}, public", [])
+                 Postgrex.query!(t, "SET LOCAL DateStyle = 'SQL, DMY'", [])
+                 assert same_as_driver(t, "SELECT who()") == [["app"]]
+                 assert same_as_driver(t, "SELECT date '2026-11-06'::text") == [["06/11/2026"]]
+                 assert [["SQL, DMY"]] = same_as_driver(t, "SHOW DateStyle")
+               end)
+    end
+
+    test "a temp table is the session's", ctx do
+      c = ctx.connection
+      sql!(c, "CREATE TEMP TABLE #{ctx.table} (id int)")
+      sql!(c, "INSERT INTO pg_temp.#{ctx.table} VALUES (42)")
+      assert same_as_driver(c, "SELECT id FROM #{ctx.table}") == [[42]]
+      assert same_as_driver(c, "SELECT 1") == [[1]]
+      sql!(c, "DROP TABLE pg_temp.#{ctx.table}")
+    end
+
+    test "a set operation of generated reads compiles after prepare_read", ctx do
+      domain = %{
+        name: "D",
+        source: %{
+          source_table: ctx.table,
+          source_schema: "public",
+          primary_key: :id,
+          fields: [:id],
+          redact_fields: [],
+          columns: %{id: %{type: :integer}},
+          associations: %{}
+        },
+        schemas: %{},
+        joins: %{}
+      }
+
+      left =
+        domain
+        |> Selecto.configure(ctx.connection, adapter: Adapter, validate: false)
+        |> Selecto.select(["id"])
+
+      assert {:ok, {rows, _, _}} = left |> Selecto.union(left) |> Selecto.execute()
+      assert Enum.sort(rows) == [[1], [2]]
+    end
+
+    test "a generated read keeps its pin and guards", ctx do
+      c = ctx.connection
+      sql!(c, "SET search_path = #{ctx.schema}, public")
+
+      domain = %{
+        name: "D",
+        source: %{
+          source_table: ctx.table,
+          primary_key: :id,
+          fields: [:id],
+          redact_fields: [],
+          columns: %{id: %{type: :integer}},
+          associations: %{}
+        },
+        schemas: %{},
+        joins: %{}
+      }
+
+      read = fn filters ->
+        domain
+        |> Selecto.configure(c, adapter: Adapter, validate: false)
+        |> Selecto.select(["id"])
+        |> then(&Enum.reduce(filters, &1, fn f, q -> Selecto.filter(q, f) end))
+        |> Selecto.execute()
+      end
+
+      assert {:error, %{details: %{reason: :relation_ambiguous}}} = read.([])
+
+      # Raw text on the same route resolves as the host's session does.
+      assert {:ok, {[[99]], _, _}} = read.([{:raw_sql_filter, "selecto_root.id > 0"}])
+      sql!(c, "SET search_path TO DEFAULT")
     end
   end
 

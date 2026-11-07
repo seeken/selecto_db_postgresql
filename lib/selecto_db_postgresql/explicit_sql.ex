@@ -317,9 +317,11 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
     end
   end
 
+  @hand_built_reads ~w(SELECT WITH VALUES TABLE SHOW EXPLAIN)
+
   @doc """
-  `:ok` when hand-built text is a read by its first word (SELECT, WITH, VALUES,
-  TABLE, past comments and opening parentheses), or the typed refusal (R68).
+  `:ok` when hand-built text is a read by its first word, past comments and
+  opening parentheses, or the typed refusal (R68, R71).
 
   This is all Selecto asks of hand-built text. Nothing else here reads it: the
   statement runs as written, in a READ ONLY transaction that refuses what it
@@ -330,10 +332,34 @@ defmodule SelectoDBPostgreSQL.ExplicitSQL do
   def hand_built_read(sql) do
     word = sql |> IO.iodata_to_binary() |> first_word()
 
-    if word != nil and String.upcase(word) in ~w(SELECT WITH VALUES TABLE),
+    if word != nil and String.upcase(word) in @hand_built_reads,
       do: :ok,
       else: refuse(:hand_built_not_a_read, "hand-built SQL on a read path must be a read")
   end
+
+  @doc "Whether hand-built text can be planned: SHOW and EXPLAIN itself cannot."
+  def planned?(sql) do
+    word = first_word(sql)
+    word != nil and String.upcase(word) not in ~w(SHOW EXPLAIN)
+  end
+
+  @doc """
+  Whether an `EXPLAIN (FORMAT JSON)` result is a plan that neither writes nor
+  locks rows. Anything unreadable is not.
+  """
+  def plan_reads?([%{"Plan" => plan}]), do: node_reads?(plan)
+  def plan_reads?(json) when is_binary(json), do: json |> Jason.decode() |> decoded_reads?()
+  def plan_reads?(_other), do: false
+
+  defp decoded_reads?({:ok, plan}), do: plan_reads?(plan)
+  defp decoded_reads?(_failed), do: false
+
+  defp node_reads?(%{"Node Type" => type} = node) when is_binary(type) do
+    type not in ["ModifyTable", "LockRows"] and
+      Enum.all?(Map.get(node, "Plans", []), &node_reads?/1)
+  end
+
+  defp node_reads?(_other), do: false
 
   defp first_word(<<c, rest::binary>>) when c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v, ?(],
     do: first_word(rest)

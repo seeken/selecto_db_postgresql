@@ -75,38 +75,79 @@ defmodule SelectoDBPostgreSQL.ReadSettingsIntegrationTest do
       GenServer.stop(d)
     end)
 
-    # At the call: the refusal itself, with no driver error dumped into it.
-    assert {:error,
-            %Selecto.Error{
-              message: "PostgreSQL refuses a read that tried to write",
-              details: %{reason: :read_only_read}
-            }} =
-             Adapter.stream(c, "SELECT pg_catalog.nextval('public.#{sequence}')", [],
-               selecto_read: true
-             )
+    {:ok, stream} =
+      Adapter.stream(c, "SELECT pg_catalog.nextval('public.#{sequence}')", [], selecto_read: true)
+
+    # Selecto.Error.to_exception/1's form: the refusal's own message, with no
+    # driver error dumped into it.
+    assert_raise(RuntimeError, "PostgreSQL refuses a read that tried to write", fn ->
+      Enum.to_list(stream)
+    end)
   end
 
-  test "a stream that fails opening returns the driver's error at the call" do
-    {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
-    Process.unlink(c)
+  describe "a stream opens lazily, its refusals come at the call (M6)" do
+    setup do
+      {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
+      Process.unlink(c)
+      on_exit(fn -> if Process.alive?(c), do: GenServer.stop(c) end)
+      %{c: c}
+    end
 
-    assert {:error, %Postgrex.Error{postgres: %{code: :undefined_table}}} =
-             Adapter.stream(c, "SELECT 1 FROM public.selecto_no_such_table", [],
-               selecto_read: true
-             )
+    test "an opened stream holds nothing, and any process can enumerate it", %{c: c} do
+      {:ok, stream} =
+        Adapter.stream(c, "SELECT g FROM pg_catalog.generate_series(1, 3) g", [],
+          selecto_read: true
+        )
 
-    assert {:ok, []} =
-             Adapter.stream(c, "SELECT 1 WHERE false", [], selecto_read: true)
+      # A pool of 1 is free, and no message reaches the opener.
+      assert {:ok, %{rows: [[1]]}} = Adapter.execute(c, "SELECT 1", [], selecto_read: true)
+      assert {:messages, []} = Process.info(self(), :messages)
 
-    assert {:ok, stream} = Adapter.stream(c, "SELECT 1", [], selecto_read: true)
-    assert [{[1], ["?column?"]}] = Enum.to_list(stream)
+      rows = Task.await(Task.async(fn -> Enum.map(stream, fn {[g], _} -> g end) end))
+      assert rows == [1, 2, 3]
+    end
 
-    # A stream opened and left gives its connection back.
-    assert {:ok, _left} =
-             Adapter.stream(c, "SELECT 1", [], selecto_read: true, receive_timeout: 50)
+    test "a refusal is the call's, typed", %{c: c} do
+      assert {:error, %{details: %{reason: :hand_built_not_a_read}}} =
+               Adapter.stream(c, "COMMIT", [], selecto_read: true)
 
-    Process.sleep(100)
-    assert {:ok, %{rows: [[1]]}} = Adapter.execute(c, "SELECT 1", [], selecto_read: true)
-    GenServer.stop(c)
+      {:ok, _} = Adapter.execute(c, "SET client_encoding = 'LATIN1'", [], [])
+
+      assert {:error, %{details: %{reason: :client_encoding}}} =
+               Adapter.stream(c, "SELECT 1", [], selecto_read: true)
+
+      {:ok, _} = Adapter.execute(c, "SET client_encoding = 'UTF8'", [], [])
+
+      # Through the executor too: the reason survives.
+      domain = %{
+        name: "D",
+        source: %{
+          source_table: "pg_am",
+          source_schema: "pg_catalog",
+          primary_key: :oid,
+          fields: [:amname],
+          redact_fields: [],
+          columns: %{amname: %{type: :string}},
+          associations: %{}
+        },
+        schemas: %{},
+        joins: %{}
+      }
+
+      assert {:ok, _} =
+               Postgrex.transaction(c, fn t ->
+                 assert {:error, %Selecto.Error{details: %{reason: :stream_in_transaction}}} =
+                          domain
+                          |> Selecto.configure(t, adapter: Adapter, validate: false)
+                          |> Selecto.select(["amname"])
+                          |> Selecto.execute_stream()
+               end)
+
+      assert {:ok, _} =
+               Postgrex.transaction(c, fn t ->
+                 assert {:error, %Selecto.Error{details: %{reason: :stream_in_transaction}}} =
+                          Adapter.stream(t, "SELECT 1", [], selecto_read: true)
+               end)
+    end
   end
 end

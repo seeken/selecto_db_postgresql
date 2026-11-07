@@ -838,7 +838,6 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
           "ROLLBACK",
           "DELETE FROM items",
           "SET search_path = ext",
-          "EXPLAIN SELECT 1",
           "/* SELECT */ COMMIT",
           "-- SELECT\nCOMMIT",
           "/* /* */ SELECT */ COMMIT",
@@ -853,6 +852,14 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     # Comments nest on the server: a word inside one is no first word.
     assert {:ok, %{rows: [[1]]}} = read.("/* /* a */ b */ -- c\n ((SELECT 1))")
     assert {:ok, %{rows: [[";"]]}} = read.("SELECT ';'")
+
+    # What only reports answers as the driver does (R71).
+    for sql <- ["SHOW search_path", "EXPLAIN SELECT 1", "EXPLAIN ANALYZE SELECT 1", "TABLE cats"] do
+      assert {:ok, %{rows: [_ | _]}} = read.(sql), sql
+    end
+
+    assert {:error, %{details: %{reason: :read_only_read}}} =
+             read.("EXPLAIN ANALYZE DELETE FROM items")
 
     for sql <- [
           "WITH d AS (DELETE FROM items RETURNING id) SELECT id FROM d",

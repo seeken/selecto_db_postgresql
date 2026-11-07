@@ -331,7 +331,8 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
       |> Selecto.select(["id", "note"])
       |> Selecto.execute_stream()
 
-    assert read_code(stream) == :session_state_changed
+    assert {:ok, rows} = stream
+    assert_raise RuntimeError, ~r/changed the session/, fn -> Enum.to_list(rows) end
     assert rows!(c, "SELECT pg_catalog.current_setting('search_path')") == [[schema]]
   end
 
@@ -772,11 +773,10 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
     end
   end
 
-  # R42 / R42 FINAL: a hand-built Selecto read (no compile-time relation
-  # list) refuses while the session holds any temp relation; without one,
-  # its relations, in comma FROM lists and scalar subqueries too, are
-  # qualified like any other. A caller-supplied empty list fails closed.
-  test "hand-built reads refuse while temp relations exist; comma lists and subqueries are qualified",
+  # R71: a hand-built read runs in the host's session: a temp relation is the
+  # host's, and answers as the driver's would. Generated SQL keeps its guards: a
+  # caller-supplied empty list fails closed.
+  test "hand-built reads see the session's temp relations; generated ones refuse an empty list",
        %{connection: c} do
     sqls = [
       ~s|SELECT "s0"."id", "s0"."note" FROM (SELECT 1) AS "d", "items" AS "s0" WHERE "s0"."org_key" OPERATOR(pg_catalog.=) $1 ORDER BY 1|,
@@ -784,12 +784,14 @@ defmodule SelectoDBPostgreSQL.SessionGuardIntegrationTest do
       "SELECT 1 AS id, (SELECT pg_catalog.string_agg(note, ',' ORDER BY id) FROM (SELECT 1) z, items WHERE org_key OPERATOR(pg_catalog.=) $1) AS note"
     ]
 
-    exec!(c, "CREATE TEMP VIEW items AS SELECT id, 't1'::text AS org_key, note FROM items")
+    exec!(
+      c,
+      "CREATE TEMP VIEW items AS SELECT 1 AS id, 't1'::text AS org_key, 'temp'::text AS note"
+    )
 
     for sql <- sqls do
-      assert {:error, %{details: %{reason: :temporary_relations}}} =
-               Adapter.execute(c, sql, ["t1"], selecto_read: true),
-             sql
+      assert {:ok, %{rows: native}} = Adapter.execute(c, sql, ["t1"], [])
+      assert {:ok, %{rows: ^native}} = Adapter.execute(c, sql, ["t1"], selecto_read: true), sql
     end
 
     exec!(c, "DROP VIEW pg_temp.items")

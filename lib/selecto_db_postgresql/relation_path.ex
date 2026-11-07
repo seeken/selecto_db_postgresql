@@ -227,38 +227,6 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   # identifier can contain it unquoted, and generated SQL never quotes it).
   def path_key, do: @path_key
 
-  @doc """
-  The session facts for text with no relation list (R68): `{:ok, map}` with the
-  reset path's schemas and the temp relation count, or a typed refusal.
-
-  The names are the scanner's guesses and nothing depends on them being right:
-  one that resolves nowhere, or only in pg_catalog, is the server's to answer.
-  Only a name this session's search_path gives a relation other than the pin's
-  refuses, since the pin would change the answer.
-  """
-  def session(execute, names, in_transaction? \\ true) do
-    plain =
-      names |> Enum.map(&to_string/1) |> Enum.uniq() |> Enum.reject(&String.contains?(&1, "."))
-
-    case lookup(execute, plain, in_transaction?) do
-      {:ok, rows, schemas, temps} ->
-        ambiguous =
-          for [name, schema, _relation, host, host_temp] <- rows,
-              host not in [nil, "pg_catalog"] and not host_temp and host != schema,
-              do: name
-
-        if ambiguous == [],
-          do: {:ok, %{@path_key => schemas, @temp_key => temps}},
-          else: ambiguous(ambiguous)
-
-      {:failed, error} ->
-        error
-
-      :error ->
-        unavailable()
-    end
-  end
-
   defp ambiguous(names) do
     refusal(
       :relation_ambiguous,
@@ -280,32 +248,6 @@ defmodule SelectoDBPostgreSQL.RelationPath do
     |> Enum.filter(& &1.qualified?)
     |> Enum.map(&binary_part(sql, &1.start, &1.length))
     |> Enum.uniq()
-  end
-
-  @doc "Whether `sql` says INSERT, UPDATE, DELETE or MERGE anywhere outside a string."
-  def names_write?(sql) do
-    sql
-    |> Scanner.tokenize()
-    |> Enum.any?(fn
-      {:word, word, _start} -> String.downcase(word) in ~w(insert update delete merge)
-      _token -> false
-    end)
-  end
-
-  @doc false
-  # R42 FINAL: a statement with no compile-time relation list (hand-built)
-  # runs only while the session holds no temp relation, unless it names
-  # pg_temp itself.
-  def hand_built_allowed?(relations, sql) do
-    Map.get(relations, @temp_key, 0) == 0 or
-      Enum.any?(Scanner.refs(sql), &(&1.qualified? and pg_temp_ref?(sql, &1)))
-  end
-
-  defp pg_temp_ref?(sql, ref) do
-    sql
-    |> binary_part(ref.start, ref.length)
-    |> String.downcase()
-    |> String.starts_with?(["pg_temp.", ~s("pg_temp".), "pg_temp_", ~s("pg_temp_)])
   end
 
   defp lookup(execute, plain, true) do
