@@ -406,19 +406,19 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  # What each query of the statement (Selecto.Executor.read_queries/1) asks for
-  # each relation it names, `{name, request}`: each query against its own root
-  # and declarations. `source_schema` next to a `source_table` in the query's
-  # domain decides; else, under a root that declares its schema, the relation
-  # resolves there, never by the connection's path (R59); else by the reset
-  # search_path. A table one domain declares with two schemas refuses.
+  # What each query of the statement (Selecto.Executor.read_scopes/1) asks for
+  # each relation it names, `{name, request}`: each query against its own
+  # declarations and root. `source_schema` next to a `source_table` in the
+  # query's domain decides; else, under a root that declares its schema, the
+  # relation resolves there, never by the connection's path (R59). A nested
+  # query (a subquery join's, a CTE's, a LATERAL join's) whose domain declares
+  # no schema takes its nearest enclosing query's. Else the reset search_path
+  # decides. A table one domain declares with two schemas refuses.
   defp relation_requests(selecto) do
-    local = Selecto.Executor.local_names(selecto)
-
     selecto
-    |> Selecto.Executor.read_queries()
-    |> Enum.reduce_while({:ok, []}, fn query, {:ok, acc} ->
-      case query_requests(query, local) do
+    |> Selecto.Executor.read_scopes()
+    |> Enum.reduce_while({:ok, []}, fn scope, {:ok, acc} ->
+      case query_requests(scope) do
         {:ok, requests} -> {:cont, {:ok, acc ++ requests}}
         {:error, _} = error -> {:halt, error}
       end
@@ -429,10 +429,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp query_requests(query, local) do
+  defp query_requests(%{query: query, visible: visible, enclosing: enclosing}) do
     domain = Map.get(query, :domain) || %{}
-    source = Map.get(domain, :source) || %{}
-    root = schema_name(Map.get(source, :source_schema) || Map.get(source, "source_schema"))
+    root = Enum.find_value([query | enclosing], &root_schema/1)
     declared = collect_declared(domain, %{})
 
     case Enum.find(declared, &match?({_table, :conflict}, &1)) do
@@ -440,11 +439,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
         two_schemas([table])
 
       nil ->
-        shadowing = Selecto.Executor.names_shadowing(query, local)
-
         query
         |> Selecto.Executor.own_relations()
-        |> Enum.reject(&(&1 in shadowing))
+        |> Enum.reject(&(&1 in visible))
         |> Enum.uniq()
         |> Enum.map(fn table ->
           schema = declared[table] || if(String.contains?(table, "."), do: nil, else: root)
@@ -452,6 +449,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
         end)
         |> then(&{:ok, &1})
     end
+  end
+
+  defp root_schema(query) do
+    source = (Map.get(query, :domain) || %{}) |> Map.get(:source) || %{}
+    schema_name(Map.get(source, :source_schema) || Map.get(source, "source_schema"))
   end
 
   # The compiled SQL qualifies a relation by its name, once for the whole

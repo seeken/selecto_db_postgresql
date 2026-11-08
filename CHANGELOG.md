@@ -4,10 +4,15 @@ CHANGES
 Unreleased
 ----------
 
-- Each query of a statement resolves against its own root and declarations, and
-  a name two of them would resolve to two relations refuses with
-  `relation_ambiguous`: a subquery's declaration redirected an ad-hoc join of the
-  same name, and union members declaring a name differently read one schema.
+- Each query of a statement resolves under its own declarations, and a name two
+  of them would resolve to two relations refuses with `relation_ambiguous`: a
+  subquery's declaration redirected an ad-hoc join of the same name, and union
+  members declaring a name differently read one schema. A nested query whose
+  domain declares no `source_schema` takes its enclosing query's declared root
+  (R59), as an ad-hoc join's table does. A CTE or VALUES name hides a table only
+  where the SQL can see it, so a name defined in one query no longer hides a
+  relation in another, and a CTE's body reads the real relation of a CTE named
+  after it later.
 - A CTE's or LATERAL join's query resolves, pins and guards like the outer
   query's: on default settings they refused `relation_unresolved`, and under a
   diverging host path a CTE named like a table read without a guard.

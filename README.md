@@ -317,8 +317,9 @@ another schema's relation, function or operator of the same name. So:
   (`reason: :relation_ambiguous`) instead of being redirected, and a
   relation only the session's temp schema holds refuses unless declared
   (`reason: :relation_unresolved`): declare `source_schema: "pg_temp"` on the
-  domain that names it, including a subquery join's domain; an ad-hoc join's
-  table takes its root's schema.
+  domain that names it. An ad-hoc join cannot name a schema (its table takes
+  its root's), so read a temporary table through `join_subquery` on a domain
+  that declares `pg_temp`.
   **A host that `SET`s search_path to
   reach another schema must declare that schema** (or set it at connection
   startup, for example `parameters: [search_path: "app"]`). A name that
@@ -326,12 +327,19 @@ another schema's relation, function or operator of the same name. So:
   text every Selecto read, stream, write or candidate load executes must
   name each relation schema-qualified, so no unqualified statement runs.
   Hand-built reads are the exception, below.
-- **Each query of a statement resolves against its own root.** An ad-hoc
-  join's table, a subquery join's query, a CTE's or LATERAL join's query and a
-  set operation's members are resolved, pinned and guarded like the domain's
-  own tables, each under its own query's declarations. The SQL names a relation
-  once, so a name two of them would resolve to two relations refuses
-  (`reason: :relation_ambiguous`) rather than read one for both.
+- **Each query of a statement resolves under its own declarations.** An
+  ad-hoc join's table, a subquery join's query, a CTE's or LATERAL join's
+  query and a set operation's members are resolved, pinned and guarded like
+  the domain's own tables. A nested query (subquery join, CTE, LATERAL) whose
+  domain declares no `source_schema` takes its enclosing query's declared
+  root, as an ad-hoc join's table does (R59); one that declares its own keeps
+  it. Set operation members are siblings and take nothing from each other.
+  The SQL names a relation once, so a name two of them would resolve to two
+  relations refuses (`reason: :relation_ambiguous`) rather than read one for
+  both. A CTE or VALUES name hides a table only where the SQL can see it: in
+  its own query and the queries nested in it, and in a non-recursive `WITH`
+  only from the bodies after it; elsewhere the table stays a relation, and a
+  name the SQL cannot scope refuses (`reason: :cte_name_collision`).
 - A CTE or query member named like a real relation is scoped: in a leading
   non-recursive `WITH`, its own body and the bodies before it read the real
   (qualified) relation, the later bodies and the main query the CTE. A
