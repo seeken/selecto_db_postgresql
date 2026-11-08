@@ -200,8 +200,8 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
   end
 
   test "one name its queries would read in two schemas refuses, whichever declares", ctx do
-    # The compiled SQL names the table once; each query resolves against its own root.
-    for {outer, inner} <- [{ctx.alt, "public"}, {nil, ctx.alt}, {ctx.alt, nil}] do
+    # The compiled SQL names the table once; each query resolves under its own declarations.
+    for {outer, inner} <- [{ctx.alt, "public"}, {nil, ctx.alt}] do
       assert {:error, :relation_ambiguous, [reviews]} =
                rows(Selecto.execute(ad_hoc_and_subquery(ctx, outer, inner))),
              inspect({outer, inner})
@@ -209,8 +209,96 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
       assert reviews == ctx.reviews
     end
 
-    # The same schema both ways answers.
+    # The same schema both ways answers; an undeclared subquery takes its enclosing root's.
     assert {:ok, _} = Selecto.execute(ad_hoc_and_subquery(ctx, nil, "public"))
+
+    assert rows(Selecto.execute(ad_hoc_and_subquery(ctx, ctx.alt, nil))) ==
+             [["alt-a", "alt", "alt"]]
+  end
+
+  test "a nested query declaring no schema takes its enclosing root's (R59)", ctx do
+    only = "selecto_only_#{System.unique_integer([:positive])}"
+
+    for sql <- [
+          "CREATE TABLE #{ctx.alt}.#{only} (id int PRIMARY KEY, product_id int, rating int, title text)",
+          "INSERT INTO #{ctx.alt}.#{only} VALUES (1, 1, 5, 'only-alt')"
+        ],
+        do: {:ok, _} = Adapter.execute(ctx.connection, sql, [], [])
+
+    inner = fn table ->
+      domain = put_in(reviews(ctx), [:source, :source_table], table)
+
+      Selecto.configure(domain, ctx.connection, adapter: Adapter)
+      |> Selecto.select(["product_id", "title"])
+    end
+
+    for table <- [ctx.reviews, only] do
+      query =
+        Selecto.configure(products(ctx, ctx.alt), ctx.connection, adapter: Adapter)
+        |> Selecto.DynamicJoin.join_subquery(:best, inner.(table),
+          on: [%{left: "id", right: "product_id"}]
+        )
+        |> Selecto.select(["name", "best.title"])
+
+      assert [["alt-a", title]] = rows(Selecto.execute(query)), table
+      assert title in ["alt", "only-alt"]
+    end
+  end
+
+  test "a CTE or VALUES name hides a table only where the SQL can see it", ctx do
+    cte_body = fn ->
+      Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.select(["product_id", "title"])
+    end
+
+    alt_body = fn ->
+      Selecto.configure(reviews(ctx, ctx.alt), ctx.connection, adapter: Adapter)
+      |> Selecto.select(["product_id", "title"])
+    end
+
+    # A union member defines a CTE, or VALUES, named like the other member's table.
+    for define <- [
+          &Selecto.with_cte(&1, ctx.reviews, alt_body),
+          &Selecto.with_values(&1, [[1, "V"]], columns: ["product_id", "title"], as: ctx.reviews)
+        ] do
+      right =
+        Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+        |> define.()
+        |> Selecto.select(["name"])
+
+      union = Selecto.union(review_titles(ctx, ctx.alt), right)
+      assert {:error, :cte_name_collision, _} = rows(Selecto.execute(union))
+    end
+
+    # A subquery's inner query defines a CTE named like the outer root.
+    inner =
+      Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.with_cte(ctx.products, cte_body)
+      |> Selecto.select(["product_id", "title"])
+
+    query =
+      Selecto.configure(products(ctx, ctx.alt), ctx.connection, adapter: Adapter)
+      |> Selecto.DynamicJoin.join_subquery(:best, inner, on: [%{left: "id", right: "product_id"}])
+      |> Selecto.select(["name", "best.title"])
+
+    assert {:error, :cte_name_collision, _} = rows(Selecto.execute(query))
+
+    # An earlier CTE's body reads the real table a later CTE is named after.
+    two =
+      Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.with_cte(
+        "c1",
+        alt_body,
+        join: [owner_key: :id, related_key: :product_id, fields: %{title: %{type: :string}}]
+      )
+      |> Selecto.with_cte(ctx.reviews, fn ->
+        Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+        |> Selecto.select(["id", "name"])
+      end)
+      |> Selecto.select(["name", "c1.title"])
+      |> Selecto.order_by("name")
+
+    assert rows(Selecto.execute(two)) == [["a", "alt"], ["b", nil]]
   end
 
   test "union members that read one name in two schemas refuse", ctx do
