@@ -341,11 +341,18 @@ another schema's relation, function or operator of the same name. So:
   both. A CTE or VALUES name hides a table only where the SQL can see it: in
   its own query and the queries nested in it (a retargeted query's origin
   included, which compiles under the target's `WITH`), and in a non-recursive
-  `WITH` from the VALUES lists, the join-generated CTEs and the CTEs before a
-  body; a CTE body's own CTEs are emitted as a `WITH` inside it. Elsewhere the
-  table stays a relation, and a name the SQL cannot scope refuses
+  `WITH` from the VALUES lists, the join-generated CTEs and the CTEs emitted
+  before a body (user CTEs are emitted in dependency order, not list order);
+  a CTE body's own CTEs are emitted as a `WITH` inside it. Elsewhere the table
+  stays a relation, and a name the SQL cannot scope refuses
   (`reason: :cte_name_collision`), as does a retarget target's CTE or VALUES
-  list named like a table its origin reads.
+  list named like a table its origin reads. A body's own CTE named like a
+  table the statement reads is such a name and refuses, even where the body's
+  CTE alone would be correct. A recursive CTE whose base or recursive query
+  defines its own CTE or VALUES list refuses
+  (`reason: :recursive_cte_nested_with`). A relation named by a declared or
+  inherited schema that does not exist there refuses
+  (`reason: :relation_unresolved`) before the read runs.
 - A CTE or query member named like a real relation is scoped: in a leading
   non-recursive `WITH`, its own body and the bodies before it read the real
   (qualified) relation, the later bodies and the main query the CTE. A

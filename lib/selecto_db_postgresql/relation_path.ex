@@ -189,6 +189,31 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   `{:ok, %{relation => %{column => {schema, arg}}}}` for a resolve/3 map's
   relations, keyed like the map.
   """
+  @missing_sql "SELECT r.n FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), " <>
+                 "pg_catalog.unnest($2::pg_catalog.text[])) AS r(n, q) " <>
+                 "WHERE pg_catalog.to_regclass(r.q) IS NULL"
+
+  @doc false
+  # Of `{name, quoted}` pairs, the names no relation answers to: refused as
+  # unresolved.
+  def missing(execute, pairs) do
+    case execute.(@missing_sql, [Enum.map(pairs, &elem(&1, 0)), Enum.map(pairs, &elem(&1, 1))]) do
+      {:ok, %{rows: []}} ->
+        :ok
+
+      {:ok, %{rows: rows}} when is_list(rows) ->
+        refusal(
+          :relation_unresolved,
+          "a relation its declared schema names does not exist; check source_schema " <>
+            "on the domain that names it, or the root it takes it from",
+          List.flatten(rows)
+        )
+
+      other ->
+        if SessionGuard.standing(other), do: other, else: unavailable()
+    end
+  end
+
   def operator_types(execute, relations) do
     pairs =
       for {name, qualified} <- relations,

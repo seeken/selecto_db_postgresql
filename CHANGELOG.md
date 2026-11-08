@@ -4,6 +4,8 @@ CHANGES
 Unreleased
 ----------
 
+- A relation named by a declared or inherited schema that does not exist there
+  refuses `relation_unresolved`, typed, instead of a raw 42P01 from the read.
 - Each query of a statement resolves under its own declarations, and a name two
   of them would resolve to two relations refuses with `relation_ambiguous`: a
   subquery's declaration redirected an ad-hoc join of the same name, and union
