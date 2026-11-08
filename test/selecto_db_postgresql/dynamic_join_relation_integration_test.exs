@@ -150,6 +150,126 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
     end)
   end
 
+  defp ad_hoc_and_subquery(ctx, outer_schema, inner_schema) do
+    sub =
+      Selecto.configure(reviews(ctx, inner_schema), ctx.connection, adapter: Adapter)
+      |> Selecto.select(["product_id", "title"])
+
+    Selecto.configure(products(ctx, outer_schema), ctx.connection, adapter: Adapter)
+    |> Selecto.join(:rv,
+      source: ctx.reviews,
+      type: :left,
+      owner_key: :id,
+      related_key: :product_id,
+      fields: %{title: %{type: :string}}
+    )
+    |> Selecto.DynamicJoin.join_subquery(:best, sub, on: [%{left: "id", right: "product_id"}])
+    |> Selecto.select(["name", "rv.title", "best.title"])
+  end
+
+  defp review_titles(ctx, schema) do
+    Selecto.configure(reviews(ctx, schema), ctx.connection, adapter: Adapter)
+    |> Selecto.select(["title"])
+  end
+
+  defp lateral_reviews(ctx) do
+    child = fn _parent ->
+      Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.select(["title"])
+      |> Selecto.filter({"product_id", {:ref, "selecto_root.id"}})
+    end
+
+    Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+    |> Selecto.lateral_join(:left, child, "lat")
+    |> Selecto.select(["name", "lat.title"])
+    |> Selecto.order_by("name")
+  end
+
+  defp cte_reviews(ctx, name) do
+    body = fn ->
+      Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.select(["product_id", "title"])
+    end
+
+    Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+    |> Selecto.with_cte(name, body,
+      join: [owner_key: :id, related_key: :product_id, fields: %{title: %{type: :string}}]
+    )
+    |> Selecto.select(["name", "#{name}.title"])
+    |> Selecto.order_by("name")
+  end
+
+  test "one name its queries would read in two schemas refuses, whichever declares", ctx do
+    # The compiled SQL names the table once; each query resolves against its own root.
+    for {outer, inner} <- [{ctx.alt, "public"}, {nil, ctx.alt}, {ctx.alt, nil}] do
+      assert {:error, :relation_ambiguous, [reviews]} =
+               rows(Selecto.execute(ad_hoc_and_subquery(ctx, outer, inner))),
+             inspect({outer, inner})
+
+      assert reviews == ctx.reviews
+    end
+
+    # The same schema both ways answers.
+    assert {:ok, _} = Selecto.execute(ad_hoc_and_subquery(ctx, nil, "public"))
+  end
+
+  test "union members that read one name in two schemas refuse", ctx do
+    for {left, right} <- [{ctx.alt, nil}, {nil, ctx.alt}] do
+      union = Selecto.union(review_titles(ctx, left), review_titles(ctx, right))
+
+      assert {:error, :relation_ambiguous, [reviews]} = rows(Selecto.execute(union)),
+             inspect({left, right})
+
+      assert reviews == ctx.reviews
+    end
+  end
+
+  test "a LATERAL join's query and a CTE's query resolve like the outer one's", ctx do
+    expected = [["a", "public"], ["b", nil]]
+    assert rows(Selecto.execute(lateral_reviews(ctx))) == expected
+    assert rows(Selecto.execute(cte_reviews(ctx, "best"))) == expected
+    # A CTE named like the table it reads: its body reads the table.
+    assert rows(Selecto.execute(cte_reviews(ctx, ctx.reviews))) == expected
+
+    diverging(ctx, fn ->
+      for query <- [lateral_reviews(ctx), cte_reviews(ctx, "best"), cte_reviews(ctx, ctx.reviews)] do
+        assert {:error, :relation_ambiguous, [reviews]} = rows(Selecto.execute(query))
+        assert reviews == ctx.reviews
+      end
+    end)
+  end
+
+  test "a temporary-only table: the refusal names what a host can declare", ctx do
+    temp = "selecto_tmp_#{System.unique_integer([:positive])}"
+
+    for sql <- [
+          "CREATE TEMP TABLE #{temp} (id int, product_id int, rating int, title text)",
+          "INSERT INTO pg_temp.#{temp} VALUES (1, 1, 5, 'temp')"
+        ],
+        do: {:ok, _} = Adapter.execute(ctx.connection, sql, [], [])
+
+    query = ad_hoc(ctx, products(ctx)) |> then(&put_in(&1.set.dynamic_joins.reviews.source, temp))
+    assert {:error, error} = Selecto.execute(query)
+    assert error.details.reason == :relation_unresolved
+    assert error.message =~ ~s(source_schema: "pg_temp")
+
+    sub =
+      Selecto.configure(
+        %{reviews(ctx, "pg_temp") | name: temp} |> put_in([:source, :source_table], temp),
+        ctx.connection,
+        adapter: Adapter
+      )
+      |> Selecto.select(["product_id", "title"])
+
+    joined =
+      Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.DynamicJoin.join_subquery(:best, sub, on: [%{left: "id", right: "product_id"}])
+      |> Selecto.select(["name", "best.title"])
+      |> Selecto.order_by("name")
+
+    assert rows(Selecto.execute(joined)) == [["a", "temp"], ["b", nil]]
+  end
+
   test "a subquery whose domain declares its schema reads there", ctx do
     assert rows(Selecto.execute(subquery_join(ctx, ctx.alt))) == [["a", "alt"], ["b", nil]]
   end

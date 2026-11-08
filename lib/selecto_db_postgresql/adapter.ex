@@ -370,69 +370,118 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # schema-qualified names of the domain's relations (R23b), resolved against
   # the connection's reset search_path, never one a statement switched.
   def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain) do
-    declared = declared_schemas(selecto)
-
-    case Selecto.Executor.domain_relations(selecto) do
-      [] ->
-        {:ok, selecto}
-
-      names ->
-        # A relation the domain declares with `source_schema` (R39) is named
-        # by that schema; "schema.relation" names keep theirs.
-        names = Enum.map(names, &if(schema = declared[&1], do: schema <> "." <> &1, else: &1))
-
-        # R46 FINAL-2: the catalog operator types of the relations' columns,
-        # so every generated comparison names its operator and casts both
-        # operands (Selecto.Builder.TypedOperator).
-        with {:ok, relations} <- with_declared(resolve_relations(connection, names), declared),
-             {:ok, types} <- operator_types(connection, relations) do
-          set =
-            (Map.get(selecto, :set) || %{})
-            |> Map.put(:qualified_relations, relations)
-            |> Map.put(:pg_operator_types, types)
-
-          {:ok, %{selecto | set: set}}
-        else
-          {:error, %Error{} = error} -> {:error, read_refusal(error)}
-          {:error, _reason} = error -> error
-        end
+    with {:ok, requests} <- relation_requests(selecto) do
+      case requests do
+        [] -> {:ok, selecto}
+        requests -> prepare_relations(selecto, connection, requests)
+      end
+    else
+      {:error, %Error{} = error} -> {:error, read_refusal(error)}
     end
   end
 
   def prepare_read(selecto, _connection), do: {:ok, selecto}
 
-  # `source_schema` declared next to a `source_table`, per table, across the
-  # read's domains; a table declared with two schemas refuses.
-  defp declared_schemas(selecto) do
-    queries = Selecto.Executor.read_queries(selecto)
-    declared = queries |> Enum.map(&Map.get(&1, :domain)) |> Enum.reduce(%{}, &collect_declared/2)
-    Enum.reduce(queries, declared, &inherit_root_schema/2)
-  end
+  defp prepare_relations(selecto, connection, requests) do
+    # A relation its query declares with `source_schema` (R39), or inherits from
+    # its query's declared root (R59), is named by that schema; "schema.relation"
+    # names keep theirs.
+    names = requests |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
 
-  # R59: under a root that declares its schema, a relation that declares
-  # none resolves there, never by the connection's path.
-  defp inherit_root_schema(selecto, declared) do
-    domain = Map.get(selecto, :domain) || %{}
-    source = Map.get(domain, :source) || %{}
+    # R46 FINAL-2: the catalog operator types of the relations' columns,
+    # so every generated comparison names its operator and casts both
+    # operands (Selecto.Builder.TypedOperator).
+    with {:ok, resolved} <- resolve_relations(connection, names),
+         {:ok, relations} <- one_relation_per_name(resolved, requests),
+         {:ok, types} <- operator_types(connection, relations) do
+      set =
+        (Map.get(selecto, :set) || %{})
+        |> Map.put(:qualified_relations, relations)
+        |> Map.put(:pg_operator_types, types)
 
-    case schema_name(Map.get(source, :source_schema) || Map.get(source, "source_schema")) do
-      nil ->
-        declared
-
-      schema ->
-        selecto
-        |> domain_tables()
-        |> Enum.reject(&String.contains?(&1, "."))
-        |> Enum.reduce(declared, &Map.put_new(&2, &1, schema))
+      {:ok, %{selecto | set: set}}
+    else
+      {:error, %Error{} = error} -> {:error, read_refusal(error)}
+      {:error, _reason} = error -> error
     end
   end
 
-  # Its own tables, and those its ad-hoc joins name; a subquery join's query
-  # has a root of its own.
-  defp domain_tables(selecto),
+  # What each query of the statement (Selecto.Executor.read_queries/1) asks for
+  # each relation it names, `{name, request}`: each query against its own root
+  # and declarations. `source_schema` next to a `source_table` in the query's
+  # domain decides; else, under a root that declares its schema, the relation
+  # resolves there, never by the connection's path (R59); else by the reset
+  # search_path. A table one domain declares with two schemas refuses.
+  defp relation_requests(selecto) do
+    local = Selecto.Executor.local_names(selecto)
+
+    selecto
+    |> Selecto.Executor.read_queries()
+    |> Enum.reduce_while({:ok, []}, fn query, {:ok, acc} ->
+      case query_requests(query, local) do
+        {:ok, requests} -> {:cont, {:ok, acc ++ requests}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, requests} -> {:ok, Enum.uniq(requests)}
+      error -> error
+    end
+  end
+
+  defp query_requests(query, local) do
+    domain = Map.get(query, :domain) || %{}
+    source = Map.get(domain, :source) || %{}
+    root = schema_name(Map.get(source, :source_schema) || Map.get(source, "source_schema"))
+    declared = collect_declared(domain, %{})
+
+    case Enum.find(declared, &match?({_table, :conflict}, &1)) do
+      {table, :conflict} ->
+        two_schemas([table])
+
+      nil ->
+        shadowing = Selecto.Executor.names_shadowing(query, local)
+
+        query
+        |> Selecto.Executor.own_relations()
+        |> Enum.reject(&(&1 in shadowing))
+        |> Enum.uniq()
+        |> Enum.map(fn table ->
+          schema = declared[table] || if(String.contains?(table, "."), do: nil, else: root)
+          {table, if(schema, do: schema <> "." <> table, else: table)}
+        end)
+        |> then(&{:ok, &1})
+    end
+  end
+
+  # The compiled SQL qualifies a relation by its name, once for the whole
+  # statement: a name its queries resolve to two relations refuses rather than
+  # read one of them for both.
+  defp one_relation_per_name(resolved, requests) do
+    requests
+    |> Enum.group_by(&elem(&1, 0), &Map.fetch!(resolved, elem(&1, 1)))
+    |> Enum.reduce_while({:ok, resolved}, fn {table, qualified}, {:ok, acc} ->
+      case Enum.uniq(qualified) do
+        [one] -> {:cont, {:ok, Map.put(acc, table, one)}}
+        _two -> {:halt, two_schemas([table])}
+      end
+    end)
+  end
+
+  defp two_schemas(tables),
     do:
-      Selecto.Executor.domain_relations(%{selecto | set: %{}}) ++
-        Selecto.Executor.dynamic_sources(selecto)
+      {:error,
+       Error.new(
+         :query_enforcement,
+         "PostgreSQL resolves one relation name to two relations in one statement; " <>
+           "declare the same schema for it wherever the statement names it",
+         details: %{
+           code: :query_rule_not_evaluable,
+           reason: :relation_ambiguous,
+           relations: tables,
+           adapter: :postgresql
+         }
+       )}
 
   defp schema_name(schema) when is_binary(schema) and schema != "", do: schema
   defp schema_name(schema) when is_atom(schema) and not is_nil(schema), do: Atom.to_string(schema)
@@ -460,31 +509,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
     do: Enum.reduce(list, acc, &collect_declared/2)
 
   defp collect_declared(_value, acc), do: acc
-
-  # The resolved map keyed by each declared table's own name too, so the
-  # compiled SQL's bare name is qualified with the declared schema.
-  defp with_declared({:ok, relations}, declared) do
-    Enum.reduce_while(declared, {:ok, relations}, fn
-      {table, :conflict}, _acc ->
-        {:halt,
-         {:error,
-          Error.new(
-            :query_enforcement,
-            "PostgreSQL domain declares one relation with two schemas",
-            details: %{
-              code: :query_rule_not_evaluable,
-              reason: :relation_ambiguous,
-              relations: [table],
-              adapter: :postgresql
-            }
-          )}}
-
-      {table, schema}, {:ok, acc} ->
-        {:cont, {:ok, Map.put(acc, table, Map.fetch!(acc, schema <> "." <> table))}}
-    end)
-  end
-
-  defp with_declared(error, _declared), do: error
 
   defp execute_plain(connection, query, params, opts) do
     case Keyword.get(opts, :timeout) do

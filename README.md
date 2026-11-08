@@ -316,13 +316,22 @@ another schema's relation, function or operator of the same name. So:
   **current** path: a relation the two resolve differently refuses
   (`reason: :relation_ambiguous`) instead of being redirected, and a
   relation only the session's temp schema holds refuses unless declared
-  (`reason: :relation_unresolved`). **A host that `SET`s search_path to
+  (`reason: :relation_unresolved`): declare `source_schema: "pg_temp"` on the
+  domain that names it, including a subquery join's domain; an ad-hoc join's
+  table takes its root's schema.
+  **A host that `SET`s search_path to
   reach another schema must declare that schema** (or set it at connection
   startup, for example `parameters: [search_path: "app"]`). A name that
   does not resolve, or a lookup that cannot run, refuses; and the exact
   text every Selecto read, stream, write or candidate load executes must
   name each relation schema-qualified, so no unqualified statement runs.
   Hand-built reads are the exception, below.
+- **Each query of a statement resolves against its own root.** An ad-hoc
+  join's table, a subquery join's query, a CTE's or LATERAL join's query and a
+  set operation's members are resolved, pinned and guarded like the domain's
+  own tables, each under its own query's declarations. The SQL names a relation
+  once, so a name two of them would resolve to two relations refuses
+  (`reason: :relation_ambiguous`) rather than read one for both.
 - A CTE or query member named like a real relation is scoped: in a leading
   non-recursive `WITH`, its own body and the bodies before it read the real
   (qualified) relation, the later bodies and the main query the CTE. A

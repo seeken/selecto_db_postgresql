@@ -4,6 +4,15 @@ CHANGES
 Unreleased
 ----------
 
+- Each query of a statement resolves against its own root and declarations, and
+  a name two of them would resolve to two relations refuses with
+  `relation_ambiguous`: a subquery's declaration redirected an ad-hoc join of the
+  same name, and union members declaring a name differently read one schema.
+- A CTE's or LATERAL join's query resolves, pins and guards like the outer
+  query's: on default settings they refused `relation_unresolved`, and under a
+  diverging host path a CTE named like a table read without a guard.
+- A relation only the temp schema holds names `source_schema: "pg_temp"` in its
+  refusal, which a host can declare.
 - An ad-hoc join's table and a subquery join's tables resolve, pin and guard like
   the domain's own: on default settings they answer, under a root that declares
   its schema an ad-hoc source resolves there (R59), a subquery's own declared
