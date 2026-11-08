@@ -185,10 +185,6 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   ORDER BY b.name, b.attname, b.depth DESC
   """
 
-  @doc """
-  `{:ok, %{relation => %{column => {schema, arg}}}}` for a resolve/3 map's
-  relations, keyed like the map.
-  """
   @missing_sql "SELECT r.n FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), " <>
                  "pg_catalog.unnest($2::pg_catalog.text[])) AS r(n, q) " <>
                  "WHERE pg_catalog.to_regclass(r.q) IS NULL"
@@ -214,6 +210,10 @@ defmodule SelectoDBPostgreSQL.RelationPath do
     end
   end
 
+  @doc """
+  `{:ok, %{relation => %{column => {schema, arg}}}}` for a resolve/3 map's
+  relations, keyed like the map.
+  """
   def operator_types(execute, relations) do
     pairs =
       for {name, qualified} <- relations,

@@ -338,34 +338,27 @@ another schema's relation, function or operator of the same name. So:
   operation members are siblings and take nothing from each other.
   The SQL names a relation once, so a name two of them would resolve to two
   relations refuses (`reason: :relation_ambiguous`) rather than read one for
-  both. A CTE or VALUES name hides a table only where the SQL can see it: in
-  its own query and the queries nested in it (a retargeted query's origin
-  included, which compiles under the target's `WITH`), and in a non-recursive
-  `WITH` from the VALUES lists and the CTEs emitted before a body (user CTEs
-  are emitted in dependency order, not list order); a CTE body's own CTEs are
-  emitted as a `WITH` inside it. The CTEs Selecto generates (a values-backed
-  schema's list, a hierarchy, materialized-path or closure-table join's CTE)
-  take reserved names starting with `__selecto_`, cut to 63 characters with a
-  digest, so they hide no table; and a table a join generates (a closure or
-  junction table) is always a relation of the read, resolved and qualified
-  like the domain's own, whatever the join's id. Elsewhere the table
-  stays a relation, and a name the SQL cannot scope refuses
-  (`reason: :cte_name_collision`), as does a retarget target's CTE or VALUES
-  list named like a table its origin reads. A body's own CTE named like a
-  table the statement reads is such a name and refuses, even where the body's
-  CTE alone would be correct. A recursive CTE whose base or recursive query
-  defines its own CTE or VALUES list refuses
-  (`reason: :recursive_cte_nested_with`); a copy of the statement's VALUES list
-  or of a CTE emitted before it is the statement's and is allowed. Under
-  `WITH RECURSIVE` a body still sees only the CTEs emitted before it: MySQL
-  shows no body a later one. A relation named by a declared or
-  inherited schema that does not exist there refuses
-  (`reason: :relation_unresolved`) before the read runs.
-- A CTE or query member named like a real relation is scoped: in a leading
-  non-recursive `WITH`, its own body and the bodies before it read the real
-  (qualified) relation, the later bodies and the main query the CTE. A
-  collision that cannot be scoped (`WITH RECURSIVE`, a nested `WITH`)
-  refuses (`reason: :cte_name_collision`).
+  both. A CTE or VALUES name is never a table: Selecto refuses, on every
+  adapter, a statement in which a name defined anywhere (a user's CTE or VALUES
+  list, or a CTE Selecto generates) is also a relation read anywhere in it
+  (`reason: :cte_name_collision`), and one name defined twice with different
+  lists (`reason: :cte_name_redefined`). Every query counts: CTE bodies at any
+  depth, subquery and LATERAL joins, set members, recursive bases and steps, a
+  retarget origin, and the closure or junction table a join reads. So every
+  relation the statement reads is resolved and qualified like the domain's
+  own. The CTEs Selecto generates start with `__selecto_` and are named by
+  their content (a values list's rows, a hierarchy join's definition), within
+  63 characters. A recursive CTE whose base or recursive query defines its own
+  CTE or VALUES list refuses (`reason: :recursive_cte_nested_with`); a copy of
+  the statement's VALUES list or of a CTE emitted before it is the statement's
+  and is allowed. A relation named by a declared or inherited schema that does
+  not exist there refuses (`reason: :relation_unresolved`) before the read runs.
+- A raw CTE (`{:raw_cte, sql, params}`), whose name Selecto does not know, named
+  like a real relation is scoped by the qualifier: in a leading non-recursive
+  `WITH`, its own body and the bodies before it read the real (qualified)
+  relation, the later bodies and the main query the CTE. A collision that
+  cannot be scoped (`WITH RECURSIVE`, a nested `WITH`) refuses
+  (`reason: :cte_name_collision`).
 - **Each Selecto statement runs under pinned settings**: search_path
   `pg_catalog, <declared schemas>, <every schema of the reset search_path>,
   pg_temp`, and `TimeZone`,

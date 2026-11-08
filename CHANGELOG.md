@@ -7,9 +7,15 @@ Unreleased
 - A closure-table join whose id is its category table's name reads its own
   closure table again. Its generated CTE was named like that table and hid it,
   so the table went unresolved and, with another schema declared in the
-  statement, read that schema's closure table. Selecto now names every
-  generated CTE `__selecto_...`, and a table a join generates is always a
-  relation of the read (`Selecto.Executor.scope_relations/1`).
+  statement, read that schema's closure table. Selecto names every generated
+  CTE `__selecto_...` by its content, and refuses any statement where a CTE or
+  VALUES name is a relation it reads (`cte_name_collision`) or is defined twice
+  differently (`cte_name_redefined`), so every relation a read names is
+  resolved and qualified. A Selecto CTE named like a table a body before it
+  reads, or like the table it reads itself, which PostgreSQL scoped and
+  answered, now refuses.
+- `mix compile --warnings-as-errors` passes again: a function sat between
+  `operator_types/2`'s `@doc` and its definition.
 - A relation named by a declared or inherited schema that does not exist there
   refuses `relation_unresolved`, typed, instead of a raw 42P01 from the read.
 - Each query of a statement resolves under its own declarations, and a name two
