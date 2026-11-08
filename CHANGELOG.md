@@ -4,6 +4,13 @@ CHANGES
 Unreleased
 ----------
 
+- A root that reads a CTE or VALUES list of its own (a domain over a CTE, its
+  domain declaring no `source_schema`) refuses `cte_name_collision` when the
+  name is also a relation on the session's search_path: the root read the CTE's
+  rows where the host may have meant the table. A query a CASE expression embeds
+  is resolved and qualified like a filter subquery: it read the public table
+  under a declared schema, or refused `relation_unresolved`. A raw CTE no longer
+  raises `BadMapError`.
 - Every table a Selecto read names is resolved and qualified: a filter
   subquery's (`{:exists, query}`, `{:subquery, ...}`) and a domain's declared
   non-association joins' tables were not relations of the read, so they refused
