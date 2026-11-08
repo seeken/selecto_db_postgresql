@@ -370,7 +370,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # schema-qualified names of the domain's relations (R23b), resolved against
   # the connection's reset search_path, never one a statement switched.
   def prepare_read(%{domain: domain} = selecto, connection) when is_map(domain) do
-    with {:ok, requests} <- relation_requests(selecto) do
+    with :ok <- list_roots_unshadowed(selecto, connection),
+         {:ok, requests} <- relation_requests(selecto) do
       case requests do
         [] -> {:ok, selecto}
         requests -> prepare_relations(selecto, connection, requests)
@@ -381,6 +382,24 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   def prepare_read(selecto, _connection), do: {:ok, selecto}
+
+  # A root that declares no schema and is named like a CTE or VALUES list its
+  # query defines reads the list (Selecto.Executor.list_roots/1). Where that
+  # name is also a relation on the session's search_path, which one the host
+  # meant cannot be told: refused.
+  defp list_roots_unshadowed(selecto, connection) do
+    case Selecto.Executor.list_roots(selecto) do
+      [] ->
+        :ok
+
+      names ->
+        with_checkout(connection, fn guard, in_transaction? ->
+          in_own_savepoint(guard, in_transaction?, fn ->
+            RelationPath.list_roots_unshadowed(guard, names)
+          end)
+        end)
+    end
+  end
 
   defp prepare_relations(selecto, connection, requests) do
     # A relation its query declares with `source_schema` (R39), or inherits from

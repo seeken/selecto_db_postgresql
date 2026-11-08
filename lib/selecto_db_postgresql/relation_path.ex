@@ -189,6 +189,30 @@ defmodule SelectoDBPostgreSQL.RelationPath do
                  "pg_catalog.unnest($2::pg_catalog.text[])) AS r(n, q) " <>
                  "WHERE pg_catalog.to_regclass(r.q) IS NULL"
 
+  @existing_sql "SELECT n FROM pg_catalog.unnest($1::pg_catalog.text[]) AS n " <>
+                  "WHERE pg_catalog.to_regclass(pg_catalog.quote_ident(n)) IS NOT NULL"
+
+  @doc false
+  # Of the names roots read as CTE or VALUES lists, those a relation on the
+  # session's search_path also answers to: refused as a name collision.
+  def list_roots_unshadowed(execute, names) do
+    case execute.(@existing_sql, [names]) do
+      {:ok, %{rows: []}} ->
+        :ok
+
+      {:ok, %{rows: rows}} when is_list(rows) ->
+        refusal(
+          :cte_name_collision,
+          "reads a CTE or VALUES list at a root named like a relation on the " <>
+            "search_path; rename the list",
+          List.flatten(rows)
+        )
+
+      other ->
+        if SessionGuard.standing(other), do: other, else: unavailable()
+    end
+  end
+
   @doc false
   # Of `{name, quoted}` pairs, the names no relation answers to: refused as
   # unresolved.
