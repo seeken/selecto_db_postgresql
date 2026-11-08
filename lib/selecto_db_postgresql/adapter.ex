@@ -431,7 +431,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp query_requests(%{query: query, visible: visible, roots: roots}) do
+  defp query_requests(%{query: query, roots: roots} = scope) do
     domain = Map.get(query, :domain) || %{}
     root = Enum.find_value(roots, &root_schema/1)
     declared = collect_declared(domain, %{})
@@ -441,9 +441,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
         two_schemas([table])
 
       nil ->
-        query
-        |> Selecto.Executor.own_relations()
-        |> Enum.reject(&(&1 in visible))
+        scope
+        |> Selecto.Executor.scope_relations()
         |> Enum.uniq()
         |> Enum.map(fn table ->
           schema = declared[table] || if(String.contains?(table, "."), do: nil, else: root)
