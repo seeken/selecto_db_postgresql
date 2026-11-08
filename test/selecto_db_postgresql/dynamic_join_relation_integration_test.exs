@@ -245,7 +245,7 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
     end
   end
 
-  test "a CTE or VALUES name hides a table only where the SQL can see it", ctx do
+  test "a CTE or VALUES name the statement reads as a table refuses, wherever it is", ctx do
     cte_body = fn ->
       Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
       |> Selecto.select(["product_id", "title"])
@@ -283,7 +283,9 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
 
     assert {:error, :cte_name_collision, _} = rows(Selecto.execute(query))
 
-    # An earlier CTE's body reads the real table a later CTE is named after.
+    # An earlier CTE's body reads the real table a later CTE is named after: the
+    # same name is a table at one place and a list at another, which refuses on
+    # every adapter.
     two =
       Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
       |> Selecto.with_cte(
@@ -298,7 +300,8 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
       |> Selecto.select(["name", "c1.title"])
       |> Selecto.order_by("name")
 
-    assert rows(Selecto.execute(two)) == [["a", "alt"], ["b", nil]]
+    assert {:error, :cte_name_collision, [reviews]} = rows(Selecto.execute(two))
+    assert reviews == ctx.reviews
   end
 
   test "union members that read one name in two schemas refuse", ctx do
@@ -316,11 +319,14 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
     expected = [["a", "public"], ["b", nil]]
     assert rows(Selecto.execute(lateral_reviews(ctx))) == expected
     assert rows(Selecto.execute(cte_reviews(ctx, "best"))) == expected
-    # A CTE named like the table it reads: its body reads the table.
-    assert rows(Selecto.execute(cte_reviews(ctx, ctx.reviews))) == expected
+    # A CTE named like the table it reads refuses.
+    assert {:error, :cte_name_collision, [reviews]} =
+             rows(Selecto.execute(cte_reviews(ctx, ctx.reviews)))
+
+    assert reviews == ctx.reviews
 
     diverging(ctx, fn ->
-      for query <- [lateral_reviews(ctx), cte_reviews(ctx, "best"), cte_reviews(ctx, ctx.reviews)] do
+      for query <- [lateral_reviews(ctx), cte_reviews(ctx, "best")] do
         assert {:error, :relation_ambiguous, [reviews]} = rows(Selecto.execute(query))
         assert reviews == ctx.reviews
       end

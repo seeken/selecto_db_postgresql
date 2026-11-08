@@ -38,6 +38,8 @@ defmodule SelectoDBPostgreSQL.ClosureRelationIntegrationTest do
           "INSERT INTO public.#{t.cat}_closure VALUES (1, 1, 0), (1, 2, 1), (2, 2, 0)",
           "INSERT INTO #{t.alt}.#{t.cat}_closure VALUES (1, 1, 10), (1, 2, 11), (2, 2, 10)",
           "INSERT INTO public.#{t.ci} VALUES (1, 2)",
+          "CREATE TABLE public.#{t.cat}_cc2 (ancestor_id int, descendant_id int, depth int)",
+          "INSERT INTO public.#{t.cat}_cc2 VALUES (1, 1, 20), (1, 2, 21), (2, 2, 20)",
           "INSERT INTO #{t.alt}.#{t.p} VALUES (1, 'alt-a')"
         ],
         do: {:ok, _} = Adapter.execute(c, sql, [], [])
@@ -48,7 +50,8 @@ defmodule SelectoDBPostgreSQL.ClosureRelationIntegrationTest do
 
       Adapter.execute(
         d,
-        "DROP TABLE IF EXISTS public.#{t.cat}, public.#{t.cat}_closure, public.#{t.ci}",
+        "DROP TABLE IF EXISTS public.#{t.cat}, public.#{t.cat}_closure, public.#{t.ci}, " <>
+          "public.#{t.cat}_cc2",
         [],
         []
       )
@@ -169,5 +172,48 @@ defmodule SelectoDBPostgreSQL.ClosureRelationIntegrationTest do
       |> Selecto.select(["id", "sq.name", "#{cat}_depth"])
 
     assert depths(subquery) == [0, 1]
+  end
+
+  test "a CTE body's closure join with the root's id reads its own closure table", ctx do
+    cat = ctx.t.cat
+
+    root =
+      Selecto.configure(domain(ctx, false), ctx.connection, adapter: Adapter, validate: false)
+
+    body = fn ->
+      ctx
+      |> domain(false)
+      |> put_in([:joins, String.to_atom(cat), :closure_table], "#{cat}_cc2")
+      |> Selecto.configure(ctx.connection, adapter: Adapter, validate: false)
+      |> Selecto.select(["id", "#{cat}_depth"])
+    end
+
+    query =
+      root
+      |> Selecto.with_cte("cb", body,
+        columns: ["rid", "cdepth"],
+        join: [owner_key: :id, related_key: :rid, fields: %{"cdepth" => %{type: :integer}}]
+      )
+      |> Selecto.select(["id", "#{cat}_depth", "cb.cdepth"])
+
+    {:ok, {rows, _, _}} = Selecto.execute(query)
+    assert Enum.sort(rows) == [[1, 0, 20], [1, 0, 21], [1, 1, 20], [1, 1, 21]]
+  end
+
+  test "a list named like the closure table a join reads refuses", ctx do
+    cat = ctx.t.cat
+
+    query =
+      Selecto.configure(domain(ctx, false), ctx.connection, adapter: Adapter, validate: false)
+      |> Selecto.with_values([[1, 1, 10]],
+        columns: ["ancestor_id", "descendant_id", "depth"],
+        as: "#{cat}_closure"
+      )
+      |> Selecto.select(["id", "#{cat}_depth"])
+
+    assert {:error, %Selecto.Error{details: %{reason: :cte_name_collision, relations: [name]}}} =
+             Selecto.execute(query)
+
+    assert name == "#{cat}_closure"
   end
 end
