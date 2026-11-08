@@ -392,6 +392,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     # so every generated comparison names its operator and casts both
     # operands (Selecto.Builder.TypedOperator).
     with {:ok, resolved} <- resolve_relations(connection, names),
+         :ok <- declared_exist(connection, resolved, names),
          {:ok, relations} <- one_relation_per_name(resolved, requests),
          {:ok, types} <- operator_types(connection, relations) do
       set =
@@ -1052,6 +1053,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   # R36: the relation lookup runs its own savepoint or transaction, so all
   # of its statements go to one connection checkout.
+  # A relation named by a declared or inherited schema is not looked up by path:
+  # one that is not there refuses, typed, before the read runs.
+  defp declared_exist(connection, resolved, names) do
+    case for(name <- names, String.contains?(name, "."), do: {name, resolved[name]}) do
+      [] ->
+        :ok
+
+      declared ->
+        with_checkout(connection, fn guard, in_transaction? ->
+          in_own_savepoint(guard, in_transaction?, fn ->
+            RelationPath.missing(guard, declared)
+          end)
+        end)
+    end
+  end
+
   defp operator_types(connection, relations),
     do:
       with_checkout(connection, fn guard, in_transaction? ->

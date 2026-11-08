@@ -356,6 +356,22 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
       |> Selecto.order_by("name")
 
     assert rows(Selecto.execute(joined)) == [["a", "temp"], ["b", nil]]
+
+    # Undeclared under a root declaring public, it is looked for in public: refused, typed.
+    undeclared =
+      Selecto.configure(put_in(reviews(ctx), [:source, :source_table], temp), ctx.connection,
+        adapter: Adapter
+      )
+      |> Selecto.select(["product_id", "title"])
+
+    missing =
+      Selecto.configure(products(ctx, "public"), ctx.connection, adapter: Adapter)
+      |> Selecto.DynamicJoin.join_subquery(:best, undeclared,
+        on: [%{left: "id", right: "product_id"}]
+      )
+      |> Selecto.select(["name", "best.title"])
+
+    assert {:error, :relation_unresolved, [_temp]} = rows(Selecto.execute(missing))
   end
 
   defp reviews_to_products(ctx, schema) do
@@ -451,6 +467,91 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
       |> Selecto.order_by("name")
 
     assert rows(Selecto.execute(query)) == [["a", "V"], ["b", nil]]
+  end
+
+  test "a body's copy of a statement CTE emitted after it is the body's own", ctx do
+    shadow = "selecto_cl_#{System.unique_integer([:positive])}"
+
+    for sql <- [
+          "CREATE TABLE public.#{shadow} (product_id int, label text)",
+          "INSERT INTO public.#{shadow} VALUES (1, 'TABLE')"
+        ],
+        do: {:ok, _} = Adapter.execute(ctx.connection, sql, [], [])
+
+    spec =
+      Selecto.Advanced.CTE.create_cte(
+        shadow,
+        fn ->
+          Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+          |> Selecto.select(["id", "name"])
+          |> Selecto.filter({"id", 1})
+        end,
+        columns: ["product_id", "label"]
+      )
+
+    body = fn ->
+      Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.with_ctes([spec])
+      |> Selecto.join(:cj,
+        source: shadow,
+        type: :left,
+        owner_key: :product_id,
+        related_key: :product_id,
+        fields: %{label: %{type: :string}}
+      )
+      |> Selecto.select(["id", "cj.label"])
+    end
+
+    for order <- [:statement_copy_after, :statement_copy_before] do
+      base = Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
+      base = if order == :statement_copy_before, do: Selecto.with_ctes(base, [spec]), else: base
+
+      query =
+        base
+        |> Selecto.with_cte("cb", body,
+          columns: ["rid", "clab"],
+          join: [owner_key: :id, related_key: :rid, fields: %{clab: %{type: :string}}]
+        )
+        |> then(&if(order == :statement_copy_after, do: Selecto.with_ctes(&1, [spec]), else: &1))
+        |> Selecto.select(["title", "cb.clab"])
+
+      assert rows(Selecto.execute(query)) == [["public", "a"]], inspect(order)
+    end
+  end
+
+  test "a recursive CTE whose base defines its own CTE refuses, typed", ctx do
+    query =
+      Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.with_recursive_cte("walk",
+        base_query: fn ->
+          Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
+          |> Selecto.with_cte("zz", fn ->
+            Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+            |> Selecto.select(["id"])
+          end)
+          |> Selecto.select(["product_id"])
+        end,
+        recursive_query: fn _ref ->
+          Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
+          |> Selecto.join(:w,
+            source: "walk",
+            type: :inner,
+            owner_key: :product_id,
+            related_key: :product_id,
+            fields: %{"product_id" => %{type: :integer}}
+          )
+          |> Selecto.select(["product_id"])
+        end,
+        columns: ["product_id"],
+        join: [
+          owner_key: :id,
+          related_key: :product_id,
+          fields: %{"product_id" => %{type: :integer}}
+        ]
+      )
+      |> Selecto.select(["name", "walk.product_id"])
+
+    assert {:error, :recursive_cte_nested_with, ["zz"]} = rows(Selecto.execute(query))
   end
 
   test "a subquery whose domain declares its schema reads there", ctx do
