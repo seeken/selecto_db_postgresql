@@ -317,9 +317,10 @@ another schema's relation, function or operator of the same name. So:
   (`reason: :relation_ambiguous`) instead of being redirected, and a
   relation only the session's temp schema holds refuses unless declared
   (`reason: :relation_unresolved`): declare `source_schema: "pg_temp"` on the
-  domain that names it. An ad-hoc join cannot name a schema (its table takes
-  its root's), so read a temporary table through `join_subquery` on a domain
-  that declares `pg_temp`.
+  domain that names it. An ad-hoc join cannot name a schema: its table takes
+  its root's, so it reaches a temporary table only under a root that declares
+  `pg_temp`; otherwise read it through `join_subquery` on a domain that
+  declares `pg_temp`.
   **A host that `SET`s search_path to
   reach another schema must declare that schema** (or set it at connection
   startup, for example `parameters: [search_path: "app"]`). A name that
@@ -332,14 +333,19 @@ another schema's relation, function or operator of the same name. So:
   query and a set operation's members are resolved, pinned and guarded like
   the domain's own tables. A nested query (subquery join, CTE, LATERAL) whose
   domain declares no `source_schema` takes its enclosing query's declared
-  root, as an ad-hoc join's table does (R59); one that declares its own keeps
-  it. Set operation members are siblings and take nothing from each other.
+  root, as an ad-hoc join's table does (R59), and a retargeted query that
+  declares none takes its origin's; one that declares its own keeps it. Set
+  operation members are siblings and take nothing from each other.
   The SQL names a relation once, so a name two of them would resolve to two
   relations refuses (`reason: :relation_ambiguous`) rather than read one for
   both. A CTE or VALUES name hides a table only where the SQL can see it: in
-  its own query and the queries nested in it, and in a non-recursive `WITH`
-  only from the bodies after it; elsewhere the table stays a relation, and a
-  name the SQL cannot scope refuses (`reason: :cte_name_collision`).
+  its own query and the queries nested in it (a retargeted query's origin
+  included, which compiles under the target's `WITH`), and in a non-recursive
+  `WITH` from the VALUES lists, the join-generated CTEs and the CTEs before a
+  body; a CTE body's own CTEs are emitted as a `WITH` inside it. Elsewhere the
+  table stays a relation, and a name the SQL cannot scope refuses
+  (`reason: :cte_name_collision`), as does a retarget target's CTE or VALUES
+  list named like a table its origin reads.
 - A CTE or query member named like a real relation is scoped: in a leading
   non-recursive `WITH`, its own body and the bodies before it read the real
   (qualified) relation, the later bodies and the main query the CTE. A

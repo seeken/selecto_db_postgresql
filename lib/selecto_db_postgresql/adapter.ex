@@ -412,8 +412,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # query's domain decides; else, under a root that declares its schema, the
   # relation resolves there, never by the connection's path (R59). A nested
   # query (a subquery join's, a CTE's, a LATERAL join's) whose domain declares
-  # no schema takes its nearest enclosing query's. Else the reset search_path
-  # decides. A table one domain declares with two schemas refuses.
+  # no schema takes its nearest enclosing query's, and a retargeted query its
+  # origin's (Selecto.Executor.read_scopes/1, `roots`). Else the reset
+  # search_path decides. A table one domain declares with two schemas refuses.
   defp relation_requests(selecto) do
     selecto
     |> Selecto.Executor.read_scopes()
@@ -429,9 +430,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  defp query_requests(%{query: query, visible: visible, enclosing: enclosing}) do
+  defp query_requests(%{query: query, visible: visible, roots: roots}) do
     domain = Map.get(query, :domain) || %{}
-    root = Enum.find_value([query | enclosing], &root_schema/1)
+    root = Enum.find_value(roots, &root_schema/1)
     declared = collect_declared(domain, %{})
 
     case Enum.find(declared, &match?({_table, :conflict}, &1)) do
