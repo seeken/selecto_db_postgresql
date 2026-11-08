@@ -4,6 +4,15 @@ CHANGES
 Unreleased
 ----------
 
+- Every table a Selecto read names is resolved and qualified: a filter
+  subquery's (`{:exists, query}`, `{:subquery, ...}`) and a domain's declared
+  non-association joins' tables were not relations of the read, so they refused
+  `relation_unresolved` whenever the outer query did not read the same table,
+  read the public table when the subquery declared another schema, or read an
+  outer VALUES list of that name. A filter subquery or declared join now
+  resolves under its own declaration, or its root's (R59). A domain rooted on a
+  CTE its own query defines, or a CTE body rooted on a visible one, reads the
+  CTE and is no relation to resolve.
 - A closure-table join whose id is its category table's name reads its own
   closure table again. Its generated CTE was named like that table and hid it,
   so the table went unresolved and, with another schema declared in the
