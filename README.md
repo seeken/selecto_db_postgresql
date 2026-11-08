@@ -350,7 +350,10 @@ another schema's relation, function or operator of the same name. So:
   table the statement reads is such a name and refuses, even where the body's
   CTE alone would be correct. A recursive CTE whose base or recursive query
   defines its own CTE or VALUES list refuses
-  (`reason: :recursive_cte_nested_with`). A relation named by a declared or
+  (`reason: :recursive_cte_nested_with`); a copy of the statement's VALUES list
+  or of a CTE emitted before it is the statement's and is allowed. Under
+  `WITH RECURSIVE` a body still sees only the CTEs emitted before it: MySQL
+  shows no body a later one. A relation named by a declared or
   inherited schema that does not exist there refuses
   (`reason: :relation_unresolved`) before the read runs.
 - A CTE or query member named like a real relation is scoped: in a leading
