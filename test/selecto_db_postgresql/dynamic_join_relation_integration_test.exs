@@ -358,6 +358,101 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
     assert rows(Selecto.execute(joined)) == [["a", "temp"], ["b", nil]]
   end
 
+  defp reviews_to_products(ctx, schema) do
+    reviews(ctx, schema)
+    |> put_in([:source, :associations], %{
+      prod: %{queryable: :prod, field: :prod, owner_key: :product_id, related_key: :id}
+    })
+    |> Map.put(:schemas, %{prod: products(ctx).source})
+    |> Map.put(:joins, %{prod: %{type: :left, name: "prod"}})
+  end
+
+  defp liked_products(ctx, schema) do
+    Selecto.configure(reviews_to_products(ctx, schema), ctx.connection, adapter: Adapter)
+    |> Selecto.filter({"rating", {:>=, 4}})
+    |> Selecto.retarget(:prod)
+  end
+
+  test "a retargeted query: the origin under the target's WITH, the target under its root", ctx do
+    assert rows(Selecto.execute(liked_products(ctx, nil) |> Selecto.select(["name"]))) == [["a"]]
+
+    # The target's VALUES named like the origin's table would feed the origin.
+    shadowed =
+      liked_products(ctx, nil)
+      |> Selecto.with_values([[2, 9, 5, "V"]],
+        columns: ["id", "product_id", "rating", "title"],
+        as: ctx.reviews
+      )
+      |> Selecto.select(["name"])
+
+    assert {:error, :cte_name_collision, [reviews]} = rows(Selecto.execute(shadowed))
+    assert reviews == ctx.reviews
+
+    # A target declaring no schema takes its origin's declared root (R59).
+    assert rows(Selecto.execute(liked_products(ctx, ctx.alt) |> Selecto.select(["name"]))) ==
+             [["alt-a"]]
+  end
+
+  test "a CTE body's own CTEs are emitted inside it; its VALUES lists stay visible", ctx do
+    body = fn own_name ->
+      fn ->
+        Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
+        |> Selecto.with_cte(own_name, fn ->
+          Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+          |> Selecto.select(["id"])
+          |> Selecto.filter({"id", 2})
+        end)
+        |> Selecto.join(:only,
+          source: own_name,
+          type: :inner,
+          owner_key: :product_id,
+          related_key: :id
+        )
+        |> Selecto.select(["product_id", "title"])
+      end
+    end
+
+    outer = fn builder ->
+      Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.with_cte("cb", builder,
+        join: [owner_key: :id, related_key: :product_id, fields: %{title: %{type: :string}}]
+      )
+      |> Selecto.select(["name", "cb.title"])
+      |> Selecto.order_by("name")
+    end
+
+    # Only product b passes the body's own CTE, and b has no review.
+    assert rows(Selecto.execute(outer.(body.("only_b")))) == [["a", nil], ["b", nil]]
+
+    # Named like a table the statement reads, it cannot be scoped.
+    assert {:error, :cte_name_collision, _} =
+             rows(Selecto.execute(outer.(body.(ctx.products))))
+
+    # A VALUES list of the enclosing query is visible in its CTE bodies.
+    labelled = fn ->
+      Selecto.configure(reviews(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.join(:vl,
+        source: "vlist",
+        type: :inner,
+        owner_key: :product_id,
+        related_key: :product_id,
+        fields: %{label: %{type: :string}}
+      )
+      |> Selecto.select(["product_id", "vl.label"])
+    end
+
+    query =
+      Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.with_values([[1, "V"]], columns: ["product_id", "label"], as: "vlist")
+      |> Selecto.with_cte("cl", labelled,
+        join: [owner_key: :id, related_key: :product_id, fields: %{label: %{type: :string}}]
+      )
+      |> Selecto.select(["name", "cl.label"])
+      |> Selecto.order_by("name")
+
+    assert rows(Selecto.execute(query)) == [["a", "V"], ["b", nil]]
+  end
+
   test "a subquery whose domain declares its schema reads there", ctx do
     assert rows(Selecto.execute(subquery_join(ctx, ctx.alt))) == [["a", "alt"], ["b", nil]]
   end

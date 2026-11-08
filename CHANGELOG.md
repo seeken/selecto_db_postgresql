@@ -9,7 +9,8 @@ Unreleased
   subquery's declaration redirected an ad-hoc join of the same name, and union
   members declaring a name differently read one schema. A nested query whose
   domain declares no `source_schema` takes its enclosing query's declared root
-  (R59), as an ad-hoc join's table does. A CTE or VALUES name hides a table only
+  (R59), as an ad-hoc join's table does, and a retargeted query that declares
+  none takes its origin's. A CTE or VALUES name hides a table only
   where the SQL can see it, so a name defined in one query no longer hides a
   relation in another, and a CTE's body reads the real relation of a CTE named
   after it later.

@@ -296,7 +296,8 @@ defmodule SelectoDBPostgreSQL.RelationPath do
                :relation_unresolved,
                "a domain relation resolves only to a temporary table; declare " <>
                  "source_schema: \"pg_temp\" on the domain that names it. An ad-hoc " <>
-                 "join cannot name a schema: read a temporary table through " <>
+                 "join's table takes its root's schema, so it reaches a temporary " <>
+                 "table only under a root declaring pg_temp; otherwise use " <>
                  "join_subquery on a domain declaring pg_temp",
                [name]
              )}
