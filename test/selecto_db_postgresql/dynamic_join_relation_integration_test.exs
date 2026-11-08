@@ -554,6 +554,40 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
     assert {:error, :recursive_cte_nested_with, ["zz"]} = rows(Selecto.execute(query))
   end
 
+  test "a recursive base built from a root carrying its VALUES list reads the statement's", ctx do
+    root =
+      Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+      |> Selecto.with_values([[1, "V"]], columns: ["product_id", "label"], as: "vv")
+
+    query =
+      root
+      |> Selecto.with_recursive_cte("walk",
+        base_query: fn -> root |> Selecto.select(["id"]) |> Selecto.filter({"id", 1}) end,
+        recursive_query: fn _ref ->
+          Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
+          |> Selecto.join(:w,
+            source: "walk",
+            type: :inner,
+            owner_key: :id,
+            related_key: :wid,
+            fields: %{"wid" => %{type: :integer}}
+          )
+          |> Selecto.select(["id"])
+          |> Selecto.filter({"id", 999})
+        end,
+        columns: ["wid"],
+        join: [
+          owner_key: :id,
+          related_key: :wid,
+          type: :inner,
+          fields: %{"wid" => %{type: :integer}}
+        ]
+      )
+      |> Selecto.select(["name"])
+
+    assert rows(Selecto.execute(query)) == [["a"]]
+  end
+
   test "a subquery whose domain declares its schema reads there", ctx do
     assert rows(Selecto.execute(subquery_join(ctx, ctx.alt))) == [["a", "alt"], ["b", nil]]
   end
