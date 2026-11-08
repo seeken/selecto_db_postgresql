@@ -338,20 +338,28 @@ another schema's relation, function or operator of the same name. So:
   operation members are siblings and take nothing from each other.
   The SQL names a relation once, so a name two of them would resolve to two
   relations refuses (`reason: :relation_ambiguous`) rather than read one for
-  both. A CTE or VALUES name is never a table: Selecto refuses, on every
-  adapter, a statement in which a name defined anywhere (a user's CTE or VALUES
-  list, or a CTE Selecto generates) is also a relation read anywhere in it
-  (`reason: :cte_name_collision`), and one name defined twice with different
-  lists (`reason: :cte_name_redefined`). Every query counts: CTE bodies at any
-  depth, subquery and LATERAL joins, set members, recursive bases and steps, a
-  retarget origin, and the closure or junction table a join reads. So every
-  relation the statement reads is resolved and qualified like the domain's
-  own. The CTEs Selecto generates start with `__selecto_` and are named by
-  their content (a values list's rows, a hierarchy join's definition), within
-  63 characters. A recursive CTE whose base or recursive query defines its own
-  CTE or VALUES list refuses (`reason: :recursive_cte_nested_with`); a copy of
-  the statement's VALUES list or of a CTE emitted before it is the statement's
-  and is allowed. A relation named by a declared or inherited schema that does
+  both. A CTE or VALUES name and a table never share a name in a statement.
+  A name a query reads is a reference to a list where the statement makes it
+  one: a domain rooted on a CTE or VALUES list its own query defines, a CTE
+  body's domain rooted on a list visible where the body sits, an ad-hoc join
+  naming a visible list. Every other name is a table, and Selecto refuses, on
+  every adapter, a statement in which a table it reads is named like a list
+  defined anywhere in it (`reason: :cte_name_collision`), or one name is defined
+  twice with different lists (`reason: :cte_name_redefined`) other than in two
+  members of one set operation, each private to its member. Every query counts:
+  CTE bodies at any depth, subquery and LATERAL joins, filter subqueries
+  (`{:exists, query}`, `{:subquery, ...}` and any query a filter or selection
+  embeds), set members, recursive bases and steps, a retarget origin, a
+  domain's declared non-association joins, and the closure or junction table a
+  join reads. Each of those tables is resolved under its query's declarations
+  (a filter subquery or declared join takes its root's declared schema, R59)
+  and qualified like the domain's own; a table two queries would resolve to two
+  relations refuses (`reason: :relation_ambiguous`). The CTEs Selecto generates
+  start with `__selecto_` and are named by their content (a values list's rows,
+  a hierarchy join's definition), within 63 characters. A recursive CTE whose
+  base or recursive query defines its own CTE or VALUES list refuses
+  (`reason: :recursive_cte_nested_with`); a copy of the statement's VALUES list
+  or of a CTE emitted before it is the statement's and is allowed. A relation named by a declared or inherited schema that does
   not exist there refuses (`reason: :relation_unresolved`) before the read runs.
 - A raw CTE (`{:raw_cte, sql, params}`), whose name Selecto does not know, named
   like a real relation is scoped by the qualifier: in a leading non-recursive
