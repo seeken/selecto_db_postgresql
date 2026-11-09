@@ -378,13 +378,18 @@ another schema's relation, function or operator of the same name. So:
   string literal, non-ASCII names, SEARCH/CYCLE, a RECURSIVE prefix and a
   trailing comma. A `$` after an identifier character (non-ASCII letters
   included) opens no dollar quote, and a `--` comment ends at a carriage
-  return. A raw CTE whose params do not match its placeholders refuses
-  (`raw_cte_params_mismatch`). Names compare case-insensitively. A list's name
-  is written unquoted when plain (letters, digits, underscores, and in any case
-  not a word PostgreSQL, MySQL 8.4, MariaDB 11.4, SQLite or DuckDB reserves) in
-  its definition and every root and join naming it, so it folds as the host's
-  own SQL naming it unquoted does; other names, and a raw CTE's quoted names,
-  are quoted. The list-root check looks a root up by that identifier and by
+  return. A raw CTE's `$n` placeholders must each be bound by its params (none
+  without params, none in a string or comment, no params beside
+  `{:param, value}` markers): otherwise it refuses
+  (`raw_cte_params_mismatch`) rather than bind a value of the statement around
+  it. Names compare case-insensitively. A list's name is written unquoted when
+  plain (letters, digits, underscores, and in any case not a word PostgreSQL,
+  MySQL 8.4, MariaDB 11.4, SQLite or DuckDB reserves) in its definition and
+  every root and join naming it, so it folds as the host's own SQL naming it
+  unquoted does; a name of that pattern quoted only for a reserved word, and a
+  raw CTE's unquoted name, are quoted folded (`Rank` as `"rank"`), so host text
+  naming them unquoted reads the same list. Other names, and a raw CTE's quoted
+  names, are quoted as written. The list-root check looks a root up by that identifier and by
   its name as written (`quote_ident`): a relation answering to either refuses.
 - **Each Selecto statement runs under pinned settings**: search_path
   `pg_catalog, <declared schemas>, <every schema of the reset search_path>,

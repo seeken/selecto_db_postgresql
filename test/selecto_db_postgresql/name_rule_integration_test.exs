@@ -34,6 +34,7 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
         do: {:ok, _} = Adapter.execute(c, sql, [], [])
 
     on_exit(fn ->
+      if Process.alive?(c), do: GenServer.stop(c)
       {:ok, d} = Adapter.connect(opts)
       Adapter.execute(d, "DROP SCHEMA IF EXISTS #{t.alt} CASCADE", [], [])
 
@@ -701,5 +702,125 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
 
     assert refusal(named |> Selecto.select(["name"]) |> Selecto.filter({"lkd.label", "x"})) ==
              {:cte_name_collision, [ctx.t.lk]}
+  end
+
+  test "a list named with a word only another dialect reserves reads as host text names it",
+       ctx do
+    listed =
+      q(ctx, p(ctx))
+      |> Selecto.with_values([[1]], columns: ["pid"], as: "Plan")
+      |> Selecto.filter({:raw_sql_filter, ["selecto_root.id IN (SELECT pid FROM Plan)"]})
+      |> Selecto.select(["name"])
+
+    assert outcome(listed) == [["a"]]
+
+    raw =
+      q(ctx, p(ctx))
+      |> Selecto.with_ctes([{:raw_cte, "Plan AS (SELECT 1 AS id, 'RAW' AS v)", []}])
+      |> Selecto.join(:mj,
+        source: "Plan",
+        type: :left,
+        owner_key: :id,
+        related_key: :id,
+        fields: %{"v" => %{type: :string}}
+      )
+      |> Selecto.select(["name", "mj.v"])
+
+    assert outcome(raw) == [["a", "RAW"], ["b", nil]]
+  end
+
+  test "a raw CTE with params inside a subquery join binds them", ctx do
+    inner =
+      q(ctx, dom("pa", pid: :integer, label: :string))
+      |> Selecto.with_ctes([
+        {:raw_cte, "pa AS (SELECT CAST($1 AS INTEGER) AS pid, 'P' AS label)", [1]}
+      ])
+      |> Selecto.select(["pid", "label"])
+
+    query =
+      q(ctx, p(ctx))
+      |> Selecto.DynamicJoin.join_subquery(:sq, inner, on: [%{left: "id", right: "pid"}])
+      |> Selecto.select(["name", "sq.label"])
+
+    assert outcome(query) == [["a", "P"], ["b", nil]]
+  end
+
+  test "a raw CTE placeholder its params do not bind refuses typed", ctx do
+    one = "CAST($1 AS INTEGER)"
+    two = String.replace("CAST($1 AS INTEGER)", "$1", "$2")
+
+    for {text, params} <- [
+          {"pa AS (SELECT #{one} AS pid, #{two} AS label)", [5]},
+          {"pa AS (SELECT 7 AS pid, #{one} AS label)", []},
+          {["pa AS (SELECT ", {:param, 5}, " AS pid, 'P' AS label)"], [6]}
+        ] do
+      query =
+        q(ctx, dom("pa", pid: :integer, label: :string))
+        |> Selecto.with_ctes([{:raw_cte, text, params}])
+        |> Selecto.select(["pid", "label"])
+        |> Selecto.filter({"label", "OUTER"})
+
+      assert {:error, %Selecto.Error{details: %{reason: :raw_cte_params_mismatch}}} =
+               Selecto.execute(query),
+             inspect(text)
+    end
+  end
+
+  test "on PostgreSQL a reserved-only list name reads as host text folds it", ctx do
+    {:ok, _} =
+      Adapter.execute(ctx.conn, ~s|CREATE TABLE public."Rank" (id INT, v TEXT)|, [], [])
+
+    try do
+      {:ok, _} =
+        Adapter.execute(ctx.conn, ~s|INSERT INTO public."Rank" VALUES (1, 'TBL')|, [], [])
+
+      raw =
+        q(ctx, p(ctx))
+        |> Selecto.with_ctes([{:raw_cte, "Rank AS (SELECT 1 AS id, 'RAW' AS v)", []}])
+        |> Selecto.join(:mj,
+          source: "Rank",
+          type: :left,
+          owner_key: :id,
+          related_key: :id,
+          fields: %{"v" => %{type: :string}}
+        )
+        |> Selecto.select(["name", "mj.v"])
+
+      assert outcome(raw) == [["a", "RAW"], ["b", nil]]
+
+      for name <- ~w(First Query Action Position RANK) do
+        joined =
+          q(ctx, p(ctx))
+          |> Selecto.with_ctes([{:raw_cte, "#{name} AS (SELECT 1 AS id, 'RAW' AS v)", []}])
+          |> Selecto.join(:mj,
+            source: name,
+            type: :left,
+            owner_key: :id,
+            related_key: :id,
+            fields: %{"v" => %{type: :string}}
+          )
+          |> Selecto.select(["name", "mj.v"])
+
+        assert outcome(joined) == [["a", "RAW"], ["b", nil]], name
+      end
+    after
+      Adapter.execute(ctx.conn, ~s|DROP TABLE IF EXISTS public."Rank"|, [], [])
+    end
+
+    {:ok, _} = Adapter.execute(ctx.conn, "CREATE TABLE public.rank (pid INT)", [], [])
+
+    try do
+      {:ok, _} = Adapter.execute(ctx.conn, "INSERT INTO public.rank VALUES (2)", [], [])
+
+      listed =
+        q(ctx, p(ctx))
+        |> Selecto.with_values([[1]], columns: ["pid"], as: "Rank")
+        |> Selecto.filter({:raw_sql_filter, ["selecto_root.id IN (SELECT pid FROM Rank)"]})
+        |> Selecto.select(["name"])
+
+      assert outcome(listed) == [["a"]]
+    after
+      Adapter.execute(ctx.conn, "DROP TABLE IF EXISTS public.rank", [], [])
+    end
   end
 end
