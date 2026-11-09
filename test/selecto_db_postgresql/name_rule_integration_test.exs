@@ -1097,4 +1097,26 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
 
     assert outcome(over_cte) == [[1], [2]]
   end
+
+  test "an integer after $ in marker iodata reads as the placeholder it renders", ctx do
+    outer = fn ->
+      q(ctx, p(ctx)) |> Selecto.filter({"name", {:!=, "a"}}) |> Selecto.select(["id"])
+    end
+
+    held = "SELECT 1 FROM #{ctx.t.p} x WHERE x.id = selecto_root.id AND CAST($"
+
+    for fragment <- [
+          [held, 1, " AS text) = 'a'"],
+          [held, 1, " AS text) = 'a' AND x.name <> ", {:param, "zz"}]
+        ] do
+      # The $1 would bind the outer "a" and answer [[2]].
+      assert {:error, %Selecto.Error{details: %{reason: reason}}} =
+               Selecto.execute(Selecto.filter(outer.(), {:exists, fragment}))
+
+      assert reason in [:placeholder_count_mismatch, :placeholder_unsupported]
+    end
+
+    plain = ["SELECT 1 FROM #{ctx.t.p} x WHERE x.id = selecto_root.id AND x.id <> ", 1]
+    assert outcome(Selecto.filter(outer.(), {:exists, plain})) == [[2]]
+  end
 end
