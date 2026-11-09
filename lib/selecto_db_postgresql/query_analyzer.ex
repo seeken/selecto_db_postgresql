@@ -189,6 +189,7 @@ defmodule SelectoDBPostgreSQL.QueryAnalyzer do
           {:error, :invalid_connection}
       end
     rescue
+      refusal in Selecto.Builder.ScopeRefusal -> {:error, Selecto.Error.from_reason(refusal)}
       error -> {:error, {:explain_failed, error}}
     catch
       kind, reason -> {:error, {:explain_failed, {kind, reason}}}

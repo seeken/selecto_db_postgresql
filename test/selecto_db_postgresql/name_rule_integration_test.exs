@@ -948,4 +948,40 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
       assert {:error, %Selecto.Error{details: %{reason: :placeholder_ambiguous}}} = result
     end
   end
+
+  test "an odd placeholder exposed as code under standard_conforming_strings off refuses typed",
+       ctx do
+    opts =
+      ConnectionOptions.options()
+      |> Keyword.put(:pool_size, 1)
+      |> Keyword.update(:parameters, [standard_conforming_strings: "off"], fn parameters ->
+        Keyword.put(parameters, :standard_conforming_strings, "off")
+      end)
+
+    {:ok, c} = Adapter.connect(opts)
+    Process.unlink(c)
+
+    try do
+      frag =
+        "SELECT 1 FROM #{ctx.t.p} x WHERE x.name <> '\\'' AND x.name = $01 -- '\n" <>
+          " AND x.name = $1"
+
+      query =
+        Selecto.configure(p(ctx), c, adapter: @adapter, validate: false)
+        |> Selecto.filter({"name", {:!=, "b"}})
+        |> Selecto.filter({:exists, frag, ["a"]})
+        |> Selecto.select(["name"])
+
+      # Main and the follow-up head left $01 to bind the outer "b": [].
+      assert {:error, %Selecto.Error{details: %{reason: :placeholder_unsupported}}} =
+               Selecto.execute(query)
+
+      refused = Selecto.filter(q(ctx, p(ctx)), {:exists, "SELECT 1", ["x"]})
+
+      assert {:error, %Selecto.Error{details: %{reason: :placeholder_count_mismatch}}} =
+               Selecto.Performance.QueryAnalyzer.analyze_query(refused)
+    after
+      GenServer.stop(c)
+    end
+  end
 end
