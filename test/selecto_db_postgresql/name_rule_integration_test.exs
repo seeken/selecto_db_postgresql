@@ -984,4 +984,34 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
       GenServer.stop(c)
     end
   end
+
+  test "a nested placeholder its own params do not bind refuses typed; one in a literal answers",
+       ctx do
+    outer = fn filter ->
+      q(ctx, p(ctx))
+      |> Selecto.filter({"name", {:!=, "zz"}})
+      |> Selecto.filter(filter)
+      |> Selecto.select(["name"])
+    end
+
+    inner =
+      q(ctx, p(ctx))
+      |> Selecto.filter({:raw_sql_filter, ["selecto_root.name = $1"]})
+      |> Selecto.select(["id"])
+
+    for query <- [
+          outer.({:exists, "SELECT 1 FROM #{ctx.t.p} x WHERE x.name = $1"}),
+          outer.({:exists, "SELECT 1 FROM #{ctx.t.p} x WHERE x.name = $1", []}),
+          outer.({"id", {:subquery, :in, inner}}),
+          outer.({:exists, "SELECT 1 FROM #{ctx.t.p} x WHERE x.name = $1 AND x.name = $3", ["a"]})
+        ] do
+      assert {:error, %Selecto.Error{details: %{reason: reason}}} = Selecto.execute(query)
+      assert reason in [:placeholder_count_mismatch, :placeholder_unsupported]
+    end
+
+    literal =
+      outer.({:exists, "SELECT 1 FROM #{ctx.t.p} x WHERE x.name <> 'cost $1' -- cost $1\n"})
+
+    assert outcome(literal) == [["a"], ["b"]]
+  end
 end
