@@ -10,7 +10,9 @@ Unreleased
   quoted (`Order`, `Key`) or that PostgreSQL reserves (`With`, `Desc`) stays
   quoted as written. A raw CTE's `$n` placeholders its params do not bind
   (every `n` from 1 up) refuse `raw_cte_params_mismatch`; without params a
-  `$1` in a string, comment or dollar quote is text.
+  `$1` in a string, comment or dollar quote is text. A nested fragment with a
+  backslash literal whose placeholders standard_conforming_strings would move
+  refuses `placeholder_ambiguous`.
 - Only the relations a read's compiled statement names are resolved before it
   runs: a domain's declared join to a table the read does not use (a session's
   temporary table that is not there) no longer refuses `relation_unresolved`.

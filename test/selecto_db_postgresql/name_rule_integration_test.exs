@@ -888,4 +888,45 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
     assert read.("Rank", "Rank") == [["a"]]
     refute read.("Rank", ~s("Rank")) == [["a"]]
   end
+
+  defp nested_filter(query_fun, raw) do
+    sub =
+      query_fun.()
+      |> Selecto.filter({:raw_sql_filter, [raw]})
+      |> Selecto.filter({"id", 1})
+      |> Selecto.select(["id"])
+
+    query_fun.()
+    |> Selecto.filter({"id", {:subquery, :in, sub}})
+    |> Selecto.select(["name"])
+  end
+
+  test "under standard_conforming_strings off, a nested fragment's backslash literal refuses typed",
+       ctx do
+    opts =
+      ConnectionOptions.options()
+      |> Keyword.put(:pool_size, 1)
+      |> Keyword.update(:parameters, [standard_conforming_strings: "off"], fn parameters ->
+        Keyword.put(parameters, :standard_conforming_strings, "off")
+      end)
+
+    {:ok, c} = Adapter.connect(opts)
+    Process.unlink(c)
+
+    try do
+      products = fn -> Selecto.configure(p(ctx), c, adapter: @adapter, validate: false) end
+
+      # Main rebound the text whole; the follow-up head hid the real $k or
+      # rebound the literal's. Whichever the session reads, refused typed.
+      for raw <- [~S[selecto_root.name <> 'O\'Brien'], ~S[selecto_root.name <> 'O\'x $1']] do
+        assert {:error, %Selecto.Error{details: %{reason: :placeholder_ambiguous}}} =
+                 Selecto.execute(nested_filter(products, raw)),
+               raw
+      end
+
+      assert outcome(nested_filter(products, "selecto_root.name <> 'O''Brien $1'")) == [["a"]]
+    after
+      GenServer.stop(c)
+    end
+  end
 end
