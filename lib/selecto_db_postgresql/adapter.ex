@@ -387,11 +387,11 @@ defmodule SelectoDBPostgreSQL.Adapter do
   def prepare_read(selecto, _connection), do: {:ok, selecto}
 
   # A root that declares no schema and is named like a CTE or VALUES list its
-  # query defines reads the list (Selecto.Executor.list_roots/1). Where that
-  # name is also a relation on the session's search_path, which one the host
-  # meant cannot be told: refused.
+  # query defines reads the list (Selecto.Executor.list_root_identifiers/1).
+  # Where the identifier the SQL names it by is also a relation on the
+  # session's search_path, which one the host meant cannot be told: refused.
   defp list_roots_unshadowed(selecto, connection) do
-    case Selecto.Executor.list_roots(selecto) do
+    case Selecto.Executor.list_root_identifiers(selecto) do
       [] ->
         :ok
 
