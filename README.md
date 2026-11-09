@@ -378,18 +378,21 @@ another schema's relation, function or operator of the same name. So:
   string literal, non-ASCII names, SEARCH/CYCLE, a RECURSIVE prefix and a
   trailing comma. A `$` after an identifier character (non-ASCII letters
   included) opens no dollar quote, and a `--` comment ends at a carriage
-  return. A raw CTE's `$n` placeholders must each be bound by its params (none
-  without params, none in a string or comment, no params beside
-  `{:param, value}` markers): otherwise it refuses
+  return. A raw CTE's `$n` placeholders must each be bound by its params, every
+  `n` from 1 up used (none outside literals without params, where `$1` in a
+  string, comment or dollar quote stays text; none in a literal with params; no
+  params beside `{:param, value}` markers): otherwise it refuses
   (`raw_cte_params_mismatch`) rather than bind a value of the statement around
   it. Names compare case-insensitively. A list's name is written unquoted when
   plain (letters, digits, underscores, and in any case not a word PostgreSQL,
   MySQL 8.4, MariaDB 11.4, SQLite or DuckDB reserves) in its definition and
   every root and join naming it, so it folds as the host's own SQL naming it
-  unquoted does; a name of that pattern quoted only for a reserved word, and a
-  raw CTE's unquoted name, are quoted folded (`Rank` as `"rank"`), so host text
-  naming them unquoted reads the same list. Other names, and a raw CTE's quoted
-  names, are quoted as written. The list-root check looks a root up by that identifier and by
+  unquoted does. A name is spelled as Selecto always spelled it: one it left
+  unquoted that another dialect now reserves (`Rank`), and a raw CTE's
+  unquoted name, are quoted folded (`"rank"`), so host text naming them
+  unquoted reads the same list; one it always quoted (`Order`, `Key`) or that
+  PostgreSQL reserves (`With`, `Desc`) is quoted as written (`FROM "Order"`).
+  Other names, and a raw CTE's quoted names, are quoted as written. The list-root check looks a root up by that identifier and by
   its name as written (`quote_ident`): a relation answering to either refuses.
 - **Each Selecto statement runs under pinned settings**: search_path
   `pg_catalog, <declared schemas>, <every schema of the reset search_path>,

@@ -4,10 +4,13 @@ CHANGES
 Unreleased
 ----------
 
-- A list name quoted only because some dialect reserves it (`Rank`, `First`,
-  `Json`) and a raw CTE's unquoted name are written and looked up folded
-  (`"rank"`), as host SQL naming them unquoted reads them. A raw CTE's `$n`
-  placeholders its params do not bind refuse `raw_cte_params_mismatch`.
+- A list name is spelled as Selecto always spelled it: one it left unquoted
+  that another dialect now reserves (`Rank`, `First`, `Json`) and a raw CTE's
+  unquoted name are written and looked up folded (`"rank"`); one it always
+  quoted (`Order`, `Key`) or that PostgreSQL reserves (`With`, `Desc`) stays
+  quoted as written. A raw CTE's `$n` placeholders its params do not bind
+  (every `n` from 1 up) refuse `raw_cte_params_mismatch`; without params a
+  `$1` in a string, comment or dollar quote is text.
 - Only the relations a read's compiled statement names are resolved before it
   runs: a domain's declared join to a table the read does not use (a session's
   temporary table that is not there) no longer refuses `relation_unresolved`.
