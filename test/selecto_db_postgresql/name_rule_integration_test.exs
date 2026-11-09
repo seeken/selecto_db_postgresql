@@ -823,4 +823,69 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
       Adapter.execute(ctx.conn, "DROP TABLE IF EXISTS public.rank", [], [])
     end
   end
+
+  test "placeholder-like text in a raw CTE's literals is text without params, nested too", ctx do
+    lit = "cost $1"
+
+    inner =
+      q(ctx, dom("pa", pid: :integer, v: :string))
+      |> Selecto.with_ctes([
+        {:raw_cte, "pa AS (SELECT 1 AS pid, '#{lit}' AS v /* #{lit} */ -- #{lit}\n)", []}
+      ])
+      |> Selecto.select(["pid", "v"])
+      |> Selecto.filter({"pid", 1})
+
+    assert outcome(inner) == [[1, lit]]
+
+    nested =
+      q(ctx, p(ctx))
+      |> Selecto.DynamicJoin.join_subquery(:sq, inner, on: [%{left: "id", right: "pid"}])
+      |> Selecto.select(["name", "sq.v"])
+      |> Selecto.filter({"name", "a"})
+
+    assert outcome(nested) == [["a", lit]]
+
+    # A nested raw filter with the same text beside a bound param.
+    sub =
+      q(ctx, p(ctx))
+      |> Selecto.filter({:raw_sql_filter, ["selecto_root.name <> '#{lit}'"]})
+      |> Selecto.filter({"id", 1})
+      |> Selecto.select(["id"])
+
+    filtered =
+      q(ctx, p(ctx))
+      |> Selecto.filter({"id", {:subquery, :in, sub}})
+      |> Selecto.select(["name"])
+
+    assert outcome(filtered) == [["a"]]
+  end
+
+  test "a raw CTE whose params leave a $n unbound refuses typed", ctx do
+    query =
+      q(ctx, dom("pa", pid: :integer))
+      |> Selecto.with_ctes([{:raw_cte, "pa AS (SELECT CAST($2 AS INTEGER) AS pid)", [5, 6]}])
+      |> Selecto.select(["pid"])
+
+    assert {:error, %Selecto.Error{details: %{reason: :raw_cte_params_mismatch}}} =
+             Selecto.execute(query)
+  end
+
+  test "on PostgreSQL a list name is spelled as Selecto always spelled it", ctx do
+    read = fn name, from ->
+      q(ctx, p(ctx))
+      |> Selecto.with_values([[1]], columns: ["pid"], as: name)
+      |> Selecto.filter({:raw_sql_filter, ["selecto_root.id IN (SELECT pid FROM #{from})"]})
+      |> Selecto.select(["name"])
+      |> outcome()
+    end
+
+    # Selecto always quoted Order and Key: host text quoting them reads the list.
+    assert read.("Order", ~s("Order")) == [["a"]]
+    assert read.("Key", ~s("Key")) == [["a"]]
+    refute read.("Key", "Key") == [["a"]]
+
+    # Rank it left unquoted: host text naming it unquoted reads the list.
+    assert read.("Rank", "Rank") == [["a"]]
+    refute read.("Rank", ~s("Rank")) == [["a"]]
+  end
 end
