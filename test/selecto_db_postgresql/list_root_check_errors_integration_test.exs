@@ -73,6 +73,10 @@ defmodule SelectoDBPostgreSQL.ListRootCheckErrorsIntegrationTest.Proxy do
   @cancel_param "SELECT n FROM pg_catalog.unnest($1::pg_catalog.text[]) AS n " <>
                   "WHERE pg_catalog.pg_cancel_backend(pg_catalog.pg_backend_pid()) " <>
                   "AND (SELECT true FROM pg_catalog.pg_sleep(5))"
+  @cancel_params "SELECT r.n FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), " <>
+                   "pg_catalog.unnest($2::pg_catalog.text[])) AS r(n, i) " <>
+                   "WHERE pg_catalog.pg_cancel_backend(pg_catalog.pg_backend_pid()) " <>
+                   "AND (SELECT true FROM pg_catalog.pg_sleep(5))"
 
   defp rewrite(?Q, body, agent) do
     sql = binary_part(body, 0, byte_size(body) - 1)
@@ -84,7 +88,13 @@ defmodule SelectoDBPostgreSQL.ListRootCheckErrorsIntegrationTest.Proxy do
     [sql, tail] = :binary.split(rest, <<0>>)
 
     if hit?(agent, sql) do
-      replacement = if String.contains?(sql, "$1"), do: @cancel_param, else: @cancel
+      replacement =
+        cond do
+          String.contains?(sql, "$2") -> @cancel_params
+          String.contains?(sql, "$1") -> @cancel_param
+          true -> @cancel
+        end
+
       frame(?P, name <> <<0>> <> replacement <> <<0>> <> tail)
     else
       frame(?P, body)
@@ -175,7 +185,7 @@ defmodule SelectoDBPostgreSQL.ListRootCheckErrorsIntegrationTest do
     # and the read answers, the host's transaction intact.
     for {pattern, outcome} <- [
           {~r/\ASAVEPOINT selecto_path_/, :canceled},
-          {~r/to_regclass\(n\) IS NOT NULL/, :canceled},
+          {~r/quote_ident\(r\.n\)\) IS NOT NULL/, :canceled},
           {~r/\AROLLBACK TO SAVEPOINT selecto_path_/, :answered},
           {~r/\ARELEASE SAVEPOINT selecto_path_/, :answered}
         ] do

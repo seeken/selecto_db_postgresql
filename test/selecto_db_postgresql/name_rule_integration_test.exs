@@ -567,4 +567,105 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
 
     assert refusal(query) == {:invalid_identifier, ["v$x"]}
   end
+
+  test "a list named with a word any supported dialect reserves reads its rows", ctx do
+    for name <- ~w(With Desc Window To Lateral Rank Rows Groups) do
+      joined =
+        q(ctx, p(ctx))
+        |> Selecto.with_values([[1, "V"]], columns: ["id", "v"], as: name)
+        |> Selecto.join(:vj,
+          source: name,
+          type: :left,
+          owner_key: :id,
+          related_key: :id,
+          fields: %{"v" => %{type: :string}}
+        )
+        |> Selecto.select(["name", "vj.v"])
+
+      assert outcome(joined) == [["a", "V"], ["b", nil]], name
+
+      rooted =
+        q(ctx, dom(name, id: :integer, v: :string))
+        |> Selecto.with_values([[1, "V"]], columns: ["id", "v"], as: name)
+        |> Selecto.select(["v"])
+
+      assert outcome(rooted) == [["V"]], name
+
+      cte =
+        q(ctx, p(ctx))
+        |> Selecto.with_cte(name, fn -> q(ctx, p(ctx)) |> Selecto.select(["id", "name"]) end,
+          columns: ["id", "v"]
+        )
+        |> Selecto.join(:cj,
+          source: name,
+          type: :left,
+          owner_key: :id,
+          related_key: :id,
+          fields: %{"v" => %{type: :string}}
+        )
+        |> Selecto.select(["name", "cj.v"])
+
+      assert outcome(cte) == [["a", "a"], ["b", "b"]], name
+    end
+  end
+
+  test "a non-ASCII identifier before $$ does not hide the next definition", ctx do
+    text = "x AS (SELECT 1 AS ä$$), #{ctx.t.r} AS (#{raw_r(ctx)}), y AS (SELECT 2 AS ö$$)"
+
+    query =
+      q(ctx, p(ctx))
+      |> Selecto.with_ctes([{:raw_cte, text, []}])
+      |> Selecto.filter({"id", {:subquery, :in, rated(ctx)}})
+      |> Selecto.select(["name"])
+
+    assert refusal(query) == {:cte_name_collision, [ctx.t.r]}
+  end
+
+  test "a carriage return ends a -- comment in a raw CTE's text", ctx do
+    for text <- [
+          "x AS (SELECT 1 AS v) -- c\r, #{ctx.t.r} AS (#{raw_r(ctx)}) -- e\n",
+          "x AS (SELECT 1 AS v -- c\r), #{ctx.t.r} AS (#{raw_r(ctx)} -- e\n)"
+        ] do
+      query =
+        q(ctx, p(ctx))
+        |> Selecto.with_ctes([{:raw_cte, text, []}])
+        |> Selecto.filter({"id", {:subquery, :in, rated(ctx)}})
+        |> Selecto.select(["name"])
+
+      assert refusal(query) == {:cte_name_collision, [ctx.t.r]}, inspect(text)
+    end
+  end
+
+  test "a list root a quoted relation of its exact name answers to refuses", ctx do
+    table = "NrK#{System.unique_integer([:positive])}"
+
+    {:ok, _} =
+      Adapter.execute(
+        ctx.conn,
+        ~s|CREATE TABLE public."#{table}" (id INT PRIMARY KEY, name TEXT, tenant_id INT)|,
+        [],
+        []
+      )
+
+    try do
+      {:ok, _} =
+        Adapter.execute(
+          ctx.conn,
+          ~s|INSERT INTO public."#{table}" VALUES (1, 'TBL-K', 1)|,
+          [],
+          []
+        )
+
+      assert outcome(q(ctx, dom(table, @pf)) |> Selecto.select(["name"])) == [["TBL-K"]]
+
+      listed =
+        q(ctx, dom(table, @pf))
+        |> Selecto.with_values([[5, "V-K", 1]], columns: ["id", "name", "tenant_id"], as: table)
+        |> Selecto.select(["name"])
+
+      assert refusal(listed) == {:cte_name_collision, [table]}
+    after
+      Adapter.execute(ctx.conn, ~s|DROP TABLE IF EXISTS public."#{table}"|, [], [])
+    end
+  end
 end
