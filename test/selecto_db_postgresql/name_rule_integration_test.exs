@@ -1014,4 +1014,87 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
 
     assert outcome(literal) == [["a"], ["b"]]
   end
+
+  test "a set member's or CTE body's placeholder its own params do not bind refuses typed", ctx do
+    left = q(ctx, p(ctx)) |> Selecto.filter({"tenant_id", 1}) |> Selecto.select(["id"])
+
+    unbound =
+      q(ctx, p(ctx))
+      |> Selecto.filter({:raw_sql_filter, "CAST($1 AS text) = '1'"})
+      |> Selecto.select(["id"])
+
+    body = fn ->
+      q(ctx, p(ctx))
+      |> Selecto.filter({:raw_sql_filter, "CAST($1 AS text) = '1'"})
+      |> Selecto.select(["id", "name"])
+    end
+
+    over_cte =
+      q(ctx, dom("nr_c25", id: :integer, name: :string))
+      |> Selecto.filter({"name", {:!=, "zz"}})
+      |> Selecto.with_cte("nr_c25", body, columns: ["id", "name"])
+      |> Selecto.select(["id"])
+
+    marked =
+      q(ctx, p(ctx))
+      |> Selecto.filter({"tenant_id", 1})
+      |> Selecto.filter(
+        {:exists,
+         [
+           "SELECT 1 FROM #{ctx.t.p} x WHERE x.name <> ",
+           {:param, "zz"},
+           " AND CAST($1 AS text) = '1'"
+         ]}
+      )
+      |> Selecto.select(["id"])
+
+    for query <- [
+          Selecto.union(left, unbound, all: true),
+          Selecto.intersect(left, unbound),
+          Selecto.except(left, unbound),
+          over_cte,
+          marked
+        ] do
+      assert {:error, %Selecto.Error{details: %{reason: reason}}} = Selecto.execute(query)
+      assert reason in [:placeholder_count_mismatch, :placeholder_unsupported]
+    end
+
+    # A marker-bearing fragment without raw placeholders answers.
+    clean =
+      q(ctx, p(ctx))
+      |> Selecto.filter(
+        {:exists, ["SELECT 1 FROM #{ctx.t.p} x WHERE x.name <> ", {:param, "zz"}]}
+      )
+      |> Selecto.select(["id"])
+
+    assert outcome(clean) == [[1], [2]]
+  end
+
+  test "a set member's or CTE body's raw $1 binds its own first param", ctx do
+    left = q(ctx, p(ctx)) |> Selecto.filter({"tenant_id", 1}) |> Selecto.select(["id"])
+
+    own =
+      q(ctx, p(ctx))
+      |> Selecto.filter({"name", {:!=, "q"}})
+      |> Selecto.filter({:raw_sql_filter, "CAST($1 AS text) = 'q'"})
+      |> Selecto.select(["id"])
+
+    assert outcome(own) == [[1], [2]]
+    assert outcome(Selecto.union(left, own, all: true)) == [[1], [1], [2]]
+
+    body = fn ->
+      q(ctx, p(ctx))
+      |> Selecto.filter({"name", {:!=, "q"}})
+      |> Selecto.filter({:raw_sql_filter, "CAST($1 AS text) = 'q'"})
+      |> Selecto.select(["id", "name"])
+    end
+
+    over_cte =
+      q(ctx, dom("nr_c25", id: :integer, name: :string))
+      |> Selecto.filter({"name", {:!=, "zz"}})
+      |> Selecto.with_cte("nr_c25", body, columns: ["id", "name"])
+      |> Selecto.select(["id"])
+
+    assert outcome(over_cte) == [[1], [2]]
+  end
 end
