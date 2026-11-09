@@ -303,7 +303,9 @@ another schema's relation, function or operator of the same name. So:
 - **Every relation of a generated read or write is schema-qualified.** A
   domain relation declares its schema with `source_schema` next to its
   `source_table` (`source_schema: "pg_temp"` for a host temp table): reads
-  and SelectoUpdato writes of that domain both name it. A hand-built write
+  and SelectoUpdato writes of that domain both name it. A read resolves only
+  the relations its compiled statement names: a declared join it does not use
+  is not looked up, so its table need not exist. A hand-built write
   command names it with a `"schema.relation"` relation. Any other name is
   resolved against the connection's **reset** search_path
   (`pg_settings.reset_val`: the server, database, role or startup value,
