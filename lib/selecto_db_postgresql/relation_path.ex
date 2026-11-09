@@ -189,16 +189,18 @@ defmodule SelectoDBPostgreSQL.RelationPath do
                  "pg_catalog.unnest($2::pg_catalog.text[])) AS r(n, q) " <>
                  "WHERE pg_catalog.to_regclass(r.q) IS NULL"
 
-  @existing_sql "SELECT n FROM pg_catalog.unnest($1::pg_catalog.text[]) AS n " <>
-                  "WHERE pg_catalog.to_regclass(n) IS NOT NULL"
+  @existing_sql "SELECT r.n FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]), " <>
+                  "pg_catalog.unnest($2::pg_catalog.text[])) AS r(n, i) " <>
+                  "WHERE pg_catalog.to_regclass(r.i) IS NOT NULL " <>
+                  "OR pg_catalog.to_regclass(pg_catalog.quote_ident(r.n)) IS NOT NULL"
 
   @doc false
   # Of `{name, identifier}` pairs for the roots that read CTE or VALUES lists,
-  # those whose identifier (as the SQL writes it: unquoted names fold) a
-  # relation on the session's search_path also answers to: refused as a name
-  # collision.
+  # those a relation on the session's search_path also answers to, by the
+  # identifier as the SQL writes it (unquoted names fold) or by the name
+  # itself (quote_ident): refused as a name collision.
   def list_roots_unshadowed(execute, pairs) do
-    case execute.(@existing_sql, [Enum.map(pairs, &elem(&1, 1))]) do
+    case execute.(@existing_sql, [Enum.map(pairs, &elem(&1, 0)), Enum.map(pairs, &elem(&1, 1))]) do
       {:ok, %{rows: []}} ->
         :ok
 
@@ -209,7 +211,7 @@ defmodule SelectoDBPostgreSQL.RelationPath do
           :cte_name_collision,
           "reads a CTE or VALUES list at a root named like a relation on the " <>
             "search_path; rename the list",
-          for({name, identifier} <- pairs, identifier in found, do: name)
+          for({name, _identifier} <- pairs, name in found, do: name)
         )
 
       other ->
