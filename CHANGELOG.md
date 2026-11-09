@@ -4,6 +4,10 @@ CHANGES
 Unreleased
 ----------
 
+- A list name quoted only because some dialect reserves it (`Rank`, `First`,
+  `Json`) and a raw CTE's unquoted name are written and looked up folded
+  (`"rank"`), as host SQL naming them unquoted reads them. A raw CTE's `$n`
+  placeholders its params do not bind refuse `raw_cte_params_mismatch`.
 - Only the relations a read's compiled statement names are resolved before it
   runs: a domain's declared join to a table the read does not use (a session's
   temporary table that is not there) no longer refuses `relation_unresolved`.
