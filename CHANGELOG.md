@@ -13,7 +13,8 @@ Unreleased
   `$1` in a string, comment or dollar quote is text. A nested fragment with a
   backslash literal whose placeholders standard_conforming_strings would move
   refuses `placeholder_ambiguous`. Query analysis returns a compile refusal
-  as the typed error rather than `{:explain_failed, refusal}`.
+  as the typed error rather than `{:explain_failed, refusal}`. A nested fragment's `$n`
+  above its own params, or in a fragment without params, refuses typed.
 - Only the relations a read's compiled statement names are resolved before it
   runs: a domain's declared join to a table the read does not use (a session's
   temporary table that is not there) no longer refuses `relation_unresolved`.
