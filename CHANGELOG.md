@@ -4,6 +4,8 @@ CHANGES
 Unreleased
 ----------
 
+- Tests: an integer after `$` in marker iodata refuses typed instead of
+  binding the outer statement's `$1`.
 - A list name is spelled as Selecto always spelled it: one it left unquoted
   that another dialect now reserves (`Rank`, `First`, `Json`) and a raw CTE's
   unquoted name are written and looked up folded (`"rank"`); one it always
