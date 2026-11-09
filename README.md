@@ -366,14 +366,13 @@ another schema's relation, function or operator of the same name. So:
   statement's VALUES list or of a CTE emitted before it is the statement's and
   is allowed. A relation named by a declared or inherited schema that does not
   exist there refuses (`reason: :relation_unresolved`) before the read runs.
-- A raw CTE (`{:raw_cte, sql, params}`) is the host's own text (R68): its
-  name, where the text starts `name [(columns)] AS (`, counts in the rule
-  above like any list's; its body is not read. A raw CTE whose name its text
-  does not show is not checked, and the qualifier scopes it: in a leading
-  non-recursive `WITH`, its own body and the bodies before it read the real
-  (qualified) relation, the later bodies and the main query the CTE; a
-  collision that cannot be scoped (`WITH RECURSIVE`, a nested `WITH`) refuses
-  (`reason: :cte_name_collision`).
+- A raw CTE (`{:raw_cte, sql, params}`) is the host's own text (R68): it must
+  be plain `name [(columns)] AS [NOT] [MATERIALIZED] (...)` definitions,
+  comments allowed, with "double-quoted" or unquoted names. Every name it
+  defines counts in the rule above like any list's, the list-root check
+  included; its bodies are not read. Text that does not parse to the end
+  refuses (`reason: :raw_cte_unparsed`). Names compare case-insensitively, so
+  a quoted mixed-case raw name over-refuses.
 - **Each Selecto statement runs under pinned settings**: search_path
   `pg_catalog, <declared schemas>, <every schema of the reset search_path>,
   pg_temp`, and `TimeZone`,

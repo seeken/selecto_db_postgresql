@@ -378,6 +378,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
       end
     else
       {:error, %Error{} = error} -> {:error, read_refusal(error)}
+      # A cancel, an aborted host transaction, a lost connection: typed like
+      # the same error from the read itself (normalize_error/1).
+      {:error, reason} -> {:error, normalize_error(reason)}
     end
   end
 
@@ -393,11 +396,17 @@ defmodule SelectoDBPostgreSQL.Adapter do
         :ok
 
       names ->
-        with_checkout(connection, fn guard, in_transaction? ->
-          in_own_savepoint(guard, in_transaction?, fn ->
-            RelationPath.list_roots_unshadowed(guard, names)
+        try do
+          with_checkout(connection, fn guard, in_transaction? ->
+            in_own_savepoint(guard, in_transaction?, fn ->
+              RelationPath.list_roots_unshadowed(guard, names)
+            end)
           end)
-        end)
+        rescue
+          exception -> {:error, exception}
+        catch
+          :exit, reason -> {:error, {:connection_exit, reason}}
+        end
     end
   end
 
