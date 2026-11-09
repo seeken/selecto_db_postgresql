@@ -366,13 +366,19 @@ another schema's relation, function or operator of the same name. So:
   statement's VALUES list or of a CTE emitted before it is the statement's and
   is allowed. A relation named by a declared or inherited schema that does not
   exist there refuses (`reason: :relation_unresolved`) before the read runs.
-- A raw CTE (`{:raw_cte, sql, params}`) is the host's own text (R68): it must
-  be plain `name [(columns)] AS [NOT] [MATERIALIZED] (...)` definitions,
-  comments allowed, with "double-quoted" or unquoted names. Every name it
-  defines counts in the rule above like any list's, the list-root check
-  included; its bodies are not read. Text that does not parse to the end
-  refuses (`reason: :raw_cte_unparsed`). Names compare case-insensitively, so
-  a quoted mixed-case raw name over-refuses.
+- A raw CTE (`{:raw_cte, sql, params}`, a binary or iodata with
+  `{:param, value}` markers) is the host's own text (R68): it must be plain
+  `name [(columns)] AS [NOT] [MATERIALIZED] (...)` definitions, comments
+  (nested ones too), dollar quotes and "double-quoted" or unquoted names
+  allowed. Every name it defines counts in the rule above like any list's, the
+  list-root check included; its bodies are not read. Text that does not parse
+  to the end refuses (`reason: :raw_cte_unparsed`), as do a backslash in a
+  string literal, non-ASCII names, SEARCH/CYCLE, a RECURSIVE prefix and a
+  trailing comma. Names compare case-insensitively. A list's name is written
+  unquoted when plain (letters, digits, underscores, not reserved) in its
+  definition and every root and join naming it, so it folds as the host's own
+  SQL naming it unquoted does; other names, and a raw CTE's quoted names, are
+  quoted. The list-root check looks a root up by that identifier.
 - **Each Selecto statement runs under pinned settings**: search_path
   `pg_catalog, <declared schemas>, <every schema of the reset search_path>,
   pg_temp`, and `TimeZone`,

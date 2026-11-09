@@ -175,7 +175,7 @@ defmodule SelectoDBPostgreSQL.ListRootCheckErrorsIntegrationTest do
     # and the read answers, the host's transaction intact.
     for {pattern, outcome} <- [
           {~r/\ASAVEPOINT selecto_path_/, :canceled},
-          {~r/to_regclass\(pg_catalog\.quote_ident\(n\)\) IS NOT NULL/, :canceled},
+          {~r/to_regclass\(n\) IS NOT NULL/, :canceled},
           {~r/\AROLLBACK TO SAVEPOINT selecto_path_/, :answered},
           {~r/\ARELEASE SAVEPOINT selecto_path_/, :answered}
         ] do

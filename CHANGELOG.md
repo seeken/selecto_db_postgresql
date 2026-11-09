@@ -4,6 +4,11 @@ CHANGES
 Unreleased
 ----------
 
+- A list root is looked up by the identifier the SQL names it with: a plain
+  mixed-case list name is now written unquoted, so it folds as host SQL naming
+  it unquoted does. Raw CTE text may carry `{:param, value}` markers, dollar
+  quotes and nested comments; a `$` inside an identifier no longer opens a
+  dollar quote.
 - Every error the list-root check meets (a cancel, an aborted host transaction,
   a lost connection) comes back typed like the same error from the read; it
   raised `WithClauseError`. A cancel on the check's SAVEPOINT or lookup is
