@@ -4,6 +4,12 @@ CHANGES
 Unreleased
 ----------
 
+- Every error the list-root check meets (a cancel, an aborted host transaction,
+  a lost connection) comes back typed like the same error from the read; it
+  raised `WithClauseError`. A cancel on the check's SAVEPOINT or lookup is
+  `query_canceled`; one on its ROLLBACK TO or RELEASE is retried and the read
+  answers. A raw CTE text's every name counts, the list-root check included;
+  text that does not parse refuses `raw_cte_unparsed`.
 - A root that reads a CTE or VALUES list of its own (a domain over a CTE, its
   domain declaring no `source_schema`) refuses `cte_name_collision` when the
   name is also a relation on the session's search_path: the root read the CTE's
