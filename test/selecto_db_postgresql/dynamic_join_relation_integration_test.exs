@@ -342,7 +342,7 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
         ],
         do: {:ok, _} = Adapter.execute(ctx.connection, sql, [], [])
 
-    query = ad_hoc(ctx, products(ctx)) |> then(&put_in(&1.set.dynamic_joins.reviews.source, temp))
+    query = ad_hoc(Map.put(ctx, :reviews, temp), products(ctx))
     assert {:error, error} = Selecto.execute(query)
     assert error.details.reason == :relation_unresolved
     assert error.message =~ ~s(source_schema: "pg_temp")

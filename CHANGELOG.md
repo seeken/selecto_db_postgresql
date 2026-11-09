@@ -4,6 +4,9 @@ CHANGES
 Unreleased
 ----------
 
+- Only the relations a read's compiled statement names are resolved before it
+  runs: a domain's declared join to a table the read does not use (a session's
+  temporary table that is not there) no longer refuses `relation_unresolved`.
 - A list root is looked up both by the identifier the SQL names it with (a
   plain mixed-case list name is now written unquoted, so it folds as host SQL
   naming it unquoted does) and by its name as written (`quote_ident`): a
