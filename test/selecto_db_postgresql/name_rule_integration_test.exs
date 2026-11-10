@@ -1107,7 +1107,11 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
 
     for fragment <- [
           [held, 1, " AS text) = 'a'"],
-          [held, 1, " AS text) = 'a' AND x.name <> ", {:param, "zz"}]
+          [held, 1, " AS text) = 'a' AND x.name <> ", {:param, "zz"}],
+          # Atoms, nil and Decimals render with to_string/1 as well.
+          [held, :"1", " AS text) = 'a' AND x.name <> ", {:param, "zz"}],
+          [held, nil, "1", " AS text) = 'a' AND x.name <> ", {:param, "zz"}],
+          [held, Decimal.new(1), " AS text) = 'a' AND x.name <> ", {:param, "zz"}]
         ] do
       # The $1 would bind the outer "a" and answer [[2]].
       assert {:error, %Selecto.Error{details: %{reason: reason}}} =

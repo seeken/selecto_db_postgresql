@@ -4,6 +4,7 @@ CHANGES
 Unreleased
 ----------
 
+- Tests: atoms, nil and Decimals after `$` in marker iodata refuse typed.
 - Tests: an integer after `$` in marker iodata refuses typed instead of
   binding the outer statement's `$1`.
 - A list name is spelled as Selecto always spelled it: one it left unquoted
