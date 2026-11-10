@@ -4,6 +4,13 @@ CHANGES
 Unreleased
 ----------
 
+- The per-read and per-write temp-catalog checks (the session fingerprint,
+  the temporary-shadow count and the relation resolver's temp count) skip
+  their pg_class / pg_type / pg_rewrite scans with a one-time filter when the
+  session has no temp schema (`pg_my_temp_schema()` is 0): those catalogs
+  have no index on the namespace alone, so each check scanned the whole
+  catalog (about 30 ms a read, 47 ms a governed write, on a 300k-relation
+  catalog). A session with temp objects scans and detects them as before.
 - A stream's encode, server, transaction or producer failure, and its
   receive timeout, raise `Selecto.Error.Refused` typed as the non-stream read
   would return it, instead of a RuntimeError quoting the driver's message.
