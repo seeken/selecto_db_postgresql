@@ -62,7 +62,8 @@ defmodule SelectoDBPostgreSQL.RelationPath do
     SELECT p.schemas AS host, p.reset_path,
            CAST(pg_catalog.current_schemas(false) AS pg_catalog.text[]) AS reset,
            (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c
-            WHERE c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) AS temps
+            WHERE pg_catalog.pg_my_temp_schema() OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)
+              AND c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) AS temps
     FROM selecto_path p
   ),
   selecto_reset AS (

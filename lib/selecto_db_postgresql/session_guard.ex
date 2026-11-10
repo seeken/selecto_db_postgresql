@@ -174,19 +174,26 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
 
   @temp "pg_catalog.pg_my_temp_schema()"
 
+  # pg_class and pg_type have no index on the namespace alone, so a match on
+  # the temp schema scans the whole catalog, on every read. A session that
+  # never made a temp object has no temp schema (pg_my_temp_schema() is 0):
+  # this one-time filter skips the scan then, and a session with one scans
+  # exactly as before.
+  @has_temp "#{@temp} OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)"
+
   # The settings are compared one by one (R30, R35: Selecto pins them
   # around its statements), the temp catalog in one string.
   @temp_columns "pg_catalog.concat_ws(' | ', 'temp'" <>
                   ", (SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', CAST(c.oid AS pg_catalog.text), " <>
                   "CAST(c.xmin AS pg_catalog.text), CAST(c.relname AS pg_catalog.text)), ',' ORDER BY c.oid) " <>
-                  "FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) #{@temp}), " <>
+                  "FROM pg_catalog.pg_class c WHERE #{@has_temp} AND c.relnamespace OPERATOR(pg_catalog.=) #{@temp}), " <>
                   "(SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', CAST(r.oid AS pg_catalog.text), " <>
                   "CAST(r.xmin AS pg_catalog.text)), ',' ORDER BY r.oid) FROM pg_catalog.pg_rewrite r " <>
                   "JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) r.ev_class " <>
-                  "WHERE c.relnamespace OPERATOR(pg_catalog.=) #{@temp}), " <>
+                  "WHERE #{@has_temp} AND c.relnamespace OPERATOR(pg_catalog.=) #{@temp}), " <>
                   "(SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', CAST(t.oid AS pg_catalog.text), " <>
                   "CAST(t.xmin AS pg_catalog.text), CAST(t.typname AS pg_catalog.text)), ',' ORDER BY t.oid) " <>
-                  "FROM pg_catalog.pg_type t WHERE t.typnamespace OPERATOR(pg_catalog.=) #{@temp}), 'end') " <>
+                  "FROM pg_catalog.pg_type t WHERE #{@has_temp} AND t.typnamespace OPERATOR(pg_catalog.=) #{@temp}), 'end') " <>
                   "AS selecto_guard_session"
 
   # client_encoding by its canonical name: the setting keeps a spelling like
@@ -219,7 +226,7 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   # searches pg_temp last).
   @shadow_count "CAST(CASE WHEN $1::pg_catalog.text[] IS NULL THEN 0 ELSE 0 END AS pg_catalog.int8) " <>
                   "OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.pg_type t " <>
-                  "WHERE t.typnamespace OPERATOR(pg_catalog.=) #{@temp} " <>
+                  "WHERE #{@has_temp} AND t.typnamespace OPERATOR(pg_catalog.=) #{@temp} " <>
                   "AND t.typrelid OPERATOR(pg_catalog.=) 0 " <>
                   "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type e WHERE e.oid OPERATOR(pg_catalog.=) t.typelem " <>
                   "AND e.typrelid OPERATOR(pg_catalog.<>) 0) " <>
