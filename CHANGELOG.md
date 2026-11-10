@@ -4,6 +4,9 @@ CHANGES
 Unreleased
 ----------
 
+- A stream's encode, server, transaction or producer failure, and its
+  receive timeout, raise `Selecto.Error.Refused` typed as the non-stream read
+  would return it, instead of a RuntimeError quoting the driver's message.
 - Tests: atoms, nil and Decimals after `$` in marker iodata refuse typed.
 - Tests: an integer after `$` in marker iodata refuses typed instead of
   binding the outer statement's `$1`.

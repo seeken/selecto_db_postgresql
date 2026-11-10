@@ -90,9 +90,12 @@ defmodule SelectoDBPostgreSQL.StreamProtocolConformanceTest do
         end
       )
 
-    assert_raise RuntimeError, ~r/Timed out waiting for streamed rows/, fn ->
-      Enum.to_list(stream)
-    end
+    refused =
+      assert_raise Selecto.Error.Refused, ~r/Timed out waiting for streamed rows/, fn ->
+        Enum.to_list(stream)
+      end
+
+    assert refused.type == :timeout_error
 
     assert_receive {:producer_started, producer}, 5_000
     monitor = Process.monitor(producer)
@@ -108,9 +111,8 @@ defmodule SelectoDBPostgreSQL.StreamProtocolConformanceTest do
 
     started_at = System.monotonic_time(:millisecond)
 
-    assert_raise RuntimeError,
-                 ~r/PostgreSQL stream transaction failed: :rolled_back/,
-                 fn -> Enum.to_list(stream) end
+    refused = assert_raise Selecto.Error.Refused, fn -> Enum.to_list(stream) end
+    assert refused.type == :query_error
 
     # Well inside the stream's receive timeout: load must not fail it.
     assert System.monotonic_time(:millisecond) - started_at < 30_000
