@@ -1123,4 +1123,30 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
     plain = ["SELECT 1 FROM #{ctx.t.p} x WHERE x.id = selecto_root.id AND x.id <> ", 1]
     assert outcome(Selecto.filter(outer.(), {:exists, plain})) == [[2]]
   end
+
+  test "an encode or server error while a stream is enumerated raises typed", ctx do
+    read = fn filter -> q(ctx, p(ctx)) |> Selecto.filter(filter) |> Selecto.select(["id"]) end
+
+    # A parameter Postgrex cannot encode for the int4 column.
+    assert %{details: %{reason: :query_exception}} =
+             assert_stream_raises_as_execute(read.({"id", Integer.pow(2, 70)}))
+
+    # A server error (division by zero) while rows are read.
+    assert %{type: :query_error} =
+             assert_stream_raises_as_execute(read.({:raw_sql_filter, "1 / (id - id) = 1"}))
+  end
+
+  # Enumerating a stream raises Selecto.Error.Refused carrying the error the
+  # non-stream entry points return for the same failure.
+  defp assert_stream_raises_as_execute(read, opts \\ []) do
+    assert {:error, %Selecto.Error{} = error} = Selecto.execute(read)
+    assert {:ok, stream} = Selecto.execute_stream(read, opts)
+
+    refused = assert_raise Selecto.Error.Refused, fn -> Enum.to_list(stream) end
+
+    assert {refused.type, refused.message, refused.details} ==
+             {error.type, error.message, error.details}
+
+    error
+  end
 end

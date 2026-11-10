@@ -4533,11 +4533,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
           {^ref, {:done, {:error, %Selecto.Error{} = refusal}}} ->
             raise Selecto.Error.Refused, refusal
 
+          # A failure once the stream is returned raises typed: the error
+          # the non-stream path returns for it (Selecto.Error.stream_failure/2).
           {^ref, {:done, {:error, reason}}} ->
-            raise "PostgreSQL stream transaction failed: #{inspect(reason)}"
+            Selecto.Error.raise_stream_failure!(__MODULE__, reason)
 
           {^ref, {:producer_failed, reason}} ->
-            raise "PostgreSQL stream producer failed: #{inspect(reason)}"
+            Selecto.Error.raise_stream_failure!(__MODULE__, reason)
 
           {^monitor_ref, _reply} ->
             {:halt, state}
@@ -4546,10 +4548,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
             {:halt, state}
 
           {:DOWN, ^monitor_ref, :process, _pid, reason} ->
-            raise "PostgreSQL stream producer failed: #{inspect(reason)}"
+            Selecto.Error.raise_stream_failure!(__MODULE__, {:connection_exit, reason})
         after
           receive_timeout ->
-            raise "Timed out waiting for streamed rows after #{receive_timeout}ms"
+            raise Selecto.Error.Refused,
+                  Selecto.Error.timeout_error(
+                    "Timed out waiting for streamed rows after #{receive_timeout}ms",
+                    %{adapter: :postgresql}
+                  )
         end
       end,
       fn state ->
@@ -4568,11 +4574,20 @@ defmodule SelectoDBPostgreSQL.Adapter do
           await_stream_ack(parent, parent_monitor_ref, ref)
         end)
       rescue
+        # The raw failure, as the non-stream path returns it: the server's
+        # error itself, any other exception by its module (normalize_error/1).
+        error in Postgrex.Error ->
+          {:producer_failed, error}
+
         exception ->
-          {:producer_failed, {:exception, exception.__struct__, Exception.message(exception)}}
+          {:producer_failed,
+           {:query_exception, exception.__struct__, Exception.message(exception)}}
       catch
         :throw, {:selecto_stream_cancelled, ^ref} ->
           {:consumer_cancelled, ref}
+
+        :exit, reason ->
+          {:producer_failed, {:connection_exit, reason}}
 
         kind, reason ->
           {:producer_failed, {kind, reason}}
