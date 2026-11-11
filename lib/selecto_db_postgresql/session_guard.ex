@@ -240,14 +240,16 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   # searches pg_temp last).
   # The name match also reads as `typname = ANY (name[])` so pg_type's
   # (typname, typnamespace) index finds the candidates; the text match keeps
-  # it exact (a name cast truncates at 63 bytes).
+  # it exact (a name cast truncates at 63 bytes). $2 binds as text[] and is
+  # cast server-side: Postgrex refuses to encode a name of 64+ bytes, and the
+  # tokens include long literals and identifiers.
   @shadow_count "CAST(CASE WHEN $1::pg_catalog.text[] IS NULL THEN 0 ELSE 0 END AS pg_catalog.int8) " <>
                   "OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.pg_type t " <>
                   "WHERE #{@has_temp} AND t.typnamespace OPERATOR(pg_catalog.=) #{@temp} " <>
                   "AND t.typrelid OPERATOR(pg_catalog.=) 0 " <>
                   "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type e WHERE e.oid OPERATOR(pg_catalog.=) t.typelem " <>
                   "AND e.typrelid OPERATOR(pg_catalog.<>) 0) " <>
-                  "AND t.typname OPERATOR(pg_catalog.=) ANY (CAST($2 AS pg_catalog.name[])) " <>
+                  "AND t.typname OPERATOR(pg_catalog.=) ANY (CAST(CAST($2 AS pg_catalog.text[]) AS pg_catalog.name[])) " <>
                   "AND CAST(t.typname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY ($2::pg_catalog.text[])) " <>
                   "AS selecto_guard_shadowed"
 

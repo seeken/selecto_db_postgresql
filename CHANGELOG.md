@@ -15,7 +15,9 @@ Unreleased
   were all dropped no longer pays for the scans. A session holding temp
   objects scans and detects them as before. The temporary-shadow count
   matches type names through pg_type's (typname, typnamespace) index, the
-  exact text match kept.
+  exact text match kept; the tokens bind as text[] and are cast to name[]
+  server-side (Postgrex cannot encode a name of 64+ bytes, which made every
+  statement holding a long literal or identifier refuse).
 - A stream's encode, server, transaction or producer failure, and its
   receive timeout, raise `Selecto.Error.Refused` typed as the non-stream read
   would return it, instead of a RuntimeError quoting the driver's message.
