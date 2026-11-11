@@ -32,7 +32,6 @@ defmodule SelectoDBPostgreSQL.RelationPath do
 
   alias Selecto.Write.Error
   alias SelectoDBPostgreSQL.RelationPath.Scanner
-  alias SelectoDBPostgreSQL.Qualify
   alias SelectoDBPostgreSQL.SessionGuard
 
   @path_key "selecto:reset_schemas"
@@ -649,9 +648,14 @@ defmodule SelectoDBPostgreSQL.RelationPath do
   end
 
   defp scan_ctes(sql) do
-    sql |> IO.iodata_to_binary() |> Qualify.tokenize() |> walk_ctes(nil, [])
-  catch
-    {:qualify_refuse, _reason, _message} -> :unsure
+    sql
+    |> Scanner.tokenize()
+    |> Enum.map(fn
+      {:word, text, _start} -> {:id, text}
+      {:qident, text, _start} -> {:qid, text}
+      {kind, text, _start} -> {kind, text}
+    end)
+    |> walk_ctes(nil, [])
   end
 
   defp walk_ctes([], _previous, names), do: {:ok, names}
@@ -683,7 +687,7 @@ defmodule SelectoDBPostgreSQL.RelationPath do
          rest = optional_materialized(rest),
          [{:punct, "("} | body] <- rest,
          {:ok, rest} <- skip_group(body, 1) do
-      names = [Qualify.folded_name(name) | names]
+      names = [fold_name(elem(name, 1)) | names]
 
       with {:ok, rest} <- skip_search(rest),
            {:ok, rest} <- skip_cycle(rest) do

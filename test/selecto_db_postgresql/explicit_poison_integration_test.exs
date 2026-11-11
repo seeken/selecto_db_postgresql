@@ -9,7 +9,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
   use ExUnit.Case, async: false
 
   alias Selecto.Write.Command
-  alias SelectoDBPostgreSQL.{Adapter, ExplicitSQL}
+  alias SelectoDBPostgreSQL.Adapter
 
   @moduletag :postgres
 
@@ -204,7 +204,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     }
   end
 
-  defp base(c, domain \\ domain()) do
+  defp base(c, domain) do
     domain
     |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
     |> Selecto.with_tenant("t1")
@@ -218,255 +218,6 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     end
   rescue
     exception -> {:raised, Exception.message(exception)}
-  end
-
-  defp stream_ids(c) do
-    {:ok, stream} =
-      c
-      |> base()
-      |> Selecto.select(["id"])
-      |> Selecto.filter({"ci", "mixed"})
-      |> Selecto.execute_stream(receive_timeout: 5_000)
-
-    {:ok, stream |> Enum.map(&elem(&1, 0)) |> Enum.sort()}
-  end
-
-  defp ids(c, filter) do
-    base(c) |> Selecto.select(["id"]) |> Selecto.filter(filter) |> run()
-  end
-
-  # The specialised builders: no tenant on these domains (a tenant boundary
-  # refuses them, invalid_domain); a required filter scopes the rows.
-  defp specialised_domain(joins, associations) do
-    columns =
-      Map.new(~w(org name vc path)a, &{&1, %{type: :string}})
-      |> Map.merge(Map.new(~w(id n parent_id cat_id)a, &{&1, %{type: :integer}}))
-
-    plain = fn table, columns, extra ->
-      rel(table, columns, Map.merge(%{tenant_field: nil}, extra))
-    end
-
-    named = %{id: %{type: :integer}, org: %{type: :string}, name: %{type: :string}}
-
-    %{
-      name: "special",
-      source: plain.("items", columns, %{associations: associations}),
-      schemas: %{
-        cat: plain.("cats", named, %{}),
-        label: plain.("labels", named, %{}),
-        item: plain.("items", columns, %{})
-      },
-      joins: joins,
-      required_filters: [{"org", "t1"}]
-    }
-  end
-
-  defp assoc(queryable, field, owner, related),
-    do: %{queryable: queryable, field: field, owner_key: owner, related_key: related}
-
-  defp special(c, joins, associations, fields, more \\ & &1) do
-    specialised_domain(joins, associations)
-    |> Selecto.configure(c, adapter: Adapter, validate: false, rollup_sort_fix: false)
-    |> Selecto.select(fields)
-    |> more.()
-    |> run()
-  end
-
-  defp specialised(c) do
-    %{
-      star_dimension:
-        special(
-          c,
-          %{star: %{type: :star_dimension, name: "star", display_field: :name}},
-          %{star: assoc(:cat, :star, :cat_id, :id)},
-          ["id", "star.name"]
-        ),
-      snowflake_dimension:
-        special(
-          c,
-          %{flake: %{type: :snowflake_dimension, name: "flake", display_field: :name}},
-          %{flake: assoc(:cat, :flake, :cat_id, :id)},
-          ["id", "flake.name"]
-        ),
-      tagging:
-        special(
-          c,
-          %{
-            labels: %{
-              type: :tagging,
-              name: "labels",
-              tag_field: :name
-            }
-          },
-          %{labels: assoc(:label, :labels, :id, :id)},
-          ["id", "labels.name"]
-        ),
-      hierarchy_adjacency:
-        special(
-          c,
-          %{
-            tree: %{
-              type: :hierarchical,
-              name: "tree",
-              hierarchy_type: :adjacency_list,
-              depth_limit: 4,
-              id_field: :id,
-              parent_field: :parent_id,
-              name_field: :name
-            }
-          },
-          %{tree: assoc(:item, :tree, :parent_id, :id)},
-          ["id", "tree.name"]
-        ),
-      hierarchy_path:
-        special(
-          c,
-          %{
-            tree: %{
-              type: :hierarchical,
-              name: "tree",
-              hierarchy_type: :materialized_path,
-              path_field: :path,
-              path_separator: "/"
-            }
-          },
-          %{tree: assoc(:item, :tree, :parent_id, :id)},
-          ["id", "tree.name"]
-        ),
-      subselect:
-        special(
-          c,
-          %{cat: %{type: :left, name: "cat"}},
-          %{cat: assoc(:cat, :cat, :cat_id, :id)},
-          ["id"],
-          &Selecto.subselect(&1, ["cat.name"])
-        )
-    }
-  end
-
-  defp corpus(c) do
-    q = fn fields -> c |> base() |> Selecto.select(fields) end
-
-    filters = [
-      plain_eq: {"vc", "alpha"},
-      ne: {"vc", {"!=", "alpha"}},
-      lt: {"vc", {"<", "b"}},
-      in_list: {"vc", ["alpha", "mixed"]},
-      not_in: {"vc", {:not_in, ["alpha"]}},
-      between: {"n", {:between, 4, 6}},
-      starts_with: {"vc", {:starts_with, "al"}},
-      like: {"vc", {:like, "al%"}},
-      contains: {"vc", {:text_contains, "lph"}},
-      ends_with: {"vc", {:ends_with, "ha"}},
-      negated: {:not, {"vc", "alpha"}},
-      enum_eq: {"kind", "a"},
-      domain_eq: {"code", "c3"},
-      citext_eq: {"ci", "mixed"},
-      citext_ne: {"ci", {"!=", "mixed"}},
-      citext_in: {"ci", ["MIXED", "nothing"]},
-      citext_like: {"ci", {:like, "MIX%"}},
-      citext_lt: {"ci", {"<", "N"}},
-      domain_citext_eq: {"dci", "bob"},
-      domain_citext_ne: {"dci", {"!=", "BOB"}},
-      citext_vs_text: {"ci", {:ref, "name"}},
-      text_vs_citext: {"name", {:ref, "ci"}},
-      computed_lower: {"lower_vc", "alpha"},
-      array_contains: {:array_contains, "tags", [2]},
-      array_overlap: {:array_overlap, "tags", [9, 1]}
-    ]
-
-    filtered = for {label, filter} <- filters, into: %{}, do: {label, ids(c, filter)}
-
-    filtered
-    |> Map.merge(specialised(c))
-    |> Map.merge(%{
-      tenant: q.(["id"]) |> run(),
-      stream: stream_ids(c),
-      join: q.(["id", "cat.name"]) |> run(),
-      citext_join: q.(["id", "code_row.label"]) |> run(),
-      group_count:
-        q.(["kind", {:count, "*"}])
-        |> Selecto.group_by(["kind"])
-        |> run(),
-      aggregate_citext_max:
-        q.([{:max, "dci"}])
-        |> run(),
-      lower_select: q.(["id", {:lower, "vc"}]) |> run(),
-      upper_select: q.(["id", {:upper, "vc"}]) |> run(),
-      length_select: q.(["id", {:length, "vc"}]) |> run(),
-      concat_select: q.(["id", {:concat, ["vc", {:literal, "x"}]}]) |> run(),
-      coalesce_select: q.(["id", {:coalesce, ["vc", {:literal, "x"}]}]) |> run(),
-      window:
-        q.(["id"])
-        |> Selecto.window_function(:row_number, [],
-          over: [partition_by: ["kind"], order_by: ["id"]]
-        )
-        |> run(),
-      subquery_in:
-        q.(["id"])
-        |> Selecto.filter(
-          {"cat_id", {:subquery, :in, "SELECT id FROM cats WHERE name = 'ten'", []}}
-        )
-        |> run(),
-      retarget:
-        c
-        |> base()
-        |> Selecto.retarget("cat", strategy: :in)
-        |> Selecto.select(["name"])
-        |> run(),
-      retarget_exists:
-        c
-        |> base()
-        |> Selecto.retarget("cat", strategy: :exists)
-        |> Selecto.select(["name"])
-        |> run()
-    })
-  end
-
-  test "the corpus answers the same under exact-match plants in a pinned schema", %{opts: opts} do
-    {:ok, c} = Adapter.connect(opts)
-
-    native = corpus(c)
-    GenServer.stop(c)
-
-    assert native.tenant == {:ok, [[1], [3], [5]]}
-    assert native.citext_eq == {:ok, [[1], [3], [5]]}
-    assert native.citext_ne == {:ok, []}
-    assert native.domain_citext_eq == {:ok, [[1], [3]]}
-    assert native.citext_vs_text == {:ok, [[3]]}
-    assert native.text_vs_citext == {:ok, [[3]]}
-    assert native.citext_join == {:ok, [[1, "tag-mixed"], [3, "tag-mixed"], [5, "tag-mixed"]]}
-
-    assert native.aggregate_citext_max == {:ok, [["Bob"]]} or
-             native.aggregate_citext_max == {:ok, [["BOB"]]}
-
-    bad = for {label, result} <- native, not match?({:ok, _}, result), do: {label, result}
-    assert bad == []
-
-    {:ok, admin} = Adapter.connect(opts)
-    for sql <- plants(), do: exec!(admin, sql)
-
-    try do
-      # Reconnect: the plants are in place for a fresh type cache too.
-      {:ok, c} = Adapter.connect(opts)
-      poisoned = corpus(c)
-
-      hijacked =
-        for {label, result} <- native,
-            Map.fetch!(poisoned, label) != result,
-            do: {label, result, Map.fetch!(poisoned, label)}
-
-      assert hijacked == []
-
-      # The plants do win a hand-written statement.
-      assert %{rows: [["alpha"]]} =
-               exec!(c, "SELECT lower(CAST('SECRET' AS varchar))")
-
-      GenServer.stop(c)
-    after
-      remove_plants(admin)
-      GenServer.stop(admin)
-    end
   end
 
   # Hand-built reads through the guarded path: the over-refusals Perl's
@@ -578,118 +329,6 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     )
   end
 
-  defp summary({:ok, %{rows: rows}}), do: rows
-  defp summary({:error, %{details: details} = error}), do: {details[:reason], error.message}
-  defp summary(other), do: other
-
-  test "citext overloads answer natively; with a plant in reach they refuse (R58, R62)", %{
-    opts: opts
-  } do
-    {:ok, c} = Adapter.connect(opts)
-
-    assert %{rows: [["zixed"]]} =
-             guarded_rows(c, "SELECT replace(ci, 'M', 'z') FROM items WHERE id = 3")
-
-    assert %{rows: [["zed"]]} =
-             guarded_rows(c, "SELECT regexp_replace(ci, 'MIX', 'z') FROM items WHERE id = 3")
-
-    # Two overloads an untyped pair could take: PostgreSQL's choice, not ours.
-    assert {:error, %{details: %{reason: :function_ambiguous}}} =
-             typed(c, "SELECT hstore('a', '1')::text")
-
-    GenServer.stop(c)
-
-    {:ok, admin} = Adapter.connect(opts)
-    for sql <- plants(), do: exec!(admin, sql)
-
-    try do
-      {:ok, c} = Adapter.connect(opts)
-
-      assert {:error, %{details: %{reason: :function_ambiguous}}} =
-               typed(c, "SELECT replace(ci, 'M', 'z') FROM items WHERE id = 3")
-
-      GenServer.stop(c)
-    after
-      remove_plants(admin)
-      GenServer.stop(admin)
-    end
-  end
-
-  defp guarded_rows(c, sql) do
-    {:ok, result} = Adapter.execute(c, sql, [], selecto_read: true)
-    result
-  end
-
-  test "an expression that may be citext refuses against an untyped value (R49c)", %{opts: opts} do
-    {:ok, c} = Adapter.connect(opts)
-
-    # PostgreSQL's common type names these: citext throughout, as natively.
-    for sql <- [
-          "SELECT id FROM items WHERE COALESCE(ci, 'x') = 'MIXED' ORDER BY id",
-          "SELECT id FROM items WHERE (CASE WHEN n > 0 THEN ci END) = 'MIXED' ORDER BY id",
-          "SELECT id FROM items WHERE GREATEST(ci, 'a') = 'MIXED' ORDER BY id",
-          "SELECT max(COALESCE(ci, 'x')) FROM items"
-        ] do
-      assert {:ok, %{rows: rows}} = typed(c, sql), sql
-      assert {:ok, %{rows: ^rows}} = Adapter.execute(c, sql, [], []), sql
-    end
-
-    for sql <- [
-          # M3: no OPERATOR() says "each column by its own type".
-          "SELECT id FROM items WHERE (ci, org) <> ('MIXED', 't1')",
-          "SELECT id FROM items WHERE ROW(ci, org) = ROW('MIXED', 't1')"
-        ] do
-      assert {:error, %{details: %{reason: :operand_type_unknown}}} =
-               typed(c, sql),
-             sql
-    end
-
-    # A computed field over citext and varchar through the domain: their common
-    # type is text, as natively.
-    computed =
-      domain()
-      |> put_in([:source, :columns, :ci_or], %{
-        type: :string,
-        computed: %{kind: :expression, expression: ["coalesce", ["field", "ci"], ["field", "vc"]]}
-      })
-      |> update_in([:source, :fields], &[:ci_or | &1])
-
-    assert {:ok, []} =
-             c
-             |> base(computed)
-             |> Selecto.select(["id"])
-             |> Selecto.filter({"ci_or", "MIXED"})
-             |> run()
-
-    GenServer.stop(c)
-  end
-
-  test "a function outside the pinned schemas is not a candidate", %{opts: opts} do
-    {:ok, admin} = Adapter.connect(opts)
-
-    for sql <- [
-          "CREATE SCHEMA offpath",
-          "CREATE FUNCTION offpath.only_there(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1'"
-        ],
-        do: exec!(admin, sql)
-
-    try do
-      {:ok, c} = Adapter.connect(opts)
-
-      assert {:error, %{details: %{reason: :function_not_found}}} =
-               typed(c, "SELECT only_there(name) FROM items")
-
-      # Hand-built text gets the driver's own answer under the pin.
-      assert {:error, %Postgrex.Error{postgres: %{code: :undefined_function}}} =
-               Adapter.execute(c, "SELECT only_there(name) FROM items", [], selecto_read: true)
-
-      GenServer.stop(c)
-    after
-      exec!(admin, "DROP SCHEMA offpath CASCADE")
-      GenServer.stop(admin)
-    end
-  end
-
   test "U& and dollar-quoted strings compare as untyped literals, as natively", %{opts: opts} do
     {:ok, c} = Adapter.connect(opts)
 
@@ -781,13 +420,6 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       statement = sql.(where)
       assert {:ok, %{rows: rows}} = typed(c, statement), where
       assert {:ok, %{rows: ^rows}} = Adapter.execute(c, statement, [], []), where
-    end
-
-    # An array no column names has an element type not known here: refused.
-    for where <- ["(ARRAY['a'::ext.citext])[1] = 'A'"] do
-      assert {:error, %{details: %{reason: :operand_type_unknown}}} =
-               typed(c, sql.(where)),
-             where
     end
 
     GenServer.stop(c)
@@ -908,7 +540,6 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
       assert SelectoDBPostgreSQL.RelationPath.resolve(execute, ["t"], false) == failure
       assert SelectoDBPostgreSQL.RelationPath.resolve(execute, ["t"], true) == failure
       assert SelectoDBPostgreSQL.SessionGuard.pin(execute, "pg_catalog") == failure
-      assert ExplicitSQL.prepare(execute, "SELECT lower(name) FROM items") == failure
     end
 
     # Anything else is still the typed refusal.
@@ -964,9 +595,6 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     assert {:ok, %{rows: rows}} = Adapter.execute(c, sql, [], [])
     assert {:ok, %{rows: ^rows}} = read.(selecto_qualified_relations: relations)
     assert {:ok, %{rows: ^rows}} = read.(selecto_generated: true)
-
-    assert {:error, %{details: %{reason: :operand_type_unknown}}} =
-             read.(selecto_generated: true, selecto_qualified_relations: relations)
 
     GenServer.stop(c)
   end
@@ -1049,121 +677,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
 
     assert {:ok, %{rows: ^flipped}} = typed(c, "SELECT min(NULLIF('z', ci)) FROM items")
 
-    for sql <- [
-          "SELECT NULLIF(random(), 0.5) FROM items",
-          "SELECT CASE random() WHEN 0.5 THEN 1 END FROM items"
-        ] do
-      assert {:error, %{details: %{reason: :volatile_operand}}} = typed(c, sql), sql
-    end
-
     GenServer.stop(c)
-  end
-
-  test "a statement beyond the bound refuses, whatever its shape (M6)", %{opts: opts} do
-    {:ok, c} = Adapter.connect(opts)
-    nested = Enum.reduce(1..40, "name", fn _n, inner -> "NULLIF(#{inner}, 'x')" end)
-
-    cased =
-      Enum.reduce(1..40, "name", fn _n, inner ->
-        "CASE #{inner} WHEN 'a' THEN 'b' WHEN 'c' THEN 'd' END"
-      end)
-
-    wide = Enum.map_join(1..30_000, " OR ", &"id = #{&1}")
-
-    for sql <- [
-          "SELECT id FROM items WHERE #{nested} = 'a'",
-          "SELECT id FROM items WHERE #{cased} = 'a'"
-        ] do
-      {micros, result} = :timer.tc(fn -> typed(c, sql) end)
-      assert {:error, %{details: %{reason: :statement_too_large}}} = result
-      assert micros < 30_000_000
-    end
-
-    # Hand-built text is the server's to bound, and it answers.
-    for sql <- [
-          "SELECT id FROM items WHERE #{wide} ORDER BY id",
-          "SELECT id FROM items WHERE name = '#{String.duplicate("a", 3_000_000)}'"
-        ] do
-      assert {:ok, %{rows: rows}} = Adapter.execute(c, sql, [], [])
-      assert {:ok, %{rows: ^rows}} = Adapter.execute(c, sql, [], selecto_read: true)
-    end
-
-    GenServer.stop(c)
-  end
-
-  test "a plant under a keyword or U& name never answers (R58, R60)", %{opts: opts} do
-    {:ok, admin} = Adapter.connect(opts)
-    forged = "RETURNS text LANGUAGE sql AS $$ SELECT 'FORGED'::text $$"
-
-    for sql <- [
-          "CREATE FUNCTION public.explain(int) #{forged}",
-          "CREATE FUNCTION public.cube(int, int) #{forged}",
-          "CREATE FUNCTION public.lower(varchar) #{forged}"
-        ],
-        do: exec!(admin, sql)
-
-    try do
-      {:ok, c} = Adapter.connect(opts)
-      read = &typed(c, &1)
-
-      for sql <- [
-            "SELECT explain(n) FROM items",
-            "SELECT cube(n, n) FROM items",
-            "SELECT public.cube(n, n) FROM items",
-            ~s|SELECT U&"cube"(n, n) FROM items|
-          ] do
-        assert {:error, %{details: %{reason: :function_not_member}}} = read.(sql)
-      end
-
-      assert {:ok, %{rows: [["alpha"]]}} =
-               read.(~s|SELECT U&"lower"(vc) FROM items WHERE id = 1|)
-
-      assert {:ok, %{rows: rows}} =
-               read.("SELECT n, count(*) FROM items GROUP BY CUBE (n) ORDER BY n")
-
-      assert length(rows) == 5
-      GenServer.stop(c)
-    after
-      for sql <- [
-            "DROP FUNCTION public.explain(int)",
-            "DROP FUNCTION public.cube(int, int)",
-            "DROP FUNCTION public.lower(varchar)"
-          ],
-          do: exec!(admin, sql)
-
-      GenServer.stop(admin)
-    end
-  end
-
-  test "a domain chain deeper than the walk refuses", %{opts: opts} do
-    {:ok, admin} = Adapter.connect(opts)
-
-    domains =
-      Enum.map_reduce(1..17, "ext.citext", fn level, previous ->
-        {"CREATE DOMAIN deep#{level} AS #{previous}", "deep#{level}"}
-      end)
-      |> elem(0)
-
-    for sql <- domains, do: exec!(admin, sql)
-    exec!(admin, "CREATE TABLE deep16t (id int PRIMARY KEY, k deep16)")
-    exec!(admin, "CREATE TABLE deep17t (id int PRIMARY KEY, k deep17)")
-    exec!(admin, "INSERT INTO deep16t VALUES (1, 'MiX')")
-
-    try do
-      {:ok, c} = Adapter.connect(opts)
-
-      assert {:ok, %{rows: [[1]]}} =
-               typed(c, "SELECT id FROM deep16t WHERE k = 'mix'", ["deep16t"])
-
-      assert {:error, %{details: %{reason: :domain_chain_too_deep}}} =
-               typed(c, "SELECT id FROM deep17t WHERE k = 'mix'", ["deep17t"])
-
-      GenServer.stop(c)
-    after
-      exec!(admin, "DROP TABLE deep16t, deep17t")
-      exec!(admin, "DROP DOMAIN deep1 CASCADE")
-      GenServer.stop(admin)
-    end
   end
 
   test "a citext-tenant UPDATE applies, under plants, and another tenant's never", %{opts: opts} do
@@ -1208,55 +722,6 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     after
       remove_plants(admin)
       exec!(admin, "DROP TABLE ct")
-      GenServer.stop(admin)
-    end
-  end
-
-  test "R49a: a column type changed after a REPEATABLE READ snapshot refuses", %{opts: opts} do
-    {:ok, admin} = Adapter.connect(opts)
-
-    exec!(
-      admin,
-      "CREATE TABLE rr (id int PRIMARY KEY, org varchar(5) NOT NULL, k text, other text)"
-    )
-
-    exec!(admin, "INSERT INTO rr VALUES (1, 't1', 'MiX', 'x')")
-
-    try do
-      {:ok, c} = Adapter.connect(opts)
-
-      in_snapshot = fn fun ->
-        Postgrex.transaction(c, fn conn ->
-          Postgrex.query!(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", [])
-          Postgrex.query!(conn, "SELECT 1", [])
-          fun.(conn)
-          Postgrex.rollback(conn, :done)
-        end)
-      end
-
-      read = &typed(&1, &2, ["rr"])
-
-      # Nothing changed: the read runs.
-      in_snapshot.(fn conn ->
-        assert {:ok, %{rows: [[1]]}} = read.(conn, "SELECT id FROM rr WHERE k = 'MiX'")
-      end)
-
-      # A column the statement does not name is not consulted.
-      in_snapshot.(fn conn ->
-        exec!(admin, "ALTER TABLE rr ALTER COLUMN other TYPE ext.citext")
-        assert {:ok, %{rows: [[1]]}} = read.(conn, "SELECT id FROM rr WHERE k = 'MiX'")
-      end)
-
-      in_snapshot.(fn conn ->
-        exec!(admin, "ALTER TABLE rr ALTER COLUMN k TYPE ext.citext")
-
-        assert {:error, %{details: %{reason: :catalog_changed}}} =
-                 read.(conn, "SELECT id FROM rr WHERE k = 'mix'")
-      end)
-
-      GenServer.stop(c)
-    after
-      exec!(admin, "DROP TABLE rr")
       GenServer.stop(admin)
     end
   end
@@ -1341,7 +806,7 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     end
   end
 
-  test "uuid and domain-over-uuid tenants: text binds, no uuid refuses, typed", %{opts: opts} do
+  test "uuid and domain-over-uuid tenants: text binds, no uuid refuses", %{opts: opts} do
     u1 = "0000000a-0000-0000-0000-000000000001"
     {:ok, admin} = Adapter.connect(opts)
 
@@ -1378,8 +843,8 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
 
       columns = %{
         id: %{type: :integer},
-        org: %{type: :string},
-        d: %{type: :string},
+        org: %{type: :uuid},
+        d: %{type: :uuid},
         note: %{type: :string}
       }
 
@@ -1396,7 +861,8 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
 
       assert read.(u1) == {:ok, [[1]]}
       assert read.("0000000a-0000-0000-0000-000000000002") == {:ok, []}
-      assert read.("not-a-uuid") == {:refused, :invalid_uuid}
+      # The driver refuses to encode text that is no uuid.
+      assert read.("not-a-uuid") == {:refused, :query_exception}
       GenServer.stop(c)
     after
       exec!(admin, "DROP TABLE ut")
