@@ -26,7 +26,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   alias SelectoDBPostgreSQL.PostImage
   alias SelectoDBPostgreSQL.RelationPath
-  alias SelectoDBPostgreSQL.{ExplicitSQL, SQLRecorder}
+  alias SelectoDBPostgreSQL.HandBuilt
   alias SelectoDBPostgreSQL.SessionGuard
 
   @read_committed "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
@@ -313,7 +313,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         guarded_read(connection, query, params, opts)
       end
     else
-      execute_plain(connection, SQLRecorder.host(query), params, opts)
+      execute_plain(connection, query, params, opts)
     end
   end
 
@@ -360,7 +360,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp hand_built_read(query) do
-    with {:error, %Error{} = error} <- ExplicitSQL.hand_built_read(query) do
+    with {:error, %Error{} = error} <- HandBuilt.read(query) do
       {:error, read_refusal(error)}
     end
   end
@@ -416,17 +416,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
     # names keep theirs.
     names = requests |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
 
-    # R46 FINAL-2: the catalog operator types of the relations' columns,
-    # so every generated comparison names its operator and casts both
-    # operands (Selecto.Builder.TypedOperator).
     with {:ok, resolved} <- resolve_relations(connection, names),
          :ok <- declared_exist(connection, resolved, names),
-         {:ok, relations} <- one_relation_per_name(resolved, requests),
-         {:ok, types} <- operator_types(connection, relations) do
-      set =
-        (Map.get(selecto, :set) || %{})
-        |> Map.put(:qualified_relations, relations)
-        |> Map.put(:pg_operator_types, types)
+         {:ok, relations} <- one_relation_per_name(resolved, requests) do
+      set = (Map.get(selecto, :set) || %{}) |> Map.put(:qualified_relations, relations)
 
       {:ok, %{selecto | set: set}}
     else
@@ -754,7 +747,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
          {:ok, _} <- guard.(open, []) do
       with {:ok, prior} <- arm_deadline(guard, keeps_savepoint?, ms),
            {:ok, state} <- open_read(guard, query, read_only?, keeps_savepoint?, ms, plan),
-           {:ok, query} <- read_statement(guard, query, state, plan),
+           {:ok, query} <- read_statement(query, plan),
            {:ok, result} <- read_result(execute.(plan.prefix <> query, params), plan.kind),
            :ok <- close_read(guard, state, plan),
            :ok <- disarm_deadline(guard, prior),
@@ -815,25 +808,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
     do: read_step(SessionGuard.close(guard, before, pinned))
 
   # The text a read sends: hand-built text as written (R68), a mixed statement
-  # with its fragment verbatim, generated text with every relation qualified and
-  # every operator and function explicit.
-  defp read_statement(_guard, query, _state, %{kind: kind, prefix: prefix})
-       when kind in [:hand_built, :mixed] do
-    text = IO.iodata_to_binary(query)
-    _ = SQLRecorder.host(prefix <> text)
-    {:ok, text}
-  end
+  # with its fragment verbatim, generated text with every relation qualified.
+  defp read_statement(query, %{kind: kind}) when kind in [:hand_built, :mixed],
+    do: {:ok, IO.iodata_to_binary(query)}
 
-  defp read_statement(guard, query, {_before, pinned}, plan) do
-    with :ok <- read_step(RelationPath.qualified(query)) do
-      read_step(
-        ExplicitSQL.prepare(guard, query,
-          read: true,
-          isolation: pinned.isolation,
-          declared_functions: plan.declared_functions
-        )
-      )
-    end
+  defp read_statement(query, _plan) do
+    with :ok <- read_step(RelationPath.qualified(query)), do: {:ok, IO.iodata_to_binary(query)}
   end
 
   # How long this read may still run, in milliseconds, or nil with no deadline.
@@ -938,8 +918,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp hold_statement(query, params, %{kind: kind}) when kind in [:hand_built, :mixed] do
     text = IO.iodata_to_binary(query)
 
-    if ExplicitSQL.planned?(text),
-      do: {SQLRecorder.host("EXPLAIN (FORMAT JSON) " <> text), params}
+    if HandBuilt.planned?(text),
+      do: {"EXPLAIN (FORMAT JSON) " <> text, params}
   end
 
   defp hold_statement(query, _params, _plan) do
@@ -961,14 +941,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   # Whether a plan is a read: anything but a plan that says so counts as not one,
   # and the read's own READ ONLY mode then answers for it.
-  defp plan_reads?(%{rows: [[plan]]}), do: ExplicitSQL.plan_reads?(plan)
+  defp plan_reads?(%{rows: [[plan]]}), do: HandBuilt.plan_reads?(plan)
   defp plan_reads?(_result), do: false
 
   # R55 awaits a decision: `config :selecto_db_postgresql, read_only_reads:
   # false` turns the pin off in this one place.
-  defp read_only?(query) do
-    read_only_reads() and not row_lock?(query)
-  end
+  defp read_only?(query), do: read_only_reads() and not HandBuilt.row_lock?(query)
 
   # Anything but false keeps reads read-only; connect/1 refuses a bad value.
   defp read_only_reads,
@@ -977,43 +955,16 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp read_only_setting_valid?,
     do: Application.get_env(:selecto_db_postgresql, :read_only_reads, true) in [true, false]
 
-  # Text that cannot be read as SQL refuses later, in ExplicitSQL. Hand-built
-  # text never gets here: it is always read-only, its writes refuse by that.
-  defp row_lock?(query) do
-    query |> SelectoDBPostgreSQL.Qualify.tokenize() |> SelectoDBPostgreSQL.Qualify.row_lock?()
-  catch
-    {:qualify_refuse, _reason, _message} -> false
-  end
-
   # A read that wrote refuses, typed. Whatever else text with host SQL in it fails with
   # is the driver's answer, as written.
   defp read_result({:error, %Postgrex.Error{postgres: %{code: :read_only_sql_transaction}}}, _),
     do: {:error, read_refusal(read_wrote())}
 
-  defp read_result(result, kind) when kind in [:hand_built, :mixed], do: result
-
-  # No operator or function for the operands (an extension type without a
-  # member for that operator): typed, like every other refusal of this step.
-  defp read_result({:error, %Postgrex.Error{postgres: %{code: :undefined_function}}}, :generated),
-    do: {:error, read_refusal(no_operator())}
-
-  defp read_result(result, :generated), do: result
+  defp read_result(result, _kind), do: result
 
   defp read_wrote do
     Error.new(:query_enforcement, "PostgreSQL refuses a read that tried to write",
       details: %{code: :query_rule_not_evaluable, reason: :read_only_read, adapter: :postgresql}
-    )
-  end
-
-  defp no_operator do
-    Error.new(
-      :query_enforcement,
-      "PostgreSQL has no operator or function for these operands",
-      details: %{
-        code: :query_rule_not_evaluable,
-        reason: :operator_not_member,
-        adapter: :postgresql
-      }
     )
   end
 
@@ -1046,7 +997,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
     %{
       path: read_path(opts),
       prefix: Keyword.get(opts, :selecto_explain, ""),
-      declared_functions: Keyword.get(opts, :selecto_declared_functions, []),
       kind: Keyword.get(opts, :selecto_read_kind, :generated),
       deadline: deadline,
       timeout: timeout
@@ -1095,14 +1045,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
         end)
     end
   end
-
-  defp operator_types(connection, relations),
-    do:
-      with_checkout(connection, fn guard, in_transaction? ->
-        in_own_savepoint(guard, in_transaction?, fn ->
-          RelationPath.operator_types(guard, relations)
-        end)
-      end)
 
   # R72: a catalog read in a host transaction runs under a savepoint of its own,
   # so a cancel keeps its type and does not abort the host's work.
@@ -1657,8 +1599,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     with :ok <- validate_candidate_request(request),
          {:ok, predicate} <-
            WriteCompiler.compile_predicate(request.parent_command.predicate,
-             context: request.context,
-             explicit_operators: true
+             context: request.context
            ),
          parent_query =
            "SELECT #{quote_identifier(request.parent_key)} FROM " <>
@@ -1700,8 +1641,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
          :ok <- ensure_upsert_serializable(connection, request, opts),
          {:ok, predicate} <-
            WriteCompiler.compile_predicate(request.predicate,
-             context: request.context,
-             explicit_operators: true
+             context: request.context
            ),
          fields = request.fields |> Enum.map(&to_string/1) |> Enum.uniq() |> Enum.sort(),
          selected = Enum.map_join(fields, ", ", &quote_identifier/1),
@@ -1804,8 +1744,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
          false <- is_nil(root_command.predicate),
          {:ok, predicate} <-
            WriteCompiler.compile_predicate(root_command.predicate,
-             context: Keyword.get(opts, :context, %{}),
-             explicit_operators: true
+             context: Keyword.get(opts, :context, %{})
            ),
          query =
            "SELECT #{quote_identifier(parent_key)} FROM #{quote_relation(root_command.relation)} " <>
@@ -2218,12 +2157,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_guarded_statement(connection, command, statement, opts) do
     guard = &guard_statement(connection, &1, &2)
 
-    # The re-reads carry the scope's predicates: explicit like the statement.
-    check = fn sql, params ->
-      with {:ok, sql} <- ExplicitSQL.prepare(guard, sql) do
-        execute_statement(connection, sql, params, Keyword.take(opts, [:timeout, :log]))
-      end
-    end
+    check = &execute_statement(connection, &1, &2, Keyword.take(opts, [:timeout, :log]))
 
     with {:ok, session} <- write_session(guard, statement.text, opts) do
       case PostImage.prepare(command) do
@@ -2314,7 +2248,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
                  transactional_connection,
                  opts
                  |> Keyword.put(:selecto_session_key, key)
-                 |> Keyword.put(:explicit_operators, true)
                ),
              :ok <- final_session_check(check, key) do
           {:ok, result}
@@ -2388,18 +2321,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # when every relation position of the very text executed is schema
   # qualified (a CTE name excepted).
   defp execute_qualified(connection, sql, params, opts) do
-    with :ok <- RelationPath.qualified(sql),
-         {:ok, sql} <-
-           ExplicitSQL.prepare(&guard_statement(connection, &1, &2), sql,
-             isolation: pinned_isolation(opts)
-           ) do
-      case execute_statement(connection, sql, params, opts) do
-        {:error, %Postgrex.Error{postgres: %{code: :undefined_function}}} ->
-          {:error, no_operator()}
-
-        result ->
-          result
-      end
+    with :ok <- RelationPath.qualified(sql) do
+      execute_statement(connection, sql, params, opts)
     end
   end
 
@@ -3222,7 +3145,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp execute_ecto_query(repo, query, params, opts) do
-    statement = query |> normalize_query() |> SQLRecorder.driver()
+    statement = query |> normalize_query()
 
     case apply(ecto_sql_module(), :query, [repo, statement, params, opts]) do
       {:ok, result} -> {:ok, normalize_result(result)}
@@ -3290,7 +3213,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       sql ->
         run_postgrex(
           connection,
-          SQLRecorder.driver(sql),
+          sql,
           [],
           opts |> unnamed() |> Keyword.put(:query_type, :text)
         )
@@ -3298,7 +3221,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp query_postgrex(connection, query, params, opts) do
-    statement = query |> normalize_query() |> SQLRecorder.driver()
+    statement = query |> normalize_query()
     run_postgrex(connection, statement, params, unnamed(opts))
   end
 
@@ -3329,11 +3252,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         query_fun.(query, params, prepared: false)
 
       _ ->
-        # R48: Selecto's own catalog reads resolve nothing by name either.
-        with {:ok, query} <-
-               ExplicitSQL.prepare(&guard_statement(connection, &1, &2), query) do
-          execute_statement(connection, query, params, prepared: false)
-        end
+        execute_statement(connection, query, params, prepared: false)
     end
   end
 
@@ -3900,8 +3819,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp execute_with_pool_pid(pool_pid, query, params, cache_key, opts) do
-    SQLRecorder.driver(query)
-
     query_opts = [timeout: Keyword.get(opts, :timeout, 15_000)] ++ Keyword.take(opts, [:deadline])
 
     try do
@@ -4391,26 +4308,21 @@ defmodule SelectoDBPostgreSQL.Adapter do
     case Keyword.get(opts, :selecto_read_kind) do
       :hand_built ->
         with {:ok, _} <- SessionGuard.open_hand_built(check) do
-          {:ok, {nil, nil, SQLRecorder.host(query)}}
+          {:ok, {nil, nil, query}}
         end
 
       :mixed ->
         with {:ok, before} <- SessionGuard.check(check, query),
              {:ok, pinned} <- SessionGuard.pin(check, read_path(opts), read_only: true) do
-          {:ok, {before, pinned, SQLRecorder.host(query)}}
+          {:ok, {before, pinned, query}}
         end
 
       _generated ->
         with :ok <- RelationPath.qualified(query),
              {:ok, before} <- SessionGuard.check(check, query),
              {:ok, pinned} <-
-               SessionGuard.pin(check, read_path(opts), read_only: read_only?(query)),
-             {:ok, prepared} <-
-               ExplicitSQL.prepare(check, query,
-                 isolation: pinned.isolation,
-                 declared_functions: Keyword.get(opts, :selecto_declared_functions, [])
-               ) do
-          {:ok, {before, pinned, prepared}}
+               SessionGuard.pin(check, read_path(opts), read_only: read_only?(query)) do
+          {:ok, {before, pinned, query}}
         end
     end
   end
@@ -4473,12 +4385,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
                 error -> refuse.(error)
               end
             else
-              {nil, nil, SQLRecorder.host(query)}
+              {nil, nil, query}
             end
 
           try do
             tx_conn
-            |> Postgrex.stream(SQLRecorder.driver(query), params, max_rows: max_rows)
+            |> Postgrex.stream(query, params, max_rows: max_rows)
             |> Enum.each(fn %Postgrex.Result{rows: rows, columns: columns} ->
               if before do
                 case SessionGuard.compare(check, before, pinned: pinned) do

@@ -306,12 +306,7 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
       {:ok, texts, params, _next_offset} ->
         texts = Enum.reverse(texts)
 
-        text =
-          if explicit?(opts),
-            do:
-              "(" <>
-                Enum.map_join(texts, " OR ", &typed_comparison(field, "=", &1, opts)) <> ")",
-            else: "#{quote_field(field, opts)} IN (#{Enum.join(texts, ", ")})"
+        text = "#{quote_field(field, opts)} IN (#{Enum.join(texts, ", ")})"
 
         {:ok, %{text: text, params: params}}
 
@@ -325,10 +320,7 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     with {:ok, compiled_value} <- compile_field_value(field, value, opts, offset) do
       operator_text = %{eq: "=", neq: "!=", gt: ">", gte: ">=", lt: "<", lte: "<="}[operator]
 
-      text =
-        if explicit?(opts),
-          do: typed_comparison(field, operator_text, compiled_value.text, opts),
-          else: "#{quote_field(field, opts)} #{operator_text} #{compiled_value.text}"
+      text = "#{quote_field(field, opts)} #{operator_text} #{compiled_value.text}"
 
       {:ok, %{text: text, params: compiled_value.params}}
     end
@@ -654,38 +646,6 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
     |> to_string()
     |> String.replace("\"", "\"\"")
     |> then(&"\"#{&1}\"")
-  end
-
-  # R46 FINAL-2: with `explicit_operators: true` (the adapter's executed
-  # writes) every predicate names its operator, pg_catalog's unless the
-  # column's catalog type (`operator_types:` column => {schema, arg}) says
-  # otherwise, and casts both operands to the operator's argument type, so
-  # no operator or implicit cast is looked up by name.
-  defp explicit?(opts), do: Keyword.get(opts, :explicit_operators) == true
-
-  @doc false
-  def typed_comparison(field, operator, right, opts) do
-    pg_operator =
-      %{
-        "=" => "=",
-        "!=" => "<>",
-        "<>" => "<>",
-        ">" => ">",
-        ">=" => ">=",
-        "<" => "<",
-        "<=" => "<="
-      }[operator]
-
-    case opts |> Keyword.get(:operator_types, %{}) |> Map.get(to_string(field)) do
-      {schema, arg} ->
-        cast = fn operand -> if arg, do: "CAST(#{operand} AS #{arg})", else: operand end
-        "(#{cast.(quote_field(field, opts))} OPERATOR(#{schema}.#{pg_operator}) #{cast.(right)})"
-
-      # A column of an extension type, or one not read: the adapter's last
-      # step names the operator, or refuses (SelectoDBPostgreSQL.Qualify).
-      nil ->
-        "(#{quote_field(field, opts)} #{pg_operator} #{right})"
-    end
   end
 
   defp quote_field(field, opts) do
