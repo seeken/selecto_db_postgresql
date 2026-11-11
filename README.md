@@ -172,34 +172,27 @@ for application code.
 
 A write bound to a tenant or trusted scope (`metadata.post_image`, set by
 `SelectoUpdato`) locks its table ROW EXCLUSIVE and resolves it to its oid
-before the statement, and is re-read by key after the statement, inside the
-same transaction, from the schema-qualified table that oid named and only
-among that table's (and its partitions') oids, never through a search_path
-lookup a row trigger could redirect. It is rolled back unless every written
-row is still inside the scope. The keys are bound back in Postgrex's binary
-form, independent of DateStyle, extra_float_digits or any other text-image
-setting. The check refuses (`query_rule_not_evaluable`) whatever it cannot
-see through:
+before the statement. The statement returns the (tableoid, ctid) of every row
+it wrote, and those exact rows are re-read after every row trigger has run,
+inside the same transaction, from the schema-qualified table that oid named
+and only among that table's (and its partitions') oids. It is rolled back
+unless every written row is still inside the scope, so keys of any type work
+and a trigger that renumbers a row behind a decoy cannot pass; a row a later
+trigger updates again has a new row id and is refused. The check refuses
+(`query_rule_not_evaluable`) whatever it cannot see through:
 
-- **Bound-scope writes refuse while a deferrable trigger that can run user
-  code exists anywhere in the database** (the same rule as every other write;
-  see "Deferrable triggers" below).
 - Statement-level triggers and rewrite rules for the event on the table or
   any of its partitions, views, tables with inheritance (non-partition)
-  children, and keys that are not an immediate, valid, non-partial unique
-  index over NOT NULL columns whose index collation is each column's own,
-  deterministic, with the default operator class (a unique index under
-  `"C"` over a case-insensitive column enforces uniqueness by bytes while
-  `=` follows the column's collation, so a decoy row could answer).
+  children, and any enabled non-internal deferrable trigger in the database:
+  it fires at COMMIT, after the check.
 - A bound-scope DELETE (`metadata.bound_scope`, graph delete-missing
   cleanups included) locks its table ROW EXCLUSIVE and is refused, before
   and again after its statement, under an enabled statement-level DELETE
   trigger or a DELETE rule on the table or anywhere in its partition or
-  inheritance tree, while a deferrable trigger that can run user code
-  exists, and on a view. A
-  graph descendant bound by its root or an ancestor (an insert, update or
-  delete on a table without a tenant field) follows the same rule for its
-  event.
+  inheritance tree, an enabled non-internal deferrable trigger, and on a
+  view. A graph descendant bound by its root or an ancestor (an insert,
+  update or delete on a table without a tenant field) follows the same rule
+  for its event.
 - **Every guarded write (bound tenant, trusted or host scope, admission
   guard or post-image) requires READ COMMITTED**, checked inside the write's
   transaction (`query_rule_not_evaluable`, `reason: :transaction_isolation`).
@@ -214,332 +207,118 @@ see through:
 on those rows are the schema owner's responsibility.** The check proves the
 rows the statement itself wrote; a row-level trigger that updates or deletes
 *other* rows, another tenant's included, runs and is not checked.
-Statement-level triggers and rewrite rules stay refused under a bound scope,
-for inserts, updates, upserts and deletes.
 
-### Session state
+## Reads
 
-A row trigger, or a function a domain view calls, can change the session for
-the statements after it: `set_config('search_path' | 'TimeZone' | ...,
-..., true)`, or a `TEMP` view, table or type, which PostgreSQL resolves before
-the search path for the rest of the session (a temp relation survives
-COMMIT). Every write and every Selecto read therefore runs between two
-pg_catalog-qualified session snapshots (search_path, TimeZone, DateStyle,
-IntervalStyle, extra_float_digits, the oid, xmin and name of every
-relation, rewrite rule and type in the session's temp schema, and the
-deferrable triggers that can run user code), compared in the client:
+A Selecto read runs on one checked-out connection, and the server's
+transaction status decides its shape (`DBConnection.status/1`, so a
+transaction opened with a raw text `BEGIN` is the host's too):
 
-- **Writes, bound or not, in any mode.** The snapshot after a write
-  statement is the FIRST statement after it, before the re-read or any
-  other SQL; it must equal the snapshot the write took first. A change rolls
-  the write's transaction, or its savepoint inside the host's transaction,
-  back (which also reverts `set_config`) and refuses with
-  `query_rule_violation`, `reason: :session_state_changed`.
-- **Reads.** A read runs under its own savepoint (a random name) inside the
-  host's transaction, or inside its own transaction in autocommit; a change
-  rolls it back (which reverts local and session-level `set_config` and any
-  temp relation it created) and refuses. A stream checks after every fetched
-  batch, before handing its rows out, and rolls its own transaction back on
-  a change.
-- **Temp shadows.** A statement whose names a temp relation would capture (a
-  temp relation named like a relation the statement reads, after FROM, JOIN,
-  INTO, UPDATE or TABLE, while a same-named relation exists in a schema of
-  the search path; a temp table named like a column refuses nothing), or a
-  temp type
-  named like one of its identifiers or a type the generated SQL casts to, is
-  refused (`query_rule_not_evaluable`, `reason: :temporary_shadow`), for
-  reads, streams and writes. A domain over a temp table that shadows nothing,
-  and unrelated temp tables, keep working.
-
-**Behaviour change.** A row trigger that runs `CREATE TEMP TABLE IF NOT
-EXISTS ...` (a scratch table) changes the session's temp namespace on the
-write that creates it. That write is refused and rolled back, which drops
-the table again, so every write on that table is refused. Create such
-tables up front in the session (or in a regular schema) instead.
-
-Generated write SQL qualifies its casts with `pg_catalog`, and Selecto keeps
-no session marker or GUC of its own that a trigger could forge. Beyond
-search_path and temp shadowing, a row trigger's other side effects (other
-settings, role changes, writes to unrelated tables, DDL) are host-owned
-schema behaviour and the schema owner's responsibility.
-
-### Deferrable triggers
-
-A deferrable trigger fires at COMMIT, after every check a write makes, so
-**no PostgreSQL write runs while a deferrable trigger that can run user code
-exists anywhere in the database**, in a transaction the adapter owns or the
-host's (`query_rule_not_evaluable`, `reason: :deferred_triggers`). It is
-checked before the write's first DML and again in the first statement after
-each DML (a trigger created while the write waited on a lock is seen).
-`SET CONSTRAINTS` is never used. Only two kinds of deferrable trigger are
-exempt, because PostgreSQL's own code runs them:
-
-- foreign-key triggers whose function is a pg_catalog `RI_FKey_*` function,
-  whose equality operators are pg_catalog's, whose referenced unique index
-  passes the index test below, and whose key columns on both sides have
-  pg_catalog base types (or domains over them): ordinary deferred foreign
-  keys keep working;
-- unique and exclusion rechecks (`unique_key_recheck`) on an index that
-  passes the index test, with pg_catalog exclusion operators.
-
-The index test: no expressions and no predicate; every collation is 0 or
-pg_catalog's; every operator class, its family's operators and support
-functions belong to pg_catalog; and every key column has a pg_catalog base
-type (or a domain over one).
-
-A `DEFERRABLE` constraint trigger, or a `DEFERRABLE EXCLUDE`, `UNIQUE` or
-foreign key whose operator class, expression, collation or key type is
-user-defined, refuses every write.
-Disable such triggers (`ALTER TABLE ... DISABLE TRIGGER`) or keep them in
-another database.
-
-### Schema-qualified relations and the pinned search_path
-
-A search_path switch that persists on the connection (an earlier
-session-level `set_config(..., false)`, or a deferred trigger racing a host
-REPEATABLE READ transaction) must not redirect a later Selecto statement to
-another schema's relation, function or operator of the same name. So:
-
-- **Every relation of a generated read or write is schema-qualified.** A
-  domain relation declares its schema with `source_schema` next to its
-  `source_table` (`source_schema: "pg_temp"` for a host temp table): reads
-  and SelectoUpdato writes of that domain both name it. A read resolves only
-  the relations its compiled statement names: a declared join it does not use
-  is not looked up, so its table need not exist. A hand-built write
-  command names it with a `"schema.relation"` relation. Any other name is
-  resolved against the connection's **reset** search_path
-  (`pg_settings.reset_val`: the server, database, role or startup value,
-  which `SET` and `set_config` do not change), which PostgreSQL itself
-  parses: inside a savepoint or transaction of its own that is rolled back,
-  the lookup applies it with `set_config(..., true)` and reads
-  `current_schemas(false)`, so quoting, case folding, `"$user"`
-  (`current_user`) and missing schemas follow the server, and `pg_temp`
-  never takes part. The name is also looked up under the session's
-  **current** path: a relation the two resolve differently refuses
-  (`reason: :relation_ambiguous`) instead of being redirected, and a
-  relation only the session's temp schema holds refuses unless declared
-  (`reason: :relation_unresolved`): declare `source_schema: "pg_temp"` on the
-  domain that names it. An ad-hoc join cannot name a schema: its table takes
-  its root's, so it reaches a temporary table only under a root that declares
-  `pg_temp`; otherwise read it through `join_subquery` on a domain that
-  declares `pg_temp`.
-  **A host that `SET`s search_path to
-  reach another schema must declare that schema** (or set it at connection
-  startup, for example `parameters: [search_path: "app"]`). A name that
-  does not resolve, or a lookup that cannot run, refuses; and the exact
-  text every Selecto read, stream, write or candidate load executes must
-  name each relation schema-qualified, so no unqualified statement runs.
-  Hand-built reads are the exception, below.
-- **Each query of a statement resolves under its own declarations.** An
-  ad-hoc join's table, a subquery join's query, a CTE's or LATERAL join's
-  query and a set operation's members are resolved, pinned and guarded like
-  the domain's own tables. A nested query (subquery join, CTE, LATERAL) whose
-  domain declares no `source_schema` takes its enclosing query's declared
-  root, as an ad-hoc join's table does (R59), and a retargeted query that
-  declares none takes its origin's; one that declares its own keeps it. Set
-  operation members are siblings and take nothing from each other.
-  The SQL names a relation once, so a name two of them would resolve to two
-  relations refuses (`reason: :relation_ambiguous`) rather than read one for
-  both. Within a Selecto statement a name read as a table is never also a CTE or
-  VALUES list's name. A name a query reads is a reference to a list at two
-  places only: a query's root, when its domain declares no `source_schema` and
-  the query defines a list of that name itself (or, for a CTE body, one
-  visible where the body sits), which is how to select from a CTE; and an
-  ad-hoc join naming a visible list. Every other name is a table: joined
-  schemas, through tables, declared non-association joins, closure and
-  junction tables, and every table of a query the statement embeds (filter and
-  CASE subqueries, `{:exists, query}`, `{:subquery, ...}`), a subquery or
-  LATERAL join, a set member, a recursive base or step, or a retarget origin.
-  A table named like a list defined anywhere in the statement refuses
-  (`reason: :cte_name_collision`), and one name defined twice with different
-  lists refuses (`reason: :cte_name_redefined`) unless the two sit in
-  different members of one set operation, each private to its member. A root
-  that reads a list named like a relation on the session's search_path refuses
-  too (`reason: :cte_name_collision`): which one was meant cannot be told. An
-  ad-hoc join naming a visible list reads the list whatever tables exist.
-  Every table is resolved under its query's declarations (an undeclared
-  subquery or declared join takes its root's declared schema, R59) and
-  qualified like the domain's own; a table two queries would resolve to two
-  relations refuses (`reason: :relation_ambiguous`). The CTEs Selecto
-  generates start with `__selecto_` and are named by their content (a values
-  list's rows, a hierarchy join's definition), within 63 characters. A
-  recursive CTE whose base or recursive query defines its own CTE or VALUES
-  list refuses (`reason: :recursive_cte_nested_with`); a copy of the
-  statement's VALUES list or of a CTE emitted before it is the statement's and
-  is allowed. A relation named by a declared or inherited schema that does not
-  exist there refuses (`reason: :relation_unresolved`) before the read runs.
-- A raw CTE (`{:raw_cte, sql, params}`, a binary or iodata with
-  `{:param, value}` markers) is the host's own text (R68): it must be plain
-  `name [(columns)] AS [NOT] [MATERIALIZED] (...)` definitions, comments
-  (nested ones too), dollar quotes and "double-quoted" or unquoted names
-  allowed. Every name it defines counts in the rule above like any list's, the
-  list-root check included; its bodies are not read. Text that does not parse
-  to the end refuses (`reason: :raw_cte_unparsed`), as do a backslash in a
-  string literal, non-ASCII names, SEARCH/CYCLE, a RECURSIVE prefix and a
-  trailing comma. A `$` after an identifier character (non-ASCII letters
-  included) opens no dollar quote, and a `--` comment ends at a carriage
-  return. A raw CTE's `$n` placeholders must each be bound by its params, every
-  `n` from 1 up used (none outside literals without params, where `$1` in a
-  string, comment or dollar quote stays text; none in a literal with params; no
-  params beside `{:param, value}` markers): otherwise it refuses
-  (`raw_cte_params_mismatch`) rather than bind a value of the statement around
-  it. Names compare case-insensitively. A list's name is written unquoted when
-  plain (letters, digits, underscores, and in any case not a word PostgreSQL,
-  MySQL 8.4, MariaDB 11.4, SQLite or DuckDB reserves) in its definition and
-  every root and join naming it, so it folds as the host's own SQL naming it
-  unquoted does. A name is spelled as Selecto always spelled it: one it left
-  unquoted that another dialect now reserves (`Rank`), and a raw CTE's
-  unquoted name, are quoted folded (`"rank"`), so host text naming them
-  unquoted reads the same list; one it always quoted (`Order`, `Key`) or that
-  PostgreSQL reserves (`With`, `Desc`) is quoted as written (`FROM "Order"`).
-  Other names, and a raw CTE's quoted names, are quoted as written. The list-root check looks a root up by that identifier and by
-  its name as written (`quote_ident`): a relation answering to either refuses.
-- **Each Selecto statement runs under pinned settings**: search_path
-  `pg_catalog, <declared schemas>, <every schema of the reset search_path>,
-  pg_temp`, and `TimeZone`,
-  `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`,
-  `standard_conforming_strings` and `timezone_abbreviations` each at its
-  `pg_settings.reset_val` (the
-  server, database, role or startup value; an unreadable one refuses), set
-  in one statement with
-  `set_config(..., true)` inside the read's savepoint or transaction, or the
-  write's, and restored to the host's values afterwards in the same
-  expression that checks every pin held. A session value a trigger or
-  earlier SQL persisted (even one masked by a local value of the same
-  setting) therefore never decides how a Selecto statement resolves names
-  or parses and renders values. A stream holds its pins on its own
-  connection checkout until it ends. `lc_monetary` and
-  `lc_numeric` are not pinned: generated SQL does not format money or
-  locale numbers. Unqualified functions and operators
-  therefore resolve to pg_catalog's first, then as the host's reset path
-  resolves them (an extension's types and operators included), and temp
-  objects last.
-- **Explicit operators.** A search_path pin cannot stop an operator in a
-  pinned schema that matches the operand types exactly (`public.=(dom, dom)`
-  for a domain column, `=(varchar, varchar)`, an enum's own `=`): PostgreSQL
-  prefers an exact match to pg_catalog's. So every comparison Selecto
-  executes names its operator: `(CAST(col AS T) OPERATOR(s.op) CAST($n AS T))`,
-  where `s` is pg_catalog for built-in, domain, enum, range, array and
-  composite types and the type's own schema for an extension type (citext),
-  and `T` the operator's argument type (a domain's base type, text for
-  varchar, the type itself otherwise), read from the catalog for every column
-  of the read's relations. IN and NOT IN become disjunctions of equalities,
-  BETWEEN a pair of bounds, IN (subquery) `= ANY`, LIKE an explicit `~~`
-  over `like_escape`, and joins, scope keys, tenant pairs, association pins,
-  retarget membership, writes, foreign-key guards, MERGE and the post-image
-  re-read name pg_catalog's operator too. Compile-only SQL (`to_sql/1`
-  without a connection) is unchanged.
-- **One last step before every statement runs** (R47, R49c, R50):
-  `SelectoDBPostgreSQL.Qualify` rewrites whatever a builder wrote bare, so the
-  specialised builders (tagging, hierarchy, OLAP, enhanced joins) run like
-  any other. Every operator names its schema, grouped as PostgreSQL's
-  precedence groups it; IN, BETWEEN, LIKE, SIMILAR TO, IS DISTINCT FROM,
-  NULLIF and simple CASE get explicit operators; every function is
-  pg_catalog's (a `public.lower(varchar)` never shadows it), the function an
-  extension defines for its first argument's type (citext's `max`,
-  `replace`), or the one candidate among the pinned schemas. The operands of
-  an operator or function in an extension's schema are cast to the member's
-  argument type, so nothing planted beside it over a domain is chosen. A
-  citext against text compares as text, in either order, as PostgreSQL
-  resolves it. An expression that may have an extension type but cannot be
-  resolved by query scope (`COALESCE(citext_col, 'x') = $1`) refuses
-  (`reason: :operand_type_unknown`), and so does a function with no single
-  candidate (`:function_not_found`, `:function_ambiguous`). Under REPEATABLE
-  READ or SERIALIZABLE the types of the columns a statement names are checked
-  through the parser (`pg_typeof((NULL::rel).col)`), and a change after the
-  transaction's snapshot refuses (`:catalog_changed`). A statement already
-  explicit runs as it is, with no catalog read. The test suite records every
-  statement at the driver call and fails if any of Selecto's own, guard and
-  catalog SQL included, would resolve by name; the host's SQL is never
-  rewritten.
-- **Extension operators are named only as members.** An extension's schema
-  is commonly writable, and an operator planted there resolves as readily as
-  one of the extension's own. So an operator outside pg_catalog is written
-  only when it is a `pg_depend` member of the operand type's extension for
-  those operand types; `hstore < hstore`, which the extension does not define,
-  refuses (`reason: :operator_not_member`) whatever is planted beside it, and
-  an `OPERATOR(ext.op)` already in a statement is verified the same way.
-  pg_catalog's operator stands in for a missing member in exactly one case: a
-  string-category extension type (citext, domains over it) against a
-  pg_catalog string type, which compares as text as PostgreSQL does. Any other
-  pair refuses in Selecto, not at the server: an implicit cast could make it
-  resolve and compare the wrong thing (box3d `=` by area, geometry as text).
-- **Hand-built SQL.** Text wholly the host's runs exactly as written, in the host's
-  session: no qualification, no rewriting, no catalog proof, no search_path or
-  settings pin and no relation guard, so its answers are the driver's, under the
-  host's search_path, `SET LOCAL`s and temporary tables. A statement is generated
-  only when Selecto's executor stamped it (`selecto_generated`). Three things still
-  apply: the text must be a read by its first word (SELECT, WITH, VALUES, TABLE,
-  SHOW, EXPLAIN, or `reason: :hand_built_not_a_read`), it always runs READ ONLY,
-  whatever `read_only_reads` says, so what it would write refuses
-  (`reason: :read_only_read`, SQLSTATE 25006), and a session that is not UTF8
-  refuses. So `transaction_read_only` reads `on` inside such a read.
-- **Host fragments.** A statement Selecto built that carries a host fragment, a
-  custom column's `select:`, a `raw_sql_filter`, a `{:ref, text}` or an
-  `{:exists, sql}` say, stays generated: its relations, filters and tenant scope
-  keep their pin and guards, and declared schemas hold. Only the fragment is
-  verbatim: no operator of such a statement is rewritten, and it runs READ ONLY.
-  Under the pin a fragment's bare names resolve as the pin does, not as the host's
-  search_path would. Tenant scope depends on a `raw_sql_filter` being well-formed:
-  one that closes its own parenthesis escapes the scope.
-- **Never build hand-built text or a raw fragment from end-user input.** It is the
-  host's own code: the write check stops honest mistakes, not evasion.
-- **Row locks.** Hand-built text and raw text cannot take row locks, on any
-  route: `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE` and `FOR KEY SHARE` refuse
-  `:read_only_read`. Take row locks through your own driver.
-- **Deployment.** No untrusted role may have CREATE on a schema the application
-  reaches, and hosts schema-qualify functions in their triggers, views and
-  policies: code already running as the application role is outside what these
-  guards address.
-- **Functions.** Selecto does not reimplement overload resolution. A function
-  outside pg_catalog is named only as the exact match for its arguments' known
-  types or the sole candidate that can take them, and no argument is cast to a
-  type it lacks; anything else is `:function_ambiguous`, as is a non-member
-  beside an extension's own functions. A function no extension owns, bare or
-  schema-qualified, refuses (`:function_not_member`) unless the domain declares
-  it as a UDF. A word before `(` is a function unless its position proves syntax
-  (hstore's `delete`, `cube(x, y)`; `GROUP BY CUBE (x, y)` is syntax), and
-  `U&"..."` identifiers are decoded first.
-- **Reads cannot write.** A Selecto read runs with `transaction_read_only`
-  pinned on, so a function or planted operator it reaches cannot write through
-  it; in a host transaction its savepoint ends by ROLLBACK TO, which restores
-  the host's setting. A generated read that takes row locks (`FOR UPDATE`,
-  `FOR SHARE`) stays writable, since PostgreSQL refuses those read-only. A host function
-  that writes (or `nextval`) in a domain view or custom column therefore
-  refuses in a read (`reason: :read_only_read`). None of this costs the host its
-  transaction: before the savepoint a read takes the relation locks the host's
-  own SELECT would hold to its commit, through a view to its base tables too, and
-  with them the transaction's first snapshot. A hand-built statement is planned
-  for that (`EXPLAIN (FORMAT JSON)`, under the read's deadline), and a plan that
-  would write or lock rows keeps nothing, since the read is about to refuse. A
-  relation only a function a view calls reaches is locked only for the read, and
-  so is `pg_advisory_xact_lock`: the read's ROLLBACK TO releases it. Take advisory
-  locks through your own driver. Planning can evaluate a function declared
-  IMMUTABLE or STABLE, outside READ ONLY mode: one that writes breaks PostgreSQL's
-  contract for those words.
-- **Timeouts.** A read's `:timeout` is the server's `statement_timeout`, local to
-  the read's own transaction or savepoint: the reply is consumed, the read is
-  undone, and a transaction the host holds goes on. Selecto kills no process on
-  such a connection. The connection's own limit comes a few seconds later, for a
-  server that does not answer at all. Should a read's undo itself fail, the
-  connection closes and the holder's next statement says so; Selecto never sends
-  ROLLBACK or COMMIT for a transaction it does not own. A transaction begun with
-  text `BEGIN` on a pool pid is host misuse: a pool can reconnect between statements
-  with or without Selecto, and the host's following statements would autocommit.
-  Use a transaction handle (`DBConnection.run/3` or `Postgrex.transaction/3`).
-  `config :selecto_db_postgresql, read_only_reads: false` turns this off.
+- **No transaction open:** the read is a transaction of its own: `BEGIN`, one
+  statement that makes it `READ ONLY`, sets the read's `statement_timeout`
+  and checks that `client_encoding` is UTF8, the query, `ROLLBACK`. Nothing
+  it reaches can write and nothing it changes outlasts it: a view using
+  `nextval` or an audit function refuses (`query_rule_not_evaluable`,
+  `reason: :read_only_read`). A generated read that locks rows (`FOR UPDATE`,
+  `FOR SHARE`) is not read-only; its locks end with it. A `ROLLBACK` that
+  fails closes the connection, so the holder's next statement says so.
+  `config :selecto_db_postgresql, read_only_reads: false` turns `READ ONLY`
+  off for generated reads.
+- **Inside the host's transaction:** the read is the host's own statement.
+  One statement checks `client_encoding` and sets the read's
+  `statement_timeout` local to the transaction, the query runs as written,
+  and the prior `statement_timeout` is put back. Its locks, snapshot and any
+  write a view makes belong to that transaction. A read that fails (a
+  timeout, a missing relation) leaves the transaction aborted for the host
+  to roll back; Selecto never sends `COMMIT` or `ROLLBACK` for a transaction
+  it does not own, and kills no process on such a connection.
+- **Timeouts.** A read's `:timeout` is the server's `statement_timeout`; a
+  shorter `statement_timeout` of the host's stands. The connection's own
+  limit comes a few seconds later, for a server that does not answer at all.
+- **Statements are Selecto's or the host's.** A statement is Selecto's only
+  when its executor stamped it (`selecto_generated`, or `selecto_raw_sql` for
+  one carrying a host fragment: a custom column's `select:`, a
+  `raw_sql_filter`, a `{:ref, text}`, an `{:exists, sql}`). Anything else
+  given to a read path is hand-built: the host's own code. **Never build
+  hand-built text or a raw fragment from end-user input.** Hand-built text
+  must be one statement beginning `SELECT`, `WITH`, `VALUES`, `TABLE`, `SHOW`
+  or `EXPLAIN` (`reason: :hand_built_not_a_read`). With no transaction open
+  it runs as written, under `READ ONLY`. In the host's transaction nothing
+  would stop a write, so text whose words could write (`INSERT`, `UPDATE`,
+  `DELETE`, `MERGE`, `TRUNCATE` or `INTO`, as a data-modifying `WITH` or
+  `SELECT INTO` uses, and `EXPLAIN ANALYZE` of one) refuses before anything
+  is sent (`reason: :hand_built_in_host_transaction`); a row lock is
+  allowed, and so are sequences and the host's own functions and views. The
+  check reads words, not meaning (a column named `update` refuses too; a
+  quoted `"delete"` or one in a string literal does not): it stops honest
+  mistakes, not evasion.
+- **Declared schemas.** Selecto compiles relation names plainly. A relation
+  a domain declares with `source_schema` next to its `source_table` is
+  written `"schema".relation` in the statement a read runs (and in its
+  stream and EXPLAIN); a write names it with a `"schema.relation"` relation.
+  A nested query (subquery join, CTE, LATERAL) whose domain declares no
+  schema takes its enclosing query's declared root, as an ad-hoc join's
+  table does, and a retargeted query its origin's. The statement names a
+  relation once, so a name read in two schemas, or declared in one query of
+  the statement and not in another, refuses (`reason: :relation_ambiguous`).
+  Nothing is read from the catalog for this. A relation no domain declares
+  a schema for resolves by the session's `search_path`.
+- **Lists.** Within a Selecto statement a name read as a table is never also
+  a CTE or VALUES list's name: a table named like a list defined in the
+  statement refuses (`reason: :cte_name_collision`), as does one name
+  defined twice with different lists (`reason: :cte_name_redefined`). A
+  query's root reads a list of its name when its domain declares no
+  `source_schema` and the query defines that list. A raw CTE
+  (`{:raw_cte, sql, params}`) is the host's own text: plain
+  `name [(columns)] AS [NOT] [MATERIALIZED] (...)` definitions whose `$n`
+  placeholders its params bind exactly; anything else refuses
+  (`raw_cte_unparsed`, `raw_cte_params_mismatch`).
+- **Streams** follow the same rules in a transaction of their own: a
+  connection in the host's transaction, or a session that is not UTF8, is
+  refused at the call (`reason: :stream_in_transaction`,
+  `:client_encoding`).
 - **EXPLAIN is a read.** `Selecto.explain/2`, `explain_analyze/2` and
-  `QueryAnalyzer` run through the same qualification, pin and session checks,
-  with the same refusals: even plain EXPLAIN evaluates operators, since a
-  selectivity estimator such as `eqsel` applies them to most-common values.
-- **`Selecto.to_sql/2` and `gen_sql/2` are compile-only.** Their text names
-  relations and operators bare and has none of this protection. It is for
-  display and tests; run a read through `Selecto.execute/2`.
-- **uuid columns** take their text value as a uuid in reads and writes,
-  whatever the field's declared type. Text that is no uuid refuses
-  (`reason: :invalid_uuid`), as does a non-canonical spelling on a tenant
-  column.
-- Every catalog read the adapter runs for its checks is pg_catalog-qualified.
+  `QueryAnalyzer` run exactly as the read itself would.
+- **`Selecto.to_sql/2` and `gen_sql/2` are compile-only**, without declared
+  schemas; run a read through `Selecto.execute/2`.
+- **uuid columns** declared `:uuid` take their text value as a uuid; a write
+  binds a uuid column's text (a domain over uuid included) whatever its
+  field type, and text that is no uuid refuses (`reason: :invalid_uuid`), as
+  does a non-canonical spelling on a tenant column.
+
+## Writes
+
+A governed write runs in a transaction the adapter opens (READ COMMITTED),
+or under a savepoint of its own in the host's transaction, which a refused
+write rolls back. Before each command one statement reads its facts:
+`client_encoding` (UTF8, or `reason: :client_encoding`), the transaction's
+isolation level, and the target's uuid columns. Generated write SQL names
+its operators and functions plainly and its relation as the command names
+it. A post-image re-read and the statement-trigger, rule and deferrable
+checks address the relation by the oid and schema-qualified name resolved
+under its lock before the DML (see the post-image check above).
+
+## What the host must provide
+
+Selecto's statements run in the host's session, under its settings, and
+resolve names as the host's own queries do. The host provides:
+
+- **`client_encoding` UTF8.** Bound values are UTF-8; read as another
+  encoding a tenant name with an accent is another tenant's. It is checked
+  by every read, stream and write.
+- **A `search_path` that names the application's schemas**, or
+  `source_schema` on the domains. An extension (`citext`) must be in a
+  schema on the path for its operators to apply.
+- **No untrusted role with `CREATE` on a schema on the path.** An operator
+  or function created there (an exact-type `=` over `varchar`, a
+  `lower(varchar)`) would be chosen over `pg_catalog`'s, for Selecto's
+  statements as for any other. Triggers, views and row-security policies
+  must schema-qualify the functions they call, and must not change session
+  state (`search_path`, temporary relations) that later statements rely on.
+- **Transactions through a handle** (`Postgrex.transaction/3`,
+  `DBConnection.run/3`, an Ecto repository). A raw text `BEGIN` is seen and
+  respected, but a pool can reconnect between statements and the host's
+  following statements would autocommit.
 
 ## Atomic write graphs and MERGE
 

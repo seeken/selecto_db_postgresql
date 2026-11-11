@@ -4,6 +4,44 @@ CHANGES
 Unreleased
 ----------
 
+- **Guard removal.** Generated SQL resolves as the host's own queries do,
+  and a read is a read-only transaction of its own or the host's own
+  statement (see README: Reads, Writes, What the host must provide).
+  Removed: the operator and function qualifier (`Qualify`, `ExplicitSQL`'s
+  catalog reads) and the suite's R47/R48 lint; relation resolution against
+  the reset search_path, the search_path and result-settings pins, the
+  temp-shadow and list-root refusals (`RelationPath`); the session snapshots
+  around every read, write and stream batch and the database-wide
+  deferrable-trigger refusal of every write (`SessionGuard`); the per-read
+  savepoint in the host's transaction with its relation hold and plan check,
+  and the read undo's cancel retries. A defence against a role with CREATE
+  in an application schema, planted triggers or temporary relations is
+  outside the threat model.
+  - With no transaction open a read is `BEGIN`, one statement (READ ONLY
+    unless it locks rows, the read's `statement_timeout`, a UTF8 check), the
+    query, `ROLLBACK`: 4 statements, was 7 (one joined read on RAM
+    PostgreSQL: 4.2 -> 0.6 ms).
+  - **Behaviour change:** in the host's transaction a read runs as the host's
+    own statement, between a statement that sets its `statement_timeout` and
+    one that puts the prior value back. A read that fails (a timeout, a
+    missing relation) now leaves the transaction aborted for the host to roll
+    back, and what a view or function it reaches writes belongs to the
+    host's transaction. Hand-built text whose words could write refuses there
+    first (`hand_built_in_host_transaction`).
+  - **Behaviour change:** a relation no domain declares a schema for resolves
+    by the session's `search_path` (no `relation_ambiguous` or
+    `relation_unresolved` refusal from the catalog); a missing relation is
+    the server's `undefined_table`. Declared schemas are still written into
+    the statement, without a catalog read; a name declared in one query of a
+    statement and undeclared in another refuses (`relation_ambiguous`).
+  - **Behaviour change:** comparisons are written plainly, so a uuid column
+    a domain declares `:string` no longer binds text in a read filter
+    (declare it `:uuid`), and text that is no uuid there refuses as the
+    driver's encode error. Writes still bind a uuid column's text.
+  - Writes read one statement of facts per command (client_encoding,
+    isolation, the target's uuid columns). Only post-image and bound-scope
+    writes refuse on a deferrable trigger (any enabled non-internal one).
+  - `prepare_read/2` reads nothing from the database.
 - The per-read and per-write temp-catalog checks (the session fingerprint,
   the temporary-shadow count and the relation resolver's temp count) skip
   their pg_class / pg_type / pg_rewrite scans with a one-time filter when the
