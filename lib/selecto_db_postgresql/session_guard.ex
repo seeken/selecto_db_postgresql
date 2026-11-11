@@ -175,11 +175,25 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   @temp "pg_catalog.pg_my_temp_schema()"
 
   # pg_class and pg_type have no index on the namespace alone, so a match on
-  # the temp schema scans the whole catalog, on every read. A session that
-  # never made a temp object has no temp schema (pg_my_temp_schema() is 0):
-  # this one-time filter skips the scan then, and a session with one scans
-  # exactly as before.
-  @has_temp "#{@temp} OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)"
+  # the temp schema scans the whole catalog, on every read. These one-time
+  # filters skip the scan when the temp schema holds nothing: none exists
+  # (pg_my_temp_schema() is 0), or nothing in pg_depend references it
+  # (an indexed lookup on pg_depend_reference_index). PostgreSQL records a
+  # dependency on its namespace for every relation, view, sequence and
+  # standalone type created in it; the rest of the temp schema's pg_class and
+  # pg_type rows (indexes, row types, array and multirange types) depend on
+  # one of those. So a schema whose temp objects were all dropped skips the
+  # scans, and a session holding a temp object scans exactly as before.
+  @has_temp_schema "#{@temp} OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)"
+
+  @has_temp @has_temp_schema <>
+              " AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend selecto_temp_dep " <>
+              "WHERE selecto_temp_dep.refclassid OPERATOR(pg_catalog.=) CAST(2615 AS pg_catalog.oid) " <>
+              "AND selecto_temp_dep.refobjid OPERATOR(pg_catalog.=) #{@temp})"
+
+  @doc false
+  # The temp-schema gate of the catalog scans, for RelationPath's lookup.
+  def temp_objects_sql, do: @has_temp
 
   # The settings are compared one by one (R30, R35: Selecto pins them
   # around its statements), the temp catalog in one string.
@@ -224,12 +238,16 @@ defmodule SelectoDBPostgreSQL.SessionGuard do
   # kept for the call shape only. A temp TYPE named like an identifier or a
   # generated cast type is still refused (defence in depth: the pinned path
   # searches pg_temp last).
+  # The name match also reads as `typname = ANY (name[])` so pg_type's
+  # (typname, typnamespace) index finds the candidates; the text match keeps
+  # it exact (a name cast truncates at 63 bytes).
   @shadow_count "CAST(CASE WHEN $1::pg_catalog.text[] IS NULL THEN 0 ELSE 0 END AS pg_catalog.int8) " <>
                   "OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.pg_type t " <>
                   "WHERE #{@has_temp} AND t.typnamespace OPERATOR(pg_catalog.=) #{@temp} " <>
                   "AND t.typrelid OPERATOR(pg_catalog.=) 0 " <>
                   "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type e WHERE e.oid OPERATOR(pg_catalog.=) t.typelem " <>
                   "AND e.typrelid OPERATOR(pg_catalog.<>) 0) " <>
+                  "AND t.typname OPERATOR(pg_catalog.=) ANY (CAST($2 AS pg_catalog.name[])) " <>
                   "AND CAST(t.typname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY ($2::pg_catalog.text[])) " <>
                   "AS selecto_guard_shadowed"
 

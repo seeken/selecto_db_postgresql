@@ -10,7 +10,12 @@ Unreleased
   session has no temp schema (`pg_my_temp_schema()` is 0): those catalogs
   have no index on the namespace alone, so each check scanned the whole
   catalog (about 30 ms a read, 47 ms a governed write, on a 300k-relation
-  catalog). A session with temp objects scans and detects them as before.
+  catalog). The gate also skips them when nothing in pg_depend references
+  the temp schema (an indexed lookup): a pooled session whose temp objects
+  were all dropped no longer pays for the scans. A session holding temp
+  objects scans and detects them as before. The temporary-shadow count
+  matches type names through pg_type's (typname, typnamespace) index, the
+  exact text match kept.
 - A stream's encode, server, transaction or producer failure, and its
   receive timeout, raise `Selecto.Error.Refused` typed as the non-stream read
   would return it, instead of a RuntimeError quoting the driver's message.
