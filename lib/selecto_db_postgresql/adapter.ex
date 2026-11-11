@@ -9,6 +9,26 @@ defmodule SelectoDBPostgreSQL.Adapter do
   `execute_prepared_write_unsafe/3` skip that check and exist for trusted
   tooling and adapter tests only.
 
+  ## Reads
+
+  With no transaction open a Selecto read is a transaction of its own:
+  `BEGIN`, one statement that makes it `READ ONLY` (unless it locks rows),
+  sets the read's `statement_timeout` and checks `client_encoding` is UTF8,
+  the query, `ROLLBACK`. Inside the host's transaction (`DBConnection.status/1`,
+  so a raw `BEGIN` is the host's) it is the host's own statement, with its
+  `statement_timeout` set before it and put back after it; a read that fails
+  leaves that transaction for the host to end. Hand-built text must be a read
+  by its first word, and in the host's transaction refuses by its words when
+  it could write (`hand_built_in_host_transaction`). Relations a domain
+  declares a schema for are written with it (`SelectoDBPostgreSQL.DeclaredSchema`).
+
+  ## What the host must provide
+
+  Selecto's statements run in the host's session and resolve names as the
+  host's own queries do: `client_encoding` UTF8, a `search_path` naming the
+  application's schemas (or `source_schema` on its domains), no untrusted role
+  with `CREATE` on a schema on the path, and transactions through a handle.
+
   ## Prepared statements
 
   Every statement runs unnamed, always: `pg_prepared_statements` stays empty.
