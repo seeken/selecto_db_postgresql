@@ -114,4 +114,29 @@ defmodule SelectoDBPostgreSQL.TempCatalogCostIntegrationTest do
     exec!(c, "CREATE DOMAIN pg_temp.text AS varchar(2)")
     assert read(c) == :temporary_shadow
   end
+
+  test "a session whose temp objects were dropped skips the scans; a new one is detected",
+       %{connection: c} do
+    # A pooled connection keeps its temp schema after its temp objects go.
+    exec!(c, "CREATE TEMP TABLE scratch (id int PRIMARY KEY, note text)")
+    exec!(c, "CREATE TEMP VIEW scratch_v AS SELECT id FROM pg_temp.scratch")
+    exec!(c, "CREATE DOMAIN pg_temp.small AS int")
+    exec!(c, "DROP VIEW pg_temp.scratch_v")
+    exec!(c, "DROP TABLE pg_temp.scratch")
+    exec!(c, "DROP DOMAIN pg_temp.small")
+    refute rows!(c, "SELECT CAST(pg_catalog.pg_my_temp_schema() AS pg_catalog.int8)") == [[0]]
+
+    scans = catalog_scans(c)
+    assert scans != []
+    assert Enum.all?(scans, &(&1 =~ "never executed")), Enum.join(scans, "\n")
+    assert rows!(c, SessionGuard.snapshot_sql()) |> hd() |> hd() == "temp | end"
+    assert read(c) == [[1, "mine"]]
+
+    # Anything created in it again is scanned and seen as before, a type
+    # alone included.
+    exec!(c, "CREATE DOMAIN pg_temp.text AS varchar(2)")
+    refute Enum.any?(catalog_scans(c), &(&1 =~ "never executed"))
+    assert rows!(c, SessionGuard.snapshot_sql()) |> hd() |> hd() =~ ~r/:text( |,)/
+    assert read(c) == :temporary_shadow
+  end
 end
