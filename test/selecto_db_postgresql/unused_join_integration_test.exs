@@ -114,6 +114,11 @@ defmodule SelectoDBPostgreSQL.UnusedJoinIntegrationTest do
       assert {:error, %Selecto.Error{details: %{sqlstate: "42P01"}}} = Selecto.execute(query)
     end
 
+    # A non-association join's field compiles; its missing table is the
+    # server's error too.
+    assert {:error, %Selecto.Error{details: %{sqlstate: "42P01"}}} =
+             Selecto.execute(Selecto.select(q(ctx), ["id", "notes.order_id"]))
+
     {:ok, _} =
       Adapter.execute(
         ctx.conn,
