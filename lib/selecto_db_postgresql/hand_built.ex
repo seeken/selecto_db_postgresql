@@ -27,6 +27,45 @@ defmodule SelectoDBPostgreSQL.HandBuilt do
   end
 
   @doc """
+  `:ok` when hand-built read text may run inside the host's transaction, or the
+  typed refusal (`hand_built_in_host_transaction`).
+
+  In the host's transaction nothing would stop a write, so text whose words
+  could write refuses before anything is sent: INSERT, UPDATE, DELETE, MERGE,
+  TRUNCATE or INTO, as a data-modifying WITH or SELECT INTO uses, and EXPLAIN
+  ANALYZE of one. A row lock (FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE) is
+  allowed, as are sequences and the host's own functions and views: they are
+  the host's. The check reads words, not meaning; it stops honest mistakes,
+  not evasion.
+  """
+  def host_transaction(sql) do
+    if may_write?(sql),
+      do:
+        refuse(
+          :hand_built_in_host_transaction,
+          "a hand-built statement that may write cannot run inside the host's transaction"
+        ),
+      else: :ok
+  end
+
+  defp may_write?(sql) do
+    text = words(sql)
+    start = text |> first_word() |> Kernel.||("") |> String.upcase()
+
+    cond do
+      start == "SHOW" ->
+        false
+
+      start == "EXPLAIN" and not Regex.match?(~r/\bANALY[SZ]E\b/i, text) ->
+        false
+
+      true ->
+        text = Regex.replace(~r/\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b/i, text, " ")
+        Regex.match?(~r/\b(?:INSERT|UPDATE|DELETE|MERGE|TRUNCATE|INTO)\b/i, text)
+    end
+  end
+
+  @doc """
   Whether a statement's words lock rows (FOR UPDATE, FOR NO KEY UPDATE, FOR
   SHARE, FOR KEY SHARE): such a read cannot run READ ONLY. Read from words, with
   string literals, quoted identifiers and comments blanked.
@@ -44,30 +83,6 @@ defmodule SelectoDBPostgreSQL.HandBuilt do
       " "
     )
   end
-
-  @doc "Whether hand-built text can be planned: SHOW and EXPLAIN itself cannot."
-  def planned?(sql) do
-    word = first_word(sql)
-    word != nil and String.upcase(word) not in ~w(SHOW EXPLAIN)
-  end
-
-  @doc """
-  Whether an `EXPLAIN (FORMAT JSON)` result is a plan that neither writes nor
-  locks rows. Anything unreadable is not.
-  """
-  def plan_reads?([%{"Plan" => plan}]), do: node_reads?(plan)
-  def plan_reads?(json) when is_binary(json), do: json |> Jason.decode() |> decoded_reads?()
-  def plan_reads?(_other), do: false
-
-  defp decoded_reads?({:ok, plan}), do: plan_reads?(plan)
-  defp decoded_reads?(_failed), do: false
-
-  defp node_reads?(%{"Node Type" => type} = node) when is_binary(type) do
-    type not in ["ModifyTable", "LockRows"] and
-      Enum.all?(Map.get(node, "Plans", []), &node_reads?/1)
-  end
-
-  defp node_reads?(_other), do: false
 
   defp first_word(<<c, rest::binary>>) when c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v, ?(],
     do: first_word(rest)

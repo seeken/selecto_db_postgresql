@@ -6,7 +6,6 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
 
   alias Selecto.Write.Command
   alias SelectoDBPostgreSQL.Adapter
-  alias SelectoDBPostgreSQL.SessionGuard
   alias SelectoDBPostgreSQL.Verification.ConnectionOptions
 
   @moduletag :postgres
@@ -126,7 +125,7 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
              [["new"]]
   end
 
-  describe "a read keeps its relation locks to the host's end (R69)" do
+  describe "a read in the host's transaction is the host's statement" do
     setup ctx do
       opts = Keyword.put(ConnectionOptions.options(), :pool_size, 1)
       {:ok, other} = Adapter.connect(opts)
@@ -157,11 +156,7 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
     defp generated(conn, relation) do
       Adapter.execute(conn, "SELECT id FROM #{relation}", [],
         selecto_read: true,
-        selecto_generated: true,
-        selecto_qualified_relations: %{
-          SelectoDBPostgreSQL.RelationPath.path_key() => ["public"],
-          relation => ~s("public"."#{relation}")
-        }
+        selecto_generated: true
       )
     end
 
@@ -193,7 +188,7 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       end
     end
 
-    test "the plan decides, not the words", ctx do
+    test "hand-built text refuses by its words; row locks, quoted names and literals run", ctx do
       words = "selecto_host_words_#{System.unique_integer([:positive])}"
 
       sql!(
@@ -203,28 +198,43 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
 
       try do
         for sql <- [
-              "SELECT update FROM public.#{words}",
               ~s|SELECT "delete" FROM public.#{words}|,
-              "SELECT id AS merge FROM public.#{words}",
-              "SELECT id FROM public.#{words} WHERE 'x\nModifyTable' <> ''"
+              "SELECT id FROM public.#{words} WHERE 'x delete' <> ''",
+              "SELECT id FROM public.#{words} /* insert */ FOR UPDATE",
+              "SELECT id FROM public.#{words} FOR NO KEY UPDATE",
+              "EXPLAIN DELETE FROM public.#{words}"
             ] do
           {:ok, blocked?} =
             Postgrex.transaction(ctx.connection, fn conn ->
-              assert {:ok, _} = Adapter.execute(conn, sql, [], selecto_read: true)
+              assert {:ok, _} = Adapter.execute(conn, sql, [], selecto_read: true), sql
               ddl_blocked?(ctx.other, words)
             end)
 
           assert blocked?, sql
+        end
+
+        # The check reads words, not meaning: a column named like a write refuses.
+        for sql <- [
+              "SELECT update FROM public.#{words}",
+              "SELECT id AS merge FROM public.#{words}",
+              "SELECT * INTO TEMP selecto_into FROM public.#{words}",
+              "EXPLAIN ANALYZE DELETE FROM public.#{words}"
+            ] do
+          Postgrex.transaction(ctx.connection, fn conn ->
+            assert {:error, %{details: %{reason: :hand_built_in_host_transaction}}} =
+                     Adapter.execute(conn, sql, [], selecto_read: true),
+                   sql
+          end)
         end
       after
         sql!(ctx.other, "DROP TABLE public.#{words}")
       end
     end
 
-    test "text that writes is not planned for a write lock, and refuses", ctx do
+    test "text that writes refuses before anything is sent", ctx do
       {:ok, locks} =
         Postgrex.transaction(ctx.connection, fn conn ->
-          assert {:error, %{details: %{reason: :read_only_read}}} =
+          assert {:error, %{details: %{reason: :hand_built_in_host_transaction}}} =
                    Adapter.execute(
                      conn,
                      "WITH d AS (DELETE FROM public.#{ctx.table} RETURNING id) SELECT * FROM d",
@@ -240,38 +250,52 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
         end)
 
       assert locks == []
+
+      # Outside a transaction the same text runs READ ONLY, which refuses it.
+      assert {:error, %{details: %{reason: :read_only_read}}} =
+               Adapter.execute(
+                 ctx.connection,
+                 "WITH d AS (DELETE FROM public.#{ctx.table} RETURNING id) SELECT * FROM d",
+                 [],
+                 selecto_read: true
+               )
     end
 
-    test "a relation that cannot be read leaves the host's transaction alive", ctx do
-      {:ok, rows} =
+    test "a read that fails leaves the host's transaction for the host to end", ctx do
+      {:error, :rollback} =
         Postgrex.transaction(ctx.connection, fn conn ->
           assert {:error, %Postgrex.Error{postgres: %{code: :undefined_table}}} =
                    Adapter.execute(conn, "SELECT 1 FROM public.selecto_no_such", [],
                      selecto_read: true
                    )
 
-          Postgrex.query!(conn, "SELECT 1", []).rows
+          assert DBConnection.status(conn) == :error
+
+          assert {:error, %Postgrex.Error{postgres: %{code: :in_failed_sql_transaction}}} =
+                   Postgrex.query(conn, "SELECT 1", [])
+
+          Postgrex.rollback(conn, :rollback)
         end)
 
-      assert rows == [[1]]
+      assert sql!(ctx.connection, "SELECT 1") == [[1]]
     end
 
-    test "a lock timeout taking them stands, and the host's transaction lives", ctx do
+    test "a lock timeout stands, and the host's transaction is the host's to end", ctx do
       sql!(ctx.other, "BEGIN")
       sql!(ctx.other, "LOCK TABLE public.#{ctx.table} IN ACCESS EXCLUSIVE MODE")
 
-      {:ok, rows} =
+      {:error, :rollback} =
         Postgrex.transaction(ctx.connection, fn conn ->
           Postgrex.query!(conn, "SET LOCAL lock_timeout = '100ms'", [])
 
           assert {:error, %Postgrex.Error{postgres: %{code: :lock_not_available}}} =
                    generated(conn, ctx.table)
 
-          Postgrex.query!(conn, "SELECT 1", []).rows
+          Postgrex.rollback(conn, :rollback)
         end)
 
       sql!(ctx.other, "ROLLBACK")
-      assert rows == [[1]]
+      assert sql!(ctx.connection, "SELECT 1") == [[1]]
     end
   end
 
@@ -310,20 +334,38 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       ).rows
     end
 
-    test "Postgrex.transaction: the host's work and settings survive", ctx do
+    test "Postgrex.transaction: the read times out, the transaction is the host's", ctx do
       c = ctx.connection
       native = session(c)
 
-      assert {:ok, :done} =
+      assert {:error, :rollback} =
                Postgrex.transaction(c, fn t ->
                  Postgrex.query!(t, "INSERT INTO public.#{ctx.table} VALUES (7, 't1', 'a')", [])
                  timed_out(t, ctx.slow)
-                 assert session(t) == native
-                 Postgrex.query!(t, "INSERT INTO public.#{ctx.table} VALUES (8, 't1', 'b')", [])
-                 :done
+                 assert DBConnection.status(t) == :error
+                 Postgrex.rollback(t, :rollback)
                end)
 
-      assert sql!(c, "SELECT count(*) FROM public.#{ctx.table} WHERE id IN (7, 8)") == [[2]]
+      assert session(c) == native
+      assert sql!(c, "SELECT count(*) FROM public.#{ctx.table} WHERE id = 7") == [[0]]
+    end
+
+    test "a read that finishes puts the host's statement_timeout back", ctx do
+      assert {:ok, :done} =
+               Postgrex.transaction(ctx.connection, fn t ->
+                 Postgrex.query!(t, "SET LOCAL statement_timeout = '45s'", [])
+
+                 assert {:ok, %{rows: [_, _]}} =
+                          Adapter.execute(t, "SELECT id FROM public.#{ctx.table}", [],
+                            selecto_read: true,
+                            timeout: 5_000
+                          )
+
+                 assert [["45s"]] =
+                          Postgrex.query!(t, "SELECT current_setting('statement_timeout')", []).rows
+
+                 :done
+               end)
     end
 
     test "Selecto.transaction: the same", ctx do
@@ -346,7 +388,7 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
 
       selecto = Selecto.configure(domain, c, adapter: Adapter, validate: false)
 
-      assert {:ok, _} =
+      assert {:error, _} =
                Selecto.transaction(selecto, fn tx ->
                  conn = Selecto.Runtime.Context.connection(tx)
 
@@ -359,11 +401,11 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
                  assert {:error, %Selecto.Error{type: :timeout_error}} =
                           tx |> Selecto.select(["z"]) |> Selecto.execute(timeout: 60)
 
-                 assert session(conn) == native
-                 {:ok, :done}
+                 {:error, :timed_out}
                end)
 
-      assert sql!(c, "SELECT count(*) FROM public.#{ctx.table} WHERE id = 7") == [[1]]
+      assert session(c) == native
+      assert sql!(c, "SELECT count(*) FROM public.#{ctx.table} WHERE id = 7") == [[0]]
     end
 
     test "an idle DBConnection.run handle stays idle and the pool stays clean", ctx do
@@ -382,45 +424,40 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
     test "a shorter statement_timeout of the host's stands", ctx do
       c = ctx.connection
 
-      assert {:ok, _} =
-               Postgrex.transaction(c, fn t ->
-                 Postgrex.query!(t, "SET LOCAL statement_timeout = 40", [])
+      for opts <- [[], [selecto_generated: true]] do
+        {:error, :rollback} =
+          Postgrex.transaction(c, fn t ->
+            Postgrex.query!(t, "SET LOCAL statement_timeout = 40", [])
 
-                 for opts <- [[], [selecto_generated: true]] do
-                   {micros, result} =
-                     :timer.tc(fn ->
-                       Adapter.execute(
-                         t,
-                         "SELECT z FROM public.#{ctx.slow}",
-                         [],
-                         [
-                           selecto_read: true,
-                           timeout: 5_000,
-                           selecto_qualified_relations: %{
-                             SelectoDBPostgreSQL.RelationPath.path_key() => ["public"]
-                           }
-                         ] ++ opts
-                       )
-                     end)
+            {micros, result} =
+              :timer.tc(fn ->
+                Adapter.execute(
+                  t,
+                  "SELECT z FROM public.#{ctx.slow}",
+                  [],
+                  [
+                    selecto_read: true,
+                    timeout: 5_000
+                  ] ++ opts
+                )
+              end)
 
-                   assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} = result
-                   assert micros < 2_000_000
-                 end
-
-                 assert [["40ms"]] =
-                          Postgrex.query!(t, "SELECT current_setting('statement_timeout')", []).rows
-               end)
+            assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} = result
+            assert micros < 2_000_000
+            Postgrex.rollback(t, :rollback)
+          end)
+      end
     end
 
-    test "a text BEGIN on a pid survives it too", ctx do
+    test "a text BEGIN on a pid stays the host's", ctx do
       c = ctx.connection
       [[backend]] = sql!(c, "SELECT pg_backend_pid()")
       sql!(c, "BEGIN")
       sql!(c, "INSERT INTO public.#{ctx.table} VALUES (7, 't1', 'a')")
       timed_out(c, ctx.slow)
+      sql!(c, "ROLLBACK")
       assert sql!(c, "SELECT pg_backend_pid()") == [[backend]]
-      sql!(c, "COMMIT")
-      assert sql!(c, "SELECT count(*) FROM public.#{ctx.table} WHERE id = 7") == [[1]]
+      assert sql!(c, "SELECT count(*) FROM public.#{ctx.table} WHERE id = 7") == [[0]]
     end
 
     test "the deadline covers planning: a lock wait ends, and the host lives", ctx do
@@ -429,7 +466,7 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       sql!(other, "BEGIN")
       sql!(other, "LOCK TABLE public.#{ctx.table} IN ACCESS EXCLUSIVE MODE")
 
-      assert {:ok, rows} =
+      assert {:error, :rollback} =
                Postgrex.transaction(ctx.connection, fn t ->
                  assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} =
                           Adapter.execute(t, "SELECT id FROM public.#{ctx.table}", [],
@@ -437,15 +474,12 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
                             timeout: 80
                           )
 
-                 assert [["0"]] =
-                          Postgrex.query!(t, "SELECT current_setting('statement_timeout')", []).rows
-
-                 Postgrex.query!(t, "SELECT 1", []).rows
+                 Postgrex.rollback(t, :rollback)
                end)
 
       sql!(other, "ROLLBACK")
       GenServer.stop(other)
-      assert rows == [[1]]
+      assert sql!(ctx.connection, "SELECT 1") == [[1]]
     end
   end
 
@@ -536,42 +570,8 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       assert Enum.sort(rows) == [[1], [2]]
     end
 
-    test "a generated read keeps its pin and guards", ctx do
-      c = ctx.connection
-      sql!(c, "SET search_path = #{ctx.schema}, public")
-
-      domain = %{
-        name: "D",
-        source: %{
-          source_table: ctx.table,
-          primary_key: :id,
-          fields: [:id],
-          redact_fields: [],
-          columns: %{id: %{type: :integer}},
-          associations: %{}
-        },
-        schemas: %{},
-        joins: %{}
-      }
-
-      read = fn filters ->
-        domain
-        |> Selecto.configure(c, adapter: Adapter, validate: false)
-        |> Selecto.select(["id"])
-        |> then(&Enum.reduce(filters, &1, fn f, q -> Selecto.filter(q, f) end))
-        |> Selecto.execute()
-      end
-
-      assert {:error, %{details: %{reason: :relation_ambiguous}}} = read.([])
-
-      # A host fragment does not make the statement the host's (R71).
-      assert {:error, %{details: %{reason: :relation_ambiguous}}} =
-               read.([{:raw_sql_filter, "selecto_root.id > 0"}])
-
-      sql!(c, "SET search_path TO DEFAULT")
-    end
-
-    test "a statement carrying a host fragment keeps its relation, pin and tenant scope", ctx do
+    test "a statement carrying a host fragment keeps its declared relation and tenant scope",
+         ctx do
       c = ctx.connection
 
       domain = %{
@@ -601,9 +601,9 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
 
       sql!(c, "SET search_path = #{ctx.schema}, public")
 
-      # Declared public.table, not the namesake the host's path finds first, and
-      # the fragment runs under the pin: public.who(), verbatim.
-      assert {:ok, {[[1, "public"], [2, "public"]], _, _}} = read.({:raw_sql, "who() AS w"})
+      # Declared public.table, not the namesake the host's path finds first; the
+      # fragment runs verbatim and resolves as the host's own SQL does.
+      assert {:ok, {[[1, "app"], [2, "app"]], _, _}} = read.({:raw_sql, "who() AS w"})
       sql!(c, "SET search_path TO DEFAULT")
 
       # A host TEMP namesake does not capture it either.
@@ -630,8 +630,7 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
   end
 
   test "a hand-built control mark carries no statement", ctx do
-    forged = %SessionGuard.Control{sql: "COMMIT; DELETE FROM public.#{ctx.table}"}
-    assert SessionGuard.control_sql(forged) == nil
+    forged = %Adapter.Control{sql: "COMMIT; DELETE FROM public.#{ctx.table}"}
 
     # Neither a struct by hand nor the old tuple reaches the simple protocol.
     for query <- [forged, {:selecto_control, "COMMIT"}], opts <- [[], [selecto_read: true]] do
@@ -764,15 +763,6 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       assert {:ok, %{affected_rows: 1}} = enc_write(c, ctx.enc, "w")
       sql!(c, "SELECT pg_catalog.set_config('client_encoding', 'UTF8', false)")
     end
-
-    test "a plant setting it during a write refuses, and the write rolls back", ctx do
-      c = ctx.connection
-      assert {:error, %{details: %{reason: :client_encoding}}} = enc_write(c, ctx.enc, "plant")
-
-      # The rollback took the setting with it.
-      assert sql!(c, "SELECT pg_catalog.current_setting('client_encoding')") == [["UTF8"]]
-      assert notes(c, ctx.enc) == [["mine"], ["SECRET"]]
-    end
   end
 
   describe "CTE names (H1)" do
@@ -841,28 +831,6 @@ defmodule SelectoDBPostgreSQL.HostTransactionIntegrationTest do
       sql = "WITH a AS (SELECT 1) UNKNOWN, #{r} AS (SELECT 'CTE' AS v) SELECT v FROM #{r}"
       assert {:error, _} = Adapter.execute(ctx.connection, sql, [], selecto_read: true)
     end
-  end
-
-  test "a connection error while preparing a read stays an error, not a raise", ctx do
-    pid = spawn(fn -> :ok end)
-    Process.sleep(10)
-
-    domain = %{
-      name: "H",
-      source: %{
-        source_table: "h",
-        primary_key: :id,
-        fields: [:id],
-        redact_fields: [],
-        columns: %{id: %{type: :integer}},
-        associations: %{}
-      },
-      schemas: %{},
-      joins: %{}
-    }
-
-    selecto = Selecto.configure(domain, ctx.connection, adapter: Adapter, validate: false)
-    assert {:error, _} = Adapter.prepare_read(selecto, {:pool, %{pool: pid}})
   end
 
   test "a string literal cast to integer converts on the server, as natively", ctx do

@@ -1,4 +1,4 @@
-defmodule SelectoDBPostgreSQL.RelationPath.Scanner do
+defmodule SelectoDBPostgreSQL.DeclaredSchema.Scanner do
   @moduledoc false
 
   # Relation positions of a statement (R42): every item of a FROM list

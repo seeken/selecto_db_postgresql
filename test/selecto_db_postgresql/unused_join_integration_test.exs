@@ -106,19 +106,13 @@ defmodule SelectoDBPostgreSQL.UnusedJoinIntegrationTest do
     assert outcome(filtered) == [[1]]
   end
 
-  test "a used join still resolves: its missing table refuses typed", ctx do
+  test "a used join still reads its table: a missing one is the server's error", ctx do
     for query <- [
           Selecto.select(q(ctx), ["id", "allocations.id"]),
           q(ctx) |> Selecto.select(["id"]) |> Selecto.filter({"allocations.line_id", 1})
         ] do
-      assert {:relation_unresolved, relations} = outcome(query)
-      assert Enum.any?(relations, &String.ends_with?(&1, "line_allocations"))
+      assert {:error, %Selecto.Error{details: %{sqlstate: "42P01"}}} = Selecto.execute(query)
     end
-
-    assert {:relation_unresolved, relations} =
-             outcome(Selecto.select(q(ctx), ["id", "notes.order_id"]))
-
-    assert Enum.any?(relations, &String.ends_with?(&1, "line_notes"))
 
     {:ok, _} =
       Adapter.execute(

@@ -282,7 +282,7 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
     |> Map.put(:joins, %{prod: %{type: :left, name: "prod"}})
   end
 
-  test "only an undeclared root reads a list of its name; joined and declared tables stay tables",
+  test "a joined or declared table named like a CTE of the statement refuses",
        ctx do
     # A joined schema over table p, and a CTE named p: refused.
     joined =
@@ -316,12 +316,6 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
       |> Selecto.select(["name"])
 
     assert refusal(nested) == {:cte_name_collision, [ctx.t.p]}
-
-    # An undeclared root named like its own CTE.
-    undeclared = q(ctx, p(ctx)) |> fake_p(ctx) |> Selecto.select(["name"])
-    # On PostgreSQL the table p is on the search_path: which one was meant
-    # cannot be told, so it refuses.
-    assert refusal(undeclared) == {:cte_name_collision, [ctx.t.p]}
   end
 
   defp tier(query, condition),
@@ -441,14 +435,6 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
 
       assert refusal(query) == {:cte_name_collision, [ctx.t.p]}, text
     end
-
-    two = "x13 AS (SELECT 1 AS v), #{ctx.t.r} AS (#{raw_r(ctx)})"
-
-    rooted =
-      q(ctx, r(ctx)) |> Selecto.with_ctes([{:raw_cte, two, []}]) |> Selecto.select(["title"])
-
-    # On PostgreSQL the table r is on the search_path: refused.
-    assert refusal(rooted) == {:cte_name_collision, [ctx.t.r]}
 
     unreadable = q(ctx, p(ctx)) |> Selecto.with_ctes([{:raw_cte, "SELECT 1", []}])
 
@@ -634,39 +620,6 @@ defmodule SelectoDBPostgreSQL.NameRuleIntegrationTest do
         |> Selecto.select(["name"])
 
       assert refusal(query) == {:cte_name_collision, [ctx.t.r]}, inspect(text)
-    end
-  end
-
-  test "a list root a quoted relation of its exact name answers to refuses", ctx do
-    table = "NrK#{System.unique_integer([:positive])}"
-
-    {:ok, _} =
-      Adapter.execute(
-        ctx.conn,
-        ~s|CREATE TABLE public."#{table}" (id INT PRIMARY KEY, name TEXT, tenant_id INT)|,
-        [],
-        []
-      )
-
-    try do
-      {:ok, _} =
-        Adapter.execute(
-          ctx.conn,
-          ~s|INSERT INTO public."#{table}" VALUES (1, 'TBL-K', 1)|,
-          [],
-          []
-        )
-
-      assert outcome(q(ctx, dom(table, @pf)) |> Selecto.select(["name"])) == [["TBL-K"]]
-
-      listed =
-        q(ctx, dom(table, @pf))
-        |> Selecto.with_values([[5, "V-K", 1]], columns: ["id", "name", "tenant_id"], as: table)
-        |> Selecto.select(["name"])
-
-      assert refusal(listed) == {:cte_name_collision, [table]}
-    after
-      Adapter.execute(ctx.conn, ~s|DROP TABLE IF EXISTS public."#{table}"|, [], [])
     end
   end
 

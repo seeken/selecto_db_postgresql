@@ -98,8 +98,7 @@ defmodule SelectoDBPostgreSQL.ExecuteTimeoutIntegrationTest do
     assert length(rows) == 2000
 
     # The call happened in this process, so no result was copied out of a task.
-    # A Selecto read runs on one connection checked out of `conn`, between
-    # the session checks (SessionGuard).
+    # A Selecto read runs on one connection checked out of `conn`.
     assert [[%DBConnection{}, _sql, _params, opts]] = statement_calls(calls, items)
     assert opts[:timeout] == 15_000
     assert is_integer(opts[:deadline])
