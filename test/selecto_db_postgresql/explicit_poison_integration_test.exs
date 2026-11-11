@@ -1,11 +1,6 @@
 defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
-  # R46 FINAL-2 / R47 / R48 / R49 / R50 live: a role with CREATE on a pinned
-  # schema (public here) plants exact-match operators and functions for every
-  # column type the corpus compares. Each entry of the corpus, the specialised
-  # builders included, runs on a clean database and again under the plants,
-  # and must answer the same: zero hijacks. citext lives in its own schema
-  # and keeps its semantics; a user-defined aggregate or operator planted
-  # beside its members over a domain is never chosen (R50).
+  # Generated and hand-built reads over extension types (citext in its own
+  # schema), domains and literals answer as the same SQL does natively.
   use ExUnit.Case, async: false
 
   alias Selecto.Write.Command
@@ -315,17 +310,11 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     GenServer.stop(c)
   end
 
-  # The qualifier's own route, what Selecto generates: hand-built text runs as
-  # written.
-  defp typed(c, sql, tables \\ ["items"]) do
-    relations =
-      Map.new(tables, &{&1, ~s("public"."#{&1}")})
-      |> Map.put(SelectoDBPostgreSQL.RelationPath.path_key(), ["public", "ext"])
-
+  # What Selecto generates.
+  defp typed(c, sql) do
     Adapter.execute(c, sql, [],
       selecto_read: true,
-      selecto_generated: true,
-      selecto_qualified_relations: relations
+      selecto_generated: true
     )
   end
 
@@ -530,25 +519,6 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
     GenServer.stop(c)
   end
 
-  test "a cancel during a catalog or session read stands as itself (tenth review M3)" do
-    canceled = {:error, %Postgrex.Error{postgres: %{code: :query_canceled, pg_code: "57014"}}}
-    lost = {:error, %DBConnection.ConnectionError{message: "closed"}}
-
-    for failure <- [canceled, lost] do
-      execute = fn _sql, _params -> failure end
-
-      assert SelectoDBPostgreSQL.RelationPath.resolve(execute, ["t"], false) == failure
-      assert SelectoDBPostgreSQL.RelationPath.resolve(execute, ["t"], true) == failure
-      assert SelectoDBPostgreSQL.SessionGuard.pin(execute, "pg_catalog") == failure
-    end
-
-    # Anything else is still the typed refusal.
-    other = fn _sql, _params -> {:error, %Postgrex.Error{postgres: %{code: :undefined_table}}} end
-
-    assert {:error, %{details: %{reason: :relation_unresolved}}} =
-             SelectoDBPostgreSQL.RelationPath.resolve(other, ["t"], false)
-  end
-
   test "a failed RELEASE SAVEPOINT undoes the write (R70)" do
     released = fn sql, answers ->
       if String.starts_with?(sql, "RELEASE"),
@@ -589,11 +559,10 @@ defmodule SelectoDBPostgreSQL.ExplicitPoisonIntegrationTest do
   } do
     {:ok, c} = Adapter.connect(opts)
     sql = "SELECT id FROM public.items WHERE (ci, org) = ('MIXED', 't1') ORDER BY id"
-    relations = %{SelectoDBPostgreSQL.RelationPath.path_key() => ["public", "ext"]}
     read = &Adapter.execute(c, sql, [], [selecto_read: true] ++ &1)
 
     assert {:ok, %{rows: rows}} = Adapter.execute(c, sql, [], [])
-    assert {:ok, %{rows: ^rows}} = read.(selecto_qualified_relations: relations)
+    assert {:ok, %{rows: ^rows}} = read.([])
     assert {:ok, %{rows: ^rows}} = read.(selecto_generated: true)
 
     GenServer.stop(c)

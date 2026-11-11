@@ -107,18 +107,6 @@ defmodule SelectoDBPostgreSQL.ColumnCatalogIntegrationTest do
                Adapter.column_catalog(connection, "#{schema}.#{plain}")
 
       assert {:ok, %{"org_key" => %{type: "text"}}} = Adapter.column_catalog(connection, plain)
-
-      # A temp namesake changes neither the write (qualified to its
-      # resolved schema, R38a) nor the catalog read that must describe it.
-      {:ok, _} =
-        Adapter.execute(connection, "CREATE TEMP TABLE #{plain} (org_key varchar(5))", [], [])
-
-      assert {:ok, %{"org_key" => %{type: "text"}}} = Adapter.column_catalog(connection, plain)
-
-      assert {:ok, %{"org_key" => %{type: "character varying(5)"}}} =
-               Adapter.column_catalog(connection, "pg_temp.#{plain}")
-
-      {:ok, _} = Adapter.execute(connection, "DROP TABLE pg_temp.#{plain}", [], [])
     after
       for sql <- [
             "DROP TABLE IF EXISTS #{quote.(mixed)}",

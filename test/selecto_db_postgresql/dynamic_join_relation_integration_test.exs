@@ -93,18 +93,6 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
   defp rows({:ok, {rows, _columns, _aliases}}), do: rows
   defp rows({:error, error}), do: {:error, error.details[:reason], error.details[:relations]}
 
-  # Only the reviews table differs under the host's path.
-  defp diverging(ctx, fun) do
-    {:ok, _} = Adapter.execute(ctx.connection, "DROP TABLE #{ctx.alt}.#{ctx.products}", [], [])
-    {:ok, _} = Adapter.execute(ctx.connection, "SET search_path TO #{ctx.alt}, public", [], [])
-
-    try do
-      fun.()
-    after
-      {:ok, _} = Adapter.execute(ctx.connection, "SET search_path TO DEFAULT", [], [])
-    end
-  end
-
   test "an ad-hoc join on a public table answers on default settings", ctx do
     assert rows(Selecto.execute(ad_hoc(ctx, products(ctx)))) == [["a", "public"]]
   end
@@ -130,24 +118,8 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
     assert rows(Selecto.execute(ad_hoc(ctx, products(ctx, ctx.alt)))) == [["alt-a", "alt"]]
   end
 
-  test "under a host path that reads another table, an ad-hoc join refuses", ctx do
-    diverging(ctx, fn ->
-      assert {:error, :relation_ambiguous, [reviews]} =
-               rows(Selecto.execute(ad_hoc(ctx, products(ctx))))
-
-      assert reviews == ctx.reviews
-    end)
-  end
-
-  test "a subquery join reads the pinned schema, never the host's", ctx do
+  test "a subquery join reads its table as the host's path resolves it", ctx do
     assert rows(Selecto.execute(subquery_join(ctx))) == [["a", "public"], ["b", nil]]
-
-    diverging(ctx, fn ->
-      assert {:error, :relation_ambiguous, [reviews]} =
-               rows(Selecto.execute(subquery_join(ctx)))
-
-      assert reviews == ctx.reviews
-    end)
   end
 
   defp ad_hoc_and_subquery(ctx, outer_schema, inner_schema) do
@@ -200,8 +172,10 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
   end
 
   test "one name its queries would read in two schemas refuses, whichever declares", ctx do
-    # The compiled SQL names the table once; each query resolves under its own declarations.
-    for {outer, inner} <- [{ctx.alt, "public"}, {nil, ctx.alt}] do
+    # The compiled SQL names the table once; each query resolves under its own
+    # declarations. Declared in one query and not in another, which schema the
+    # undeclared one meant cannot be told without the catalog: refused too.
+    for {outer, inner} <- [{ctx.alt, "public"}, {nil, ctx.alt}, {nil, "public"}] do
       assert {:error, :relation_ambiguous, [reviews]} =
                rows(Selecto.execute(ad_hoc_and_subquery(ctx, outer, inner))),
              inspect({outer, inner})
@@ -209,9 +183,7 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
       assert reviews == ctx.reviews
     end
 
-    # The same schema both ways answers; an undeclared subquery takes its enclosing root's.
-    assert {:ok, _} = Selecto.execute(ad_hoc_and_subquery(ctx, nil, "public"))
-
+    # An undeclared subquery takes its enclosing root's.
     assert rows(Selecto.execute(ad_hoc_and_subquery(ctx, ctx.alt, nil))) ==
              [["alt-a", "alt", "alt"]]
   end
@@ -324,60 +296,6 @@ defmodule SelectoDBPostgreSQL.DynamicJoinRelationIntegrationTest do
              rows(Selecto.execute(cte_reviews(ctx, ctx.reviews)))
 
     assert reviews == ctx.reviews
-
-    diverging(ctx, fn ->
-      for query <- [lateral_reviews(ctx), cte_reviews(ctx, "best")] do
-        assert {:error, :relation_ambiguous, [reviews]} = rows(Selecto.execute(query))
-        assert reviews == ctx.reviews
-      end
-    end)
-  end
-
-  test "a temporary-only table: the refusal names what a host can declare", ctx do
-    temp = "selecto_tmp_#{System.unique_integer([:positive])}"
-
-    for sql <- [
-          "CREATE TEMP TABLE #{temp} (id int, product_id int, rating int, title text)",
-          "INSERT INTO pg_temp.#{temp} VALUES (1, 1, 5, 'temp')"
-        ],
-        do: {:ok, _} = Adapter.execute(ctx.connection, sql, [], [])
-
-    query = ad_hoc(Map.put(ctx, :reviews, temp), products(ctx))
-    assert {:error, error} = Selecto.execute(query)
-    assert error.details.reason == :relation_unresolved
-    assert error.message =~ ~s(source_schema: "pg_temp")
-
-    sub =
-      Selecto.configure(
-        %{reviews(ctx, "pg_temp") | name: temp} |> put_in([:source, :source_table], temp),
-        ctx.connection,
-        adapter: Adapter
-      )
-      |> Selecto.select(["product_id", "title"])
-
-    joined =
-      Selecto.configure(products(ctx), ctx.connection, adapter: Adapter)
-      |> Selecto.DynamicJoin.join_subquery(:best, sub, on: [%{left: "id", right: "product_id"}])
-      |> Selecto.select(["name", "best.title"])
-      |> Selecto.order_by("name")
-
-    assert rows(Selecto.execute(joined)) == [["a", "temp"], ["b", nil]]
-
-    # Undeclared under a root declaring public, it is looked for in public: refused, typed.
-    undeclared =
-      Selecto.configure(put_in(reviews(ctx), [:source, :source_table], temp), ctx.connection,
-        adapter: Adapter
-      )
-      |> Selecto.select(["product_id", "title"])
-
-    missing =
-      Selecto.configure(products(ctx, "public"), ctx.connection, adapter: Adapter)
-      |> Selecto.DynamicJoin.join_subquery(:best, undeclared,
-        on: [%{left: "id", right: "product_id"}]
-      )
-      |> Selecto.select(["name", "best.title"])
-
-    assert {:error, :relation_unresolved, [_temp]} = rows(Selecto.execute(missing))
   end
 
   defp reviews_to_products(ctx, schema) do

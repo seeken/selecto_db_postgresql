@@ -3,7 +3,6 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
   # facts, derived outputs, deferrable triggers and read-only reads.
   use ExUnit.Case, async: false
 
-  alias Selecto.Write.Command
   alias SelectoDBPostgreSQL.Adapter
 
   @moduletag :postgres
@@ -38,14 +37,10 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
   end
 
   defp guarded(c, sql, params \\ []) do
-    # The qualifier's own route: what Selecto generates. Hand-built text
-    # refuses the forms these tests prove (the hand-built tests elsewhere).
-    relations = %{SelectoDBPostgreSQL.RelationPath.path_key() => ["public"]}
-
+    # What Selecto generates.
     case Adapter.execute(c, sql, params,
            selecto_read: true,
-           selecto_generated: true,
-           selecto_qualified_relations: relations
+           selecto_generated: true
          ) do
       {:ok, %{rows: rows}} -> rows
       {:error, %{details: %{reason: reason}}} -> {:refused, reason}
@@ -121,7 +116,7 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
     )
   end
 
-  test "another session's deferrable trigger never refuses a read or a stream; writes keep R23" do
+  test "another session's deferrable trigger never refuses a read or a stream" do
     trigger =
       "CREATE CONSTRAINT TRIGGER r61 AFTER UPDATE ON other DEFERRABLE INITIALLY DEFERRED " <>
         "FOR EACH ROW EXECUTE FUNCTION tg()"
@@ -180,21 +175,9 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
 
         assert seen == 5
 
-        # With the trigger committed: reads stand, writes refuse.
+        # With the trigger committed, reads stand.
         assert {:ok, %{rows: [[5]]}} =
                  Adapter.execute(c, "SELECT count(*) FROM public.r", [], selecto_read: true)
-
-        {:ok, command} =
-          Command.new(%{
-            operation: :update,
-            relation: "r",
-            predicate: {:eq, {:field, "id"}, {:literal, 1}},
-            assignments: [%{field: "note", value: {:literal, "x"}}],
-            expected_cardinality: :many
-          })
-
-        assert {:error, %{details: %{reason: :deferred_triggers}}} =
-                 Adapter.execute_write_unsafe(c, command, [])
       end
     )
   end
@@ -236,9 +219,10 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
                  )
       end
 
-      # In a host transaction too, which stays writable afterwards.
+      # In a host transaction the read is the host's own statement: what the
+      # function writes belongs to that transaction, which stays writable.
       Postgrex.transaction(c, fn conn ->
-        assert {:error, _} = read.(conn)
+        assert {:ok, %{rows: [[1]]}} = read.(conn)
 
         assert {:ok, %{num_rows: 1}} =
                  Postgrex.query(conn, "UPDATE #{schema}.ro SET note = 'host'", [])
@@ -256,10 +240,7 @@ defmodule SelectoDBPostgreSQL.ExtensionOperatorIntegrationTest do
       assert {:ok, %{rows: [[1]]}} =
                Adapter.execute(c, "SELECT id FROM #{schema}.ro FOR SHARE", [],
                  selecto_read: true,
-                 selecto_generated: true,
-                 selecto_qualified_relations: %{
-                   SelectoDBPostgreSQL.RelationPath.path_key() => ["public"]
-                 }
+                 selecto_generated: true
                )
 
       # Hand-built text always is read-only: only that stops it writing.

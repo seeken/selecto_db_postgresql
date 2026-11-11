@@ -374,12 +374,9 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
 
   defp compile_field_value(_field, value, opts, offset), do: compile_value(value, opts, offset)
 
-  defp uuid_column?(field, opts) do
-    match?(
-      {_schema, "pg_catalog.uuid"},
-      opts |> Keyword.get(:operator_types, %{}) |> Map.get(to_string(field))
-    )
-  end
+  # The written relation's uuid columns, a domain over uuid included (the
+  # adapter reads them before the command).
+  defp uuid_column?(field, opts), do: to_string(field) in Keyword.get(opts, :uuid_columns, [])
 
   @uuid ~r/\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/
 
