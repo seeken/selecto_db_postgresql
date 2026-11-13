@@ -8,10 +8,52 @@ defmodule SelectoDBPostgreSQL.DialectTest do
   alias Selecto.Dialect.Json.Operation, as: JsonOperation
   alias Selecto.Dialect.Predicate.Comparison
   alias Selecto.Dialect.Text.Normalization, as: TextNormalization
+  alias Selecto.Dialect.TableFunction.Join, as: TableFunctionJoin
   alias Selecto.Dialect.View.{Definition, Index, Refresh}
   alias SelectoDBPostgreSQL.Dialect
 
   defp sql(iodata), do: IO.iodata_to_binary(iodata)
+
+  test "table functions declare the value column addressed by unnest selections" do
+    join = %TableFunctionJoin{
+      join_type: :cross,
+      source_sql: ~s|UNNEST("selecto_root"."tags")|,
+      alias: "product_tag",
+      source_kind: :table_function
+    }
+
+    assert {:ok, rendered} = Dialect.render_table_function_join(join, %{})
+
+    assert sql(rendered) ==
+             ~s|CROSS JOIN LATERAL UNNEST("selecto_root"."tags") AS product_tag(value)|
+  end
+
+  test "lateral subqueries retain their published output column names" do
+    join = %TableFunctionJoin{
+      join_type: :left,
+      source_sql: "(SELECT count(*) AS total)",
+      alias: "counts",
+      source_kind: :subquery
+    }
+
+    assert {:ok, rendered} = Dialect.render_table_function_join(join, %{})
+    assert sql(rendered) == "LEFT JOIN LATERAL (SELECT count(*) AS total) AS counts ON true"
+  end
+
+  test "table functions with ordinality declare both value and position" do
+    join = %TableFunctionJoin{
+      join_type: :cross,
+      source_sql: ~s|UNNEST("selecto_root"."tags")|,
+      alias: "product_tag",
+      ordinality_alias: "position",
+      source_kind: :table_function
+    }
+
+    assert {:ok, rendered} = Dialect.render_table_function_join(join, %{})
+
+    assert sql(rendered) ==
+             ~s|CROSS JOIN LATERAL UNNEST("selecto_root"."tags") WITH ORDINALITY AS product_tag(value, position)|
+  end
 
   test "collection aggregates are rendered entirely by the PostgreSQL dialect" do
     fragment = %CollectionOperation{
