@@ -48,6 +48,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
     defstruct [:sql]
   end
 
+  defmodule ReadOpening do
+    @moduledoc false
+    # Only adapter-owned SQL and an integer deadline, never business text.
+    @enforce_keys [:read_only?, :timeout]
+    defstruct [:read_only?, :timeout]
+  end
+
   @behaviour Selecto.DB.Adapter
   @behaviour Selecto.DB.WriteAdapter
 
@@ -621,6 +628,20 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # server reads in the session's client_encoding: under LATIN1 the tenant café
   # arrives as another tenant's name (R65).
   defp open_read(guard, read_only?, ms) do
+    opening = %ReadOpening{read_only?: read_only?, timeout: ms}
+
+    case guard.(opening, []) do
+      {:ok, %{rows: [[encoding | _]]}} -> utf8(encoding)
+      {:error, _} = error -> error
+      _unreadable -> {:error, read_refusal(session_unreadable())}
+    end
+  end
+
+  # This fixed guard has no host SQL or parameter values. Sending its bounded
+  # integer deadline as a literal lets Postgrex use the simple protocol, rather
+  # than waiting for a Describe reply just to discover that $1 is text.
+  defp read_opening_sql(%ReadOpening{read_only?: read_only?, timeout: ms})
+       when is_boolean(read_only?) and (is_nil(ms) or (is_integer(ms) and ms > 0)) do
     columns =
       [@encoding_column] ++
         if(read_only?,
@@ -628,15 +649,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
             "pg_catalog.set_config('transaction_read_only', 'on', true) AS selecto_guard_read_only"
           ],
           else: []
-        ) ++ if(ms, do: [deadline_sql("$1") <> " AS selecto_guard_deadline"], else: [])
+        ) ++
+        if(ms,
+          do: [deadline_sql("'" <> Integer.to_string(ms) <> "'") <> " AS selecto_guard_deadline"],
+          else: []
+        )
 
-    params = if ms, do: [Integer.to_string(ms)], else: []
-
-    case guard.("SELECT " <> Enum.join(columns, ", "), params) do
-      {:ok, %{rows: [[encoding | _]]}} -> utf8(encoding)
-      {:error, _} = error -> error
-      _unreadable -> {:error, read_refusal(session_unreadable())}
-    end
+    "SELECT " <> Enum.join(columns, ", ")
   end
 
   # In the host's transaction: the encoding check and, with a deadline, the
@@ -2635,6 +2654,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # which would take the adapter's savepoints with it.
   defp execute_ecto_query(repo, query, params, opts \\ [])
 
+  defp execute_ecto_query(repo, %ReadOpening{} = opening, [], opts) do
+    execute_ecto_query(repo, read_opening_sql(opening), [], Keyword.put(opts, :query_type, :text))
+  end
+
   defp execute_ecto_query(repo, %Control{} = control, params, opts) do
     case control_sql(control) do
       nil ->
@@ -2706,6 +2729,15 @@ defmodule SelectoDBPostgreSQL.Adapter do
     :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
+  defp query_postgrex(connection, %ReadOpening{} = opening, [], opts) do
+    run_postgrex(
+      connection,
+      read_opening_sql(opening),
+      [],
+      opts |> unnamed() |> Keyword.put(:query_type, :text)
+    )
+  end
+
   defp query_postgrex(connection, %Control{} = control, [], opts) do
     case control_sql(control) do
       nil ->
@@ -2743,8 +2775,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # and survive ROLLBACK, and Postgrex binds a name without parsing it again,
   # so a named guard, or a named business statement, can be swapped for
   # another under the same name. An unnamed statement is parsed from the text
-  # sent with it. Only the adapter's own transaction statements, marked by
-  # control/1, take the simple protocol.
+  # sent with it. Only adapter-owned transaction controls and ReadOpening's
+  # fixed session guard take the simple protocol.
   def unnamed(opts), do: Keyword.delete(opts, :cache_statement)
 
   # A transaction statement of the adapter's own, marked: only a statement

@@ -47,6 +47,38 @@ defmodule SelectoDBPostgreSQL.ReadSettingsIntegrationTest do
     if Process.alive?(c), do: GenServer.stop(c)
   end
 
+  test "the simple opening preserves read-only mode, the shorter host timeout and UTF8" do
+    {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
+    Process.unlink(c)
+    on_exit(fn -> if Process.alive?(c), do: GenServer.stop(c) end)
+    Postgrex.query!(c, "SET statement_timeout = '400ms'", [])
+
+    assert {:ok, %{rows: [["on", "400ms", "café"]]}} =
+             Adapter.execute(
+               c,
+               "SELECT current_setting('transaction_read_only'), " <>
+                 "current_setting('statement_timeout'), $1::text",
+               ["café"],
+               selecto_read: true,
+               timeout: 5_000
+             )
+
+    assert [["off", "400ms"]] =
+             Postgrex.query!(
+               c,
+               "SELECT current_setting('transaction_read_only'), current_setting('statement_timeout')",
+               []
+             ).rows
+
+    Postgrex.query!(c, "SET client_encoding = 'LATIN1'", [])
+
+    assert {:error, %{details: %{reason: :client_encoding}}} =
+             Adapter.execute(c, "SELECT $1::text", ["café"], selecto_read: true, timeout: 5_000)
+
+    Postgrex.query!(c, "SET client_encoding = 'UTF8'", [])
+    assert Postgrex.query!(c, "SELECT 1", []).rows == [[1]]
+  end
+
   test "a string cast to a number binds as text, for the server to convert" do
     fragment = %Selecto.Dialect.ComputedValue{
       operation: :cast,
