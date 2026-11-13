@@ -876,14 +876,14 @@ defmodule SelectoDBPostgreSQL.Dialect do
     alias_sql = portable_alias(join.alias)
 
     source =
-      case {join.ordinality_alias, join.source_kind} do
-        {nil, :table_function} ->
+      case {join.ordinality_alias, unnest_value_source?(join)} do
+        {nil, true} ->
           [join.source_sql, " AS ", alias_sql, "(", portable_alias("value"), ")"]
 
-        {nil, _source_kind} ->
+        {nil, false} ->
           [join.source_sql, " AS ", alias_sql]
 
-        {ordinality_alias, _source_kind} ->
+        {ordinality_alias, true} ->
           [
             join.source_sql,
             " WITH ORDINALITY AS ",
@@ -894,16 +894,51 @@ defmodule SelectoDBPostgreSQL.Dialect do
             portable_alias(ordinality_alias),
             ")"
           ]
+
+        {_ordinality_alias, false} ->
+          # The public unnest path declares its one value column. Other
+          # functions can return any number of named columns, so a partial
+          # column list cannot safely rename their ordinality column.
+          nil
       end
 
-    case join.join_type do
-      :cross -> {:ok, ["CROSS JOIN LATERAL ", source]}
-      :inner -> {:ok, ["INNER JOIN LATERAL ", source, " ON true"]}
-      :left -> {:ok, ["LEFT JOIN LATERAL ", source, " ON true"]}
-      :right -> {:ok, ["RIGHT JOIN LATERAL ", source, " ON true"]}
-      :full -> {:ok, ["FULL JOIN LATERAL ", source, " ON true"]}
+    case {source, join.join_type} do
+      {nil, _} ->
+        {:error,
+         Selecto.Error.validation_error(
+           "Ordinality aliases require a single-value UNNEST source",
+           %{
+             unsupported_feature: :table_function_ordinality
+           }
+         )}
+
+      {_, :cross} ->
+        {:ok, ["CROSS JOIN LATERAL ", source]}
+
+      {_, :inner} ->
+        {:ok, ["INNER JOIN LATERAL ", source, " ON true"]}
+
+      {_, :left} ->
+        {:ok, ["LEFT JOIN LATERAL ", source, " ON true"]}
+
+      {_, :right} ->
+        {:ok, ["RIGHT JOIN LATERAL ", source, " ON true"]}
+
+      {_, :full} ->
+        {:ok, ["FULL JOIN LATERAL ", source, " ON true"]}
     end
   end
+
+  # Match the adapter's structured collection renderer, rather than every
+  # table function (jsonb_each has key/value; arbitrary UDFs have their own
+  # signatures). Generic or multi-array UNNEST calls retain native names too.
+  defp unnest_value_source?(%TableFunctionJoin{
+         source_kind: :table_function,
+         source_sql: ["UNNEST(", _column, ")", ""]
+       }),
+       do: true
+
+  defp unnest_value_source?(_join), do: false
 
   @impl true
   def render_window_frame_boundary(%FrameBoundary{} = boundary, _selecto) do

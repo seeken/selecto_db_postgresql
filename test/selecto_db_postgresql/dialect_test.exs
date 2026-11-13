@@ -17,7 +17,7 @@ defmodule SelectoDBPostgreSQL.DialectTest do
   test "table functions declare the value column addressed by unnest selections" do
     join = %TableFunctionJoin{
       join_type: :cross,
-      source_sql: ~s|UNNEST("selecto_root"."tags")|,
+      source_sql: ["UNNEST(", ~s|"selecto_root"."tags"|, ")", ""],
       alias: "product_tag",
       source_kind: :table_function
     }
@@ -43,7 +43,7 @@ defmodule SelectoDBPostgreSQL.DialectTest do
   test "table functions with ordinality declare both value and position" do
     join = %TableFunctionJoin{
       join_type: :cross,
-      source_sql: ~s|UNNEST("selecto_root"."tags")|,
+      source_sql: ["UNNEST(", ~s|"selecto_root"."tags"|, ")", ""],
       alias: "product_tag",
       ordinality_alias: "position",
       source_kind: :table_function
@@ -53,6 +53,18 @@ defmodule SelectoDBPostgreSQL.DialectTest do
 
     assert sql(rendered) ==
              ~s|CROSS JOIN LATERAL UNNEST("selecto_root"."tags") WITH ORDINALITY AS product_tag(value, position)|
+  end
+
+  test "an arbitrary function's ordinality cannot guess its output signature" do
+    join = %TableFunctionJoin{
+      join_type: :cross,
+      source_sql: ["JSONB_EACH", "(", "payload", ")"],
+      alias: "items",
+      source_kind: :table_function,
+      ordinality_alias: "position"
+    }
+
+    assert {:error, %Selecto.Error{}} = Dialect.render_table_function_join(join, %{})
   end
 
   test "collection aggregates are rendered entirely by the PostgreSQL dialect" do
