@@ -1,8 +1,8 @@
 CHANGES
 =======
 
-Unreleased
-----------
+V 0.5.0
+-------
 
 - **Guard removal.** Generated SQL resolves as the host's own queries do,
   and a read is a read-only transaction of its own or the host's own
@@ -384,8 +384,8 @@ Unreleased
 - Added governed co-domain lookup support with bound prefix search, allowlisted
   text-search configuration, ranking, and live tenant/segment isolation tests.
 
-V 0.5.0
---------
+0.5.0 baseline
+~~~~~~~~~~~~~~
 
 - Removed renderer aliases for the retired `json_extract_path`,
   `json_extract_path_text`, and `json_insert` core operations.
