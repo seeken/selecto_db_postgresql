@@ -876,11 +876,14 @@ defmodule SelectoDBPostgreSQL.Dialect do
     alias_sql = portable_alias(join.alias)
 
     source =
-      case join.ordinality_alias do
-        nil ->
+      case {join.ordinality_alias, join.source_kind} do
+        {nil, :table_function} ->
+          [join.source_sql, " AS ", alias_sql, "(", portable_alias("value"), ")"]
+
+        {nil, _source_kind} ->
           [join.source_sql, " AS ", alias_sql]
 
-        ordinality_alias ->
+        {ordinality_alias, _source_kind} ->
           [
             join.source_sql,
             " WITH ORDINALITY AS ",
