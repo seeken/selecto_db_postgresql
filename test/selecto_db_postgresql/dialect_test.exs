@@ -255,6 +255,20 @@ defmodule SelectoDBPostgreSQL.DialectTest do
              ~s|TO_CHAR(TO_TIMESTAMP("occurred_at_epoch") AT TIME ZONE 'America/Denver', 'YYYY-MM')|
   end
 
+  test "a TIMESTAMPTZ instant formats as its wall clock in the zone" do
+    fragment = %DateTimeOperation{
+      operation: :format,
+      clause: :select,
+      expression: ~s("placed_at"),
+      options: %{format: "YYYY-MM-DD", timezone: "America/Denver", source_type: :utc_datetime}
+    }
+
+    assert {:ok, rendered} = Dialect.render_datetime_operation(fragment, %{})
+
+    assert sql(rendered) ==
+             ~s|TO_CHAR(("placed_at" AT TIME ZONE 'America/Denver'), 'YYYY-MM-DD')|
+  end
+
   test "PostgreSQL owns text normalization and case-insensitive comparison SQL" do
     normalization = %TextNormalization{
       expression: ~s("title"),
