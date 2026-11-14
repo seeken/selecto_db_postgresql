@@ -265,6 +265,11 @@ defmodule SelectoDBPostgreSQL.Dialect do
           storage when storage in [:unix_seconds, :unix_milliseconds] ->
             [expression, " AT TIME ZONE '", timezone, "'"]
 
+          # A TIMESTAMPTZ value is an instant: its wall clock in the zone,
+          # whatever the session's TimeZone.
+          _ when :erlang.map_get(:source_type, operation.options) in [:utc_datetime, :timestamptz] ->
+            ["(", expression, " AT TIME ZONE '", timezone, "')"]
+
           _ ->
             storage_timezone =
               operation.options
