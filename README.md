@@ -61,8 +61,9 @@ on Selecto's connections. Code a statement reaches (a trigger, a planted
 function) can DEALLOCATE and PREPARE a named statement, in a READ ONLY
 transaction and past a ROLLBACK, and the driver binds the replacement without
 parsing it, so a named guard or business statement could be swapped. The
-`statement_cache` setting is gone. Transaction statements use the simple
-protocol, one round trip; the others take two (Parse/Describe, Bind/Execute).
+`statement_cache` setting is gone. Adapter-owned transaction controls and the
+merged read opening use the simple protocol, one round trip each; business
+statements take two (Parse/Describe, Bind/Execute).
 This works behind a transaction-mode connection pooler.
 
 ### Optional raw jsonb results
@@ -237,9 +238,10 @@ A Selecto read runs on one checked-out connection, and the server's
 transaction status decides its shape (`DBConnection.status/1`, so a
 transaction opened with a raw text `BEGIN` is the host's too):
 
-- **No transaction open:** the read is a transaction of its own: `BEGIN`, one
-  statement that makes it `READ ONLY`, sets the read's `statement_timeout`
-  and checks that `client_encoding` is UTF8, the query, `ROLLBACK`. Nothing
+- **No transaction open:** the read is a transaction of its own: one simple query
+  begins it `READ ONLY`, sets the read's `statement_timeout` and asserts that
+  `client_encoding` is UTF8 using PostgreSQL's standard `plpgsql` language.
+  The business query and `ROLLBACK` follow. Nothing
   it reaches can write and nothing it changes outlasts it: a view using
   `nextval` or an audit function refuses (`query_rule_not_evaluable`,
   `reason: :read_only_read`). A generated read that locks rows (`FOR UPDATE`,
