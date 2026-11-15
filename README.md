@@ -65,6 +65,29 @@ parsing it, so a named guard or business statement could be swapped. The
 protocol, one round trip; the others take two (Parse/Describe, Bind/Execute).
 This works behind a transaction-mode connection pooler.
 
+### Optional raw jsonb results
+
+`Adapter.connect(raw_jsonb: true, ...)` creates a Postgrex connection/pool with
+`SelectoDBPostgreSQL.RawJSONBTypes`. The default is `false`: jsonb objects still
+arrive as maps. With the option enabled, non-NULL jsonb values (including array
+elements) arrive as `Jason.Fragment`, preserving PostgreSQL's JSON text for
+Jason output without decoding into Elixir values. Ordinary `json` is unchanged;
+jsonb parameters are still encoded with Jason and SQL NULL is still `nil`.
+
+This is a connection creation option, not an execution option. On a host-owned
+Postgrex pool or Ecto repository, configure `types:
+SelectoDBPostgreSQL.RawJSONBTypes` before starting it. A host with custom types
+must prepend `SelectoDBPostgreSQL.Extensions.RawJSONB` to its own types module;
+the adapter refuses `raw_jsonb: true` combined with a different `:types` module
+instead of silently replacing the host's codecs.
+
+Enable this only for callers prepared to handle fragments. Code that inspects
+JSON values must decode them (for example, `Jason.decode!(Jason.encode!(value))`).
+`selecto_api`'s canonical host does not accept fragments: it must decode them
+before scalar validation and collection traversal, then use its canonical
+encoder. PostgreSQL JSON text is not canonical response JSON; passing it
+through would change canonical key order, whitespace and number validation.
+
 ## Connected database-function verification
 
 The adapter advertises Selecto's `:function_verification` capability. Given a

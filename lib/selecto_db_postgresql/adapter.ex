@@ -279,8 +279,23 @@ defmodule SelectoDBPostgreSQL.Adapter do
       not read_only_setting_valid?() ->
         {:error, {:invalid_configuration, :read_only_reads}}
 
+      Keyword.get(opts, :raw_jsonb, false) not in [true, false] ->
+        {:error, {:invalid_connection_options, :raw_jsonb}}
+
+      Keyword.get(opts, :raw_jsonb, false) and
+          Keyword.get(opts, :types, SelectoDBPostgreSQL.RawJSONBTypes) !=
+            SelectoDBPostgreSQL.RawJSONBTypes ->
+        {:error, {:invalid_connection_options, :raw_jsonb_types_conflict}}
+
       true ->
         warn_statement_cache()
+        {raw_jsonb?, opts} = Keyword.pop(opts, :raw_jsonb, false)
+
+        opts =
+          if raw_jsonb?,
+            do: Keyword.put(opts, :types, SelectoDBPostgreSQL.RawJSONBTypes),
+            else: opts
+
         connect_postgrex(opts)
     end
   end
