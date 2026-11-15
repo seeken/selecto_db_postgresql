@@ -36,7 +36,7 @@ defmodule SelectoDBPostgreSQL.MixProject do
   defp deps do
     [
       selecto_dep(),
-      {:postgrex, ">= 0.0.0"},
+      {:postgrex, "~> 0.22.0"},
       {:ecto_sql, "~> 3.13", optional: true},
       {:benchee, "~> 1.5", only: [:dev, :test], optional: true},
       {:benchee_html, "~> 1.0", only: [:dev, :test], optional: true},

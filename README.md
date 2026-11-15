@@ -16,6 +16,9 @@ def deps do
 end
 ```
 
+Postgrex 0.22.x is the supported driver series; the lockfile and PostgreSQL
+matrix use 0.22.4.
+
 ## Verification
 
 Run the package tests and the deterministic bounded adapter-safety model with:
