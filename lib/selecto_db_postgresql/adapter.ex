@@ -12,8 +12,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   ## Reads
 
   With no transaction open a Selecto read is a transaction of its own:
-  `BEGIN`, one statement that makes it `READ ONLY` (unless it locks rows),
-  sets the read's `statement_timeout` and checks `client_encoding` is UTF8,
+  one simple query that begins it `READ ONLY` (unless it locks rows),
+  sets the read's `statement_timeout` and asserts `client_encoding` is UTF8,
   the query, `ROLLBACK`. Inside the host's transaction (`DBConnection.status/1`,
   so a raw `BEGIN` is the host's) it is the host's own statement, with its
   `statement_timeout` set before it and put back after it; a read that fails
@@ -423,8 +423,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # runs on one checked-out connection. The server's transaction status decides
   # its shape (DBConnection.status/1, so a raw BEGIN is the host's too):
   #
-  # - idle: BEGIN, one statement that makes the transaction READ ONLY, sets the
-  #   read's statement_timeout and checks client_encoding, the query, ROLLBACK;
+  # - idle: one simple query begins the transaction READ ONLY, sets the read's
+  #   statement_timeout and asserts client_encoding, then the query, ROLLBACK;
   # - in the host's transaction: the query as the host's own statement, with its
   #   statement_timeout set before it and the prior value put back after it.
   #
@@ -439,7 +439,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       DBConnection.status(connection) == :transaction,
       query,
       params,
-      Map.put(read_plan(opts), :close, fn -> close_connection(connection) end)
+      connection_plan(read_plan(opts), connection)
     )
   end
 
@@ -511,7 +511,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
           in_transaction?,
           query,
           params,
-          Map.put(read_plan(opts), :close, fn -> close_connection(checked_out) end)
+          connection_plan(read_plan(opts), checked_out)
         )
       end,
       client_cut(opts)
@@ -547,6 +547,16 @@ defmodule SelectoDBPostgreSQL.Adapter do
     :ok
   end
 
+  defp connection_plan(plan, %DBConnection{} = connection) do
+    Map.merge(plan, %{
+      status: fn -> DBConnection.status(connection) end,
+      close: fn -> close_connection(connection) end
+    })
+  end
+
+  # Unknown status is conservative: an opening may already have run BEGIN.
+  defp connection_plan(plan, nil), do: plan
+
   defp guarded_ecto_read(repo, query, params, opts) do
     {_checked_out?, repo_timeout} = ecto_execution_context(repo)
 
@@ -569,7 +579,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
           in_transaction?,
           query,
           params,
-          read_plan(opts)
+          connection_plan(read_plan(opts), ecto_connection(repo))
         )
       end,
       # A checked-out connection runs under its checkout's deadline.
@@ -600,20 +610,40 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp run_guarded_read(execute, guard, false, query, params, plan) do
     read_only? = plan.kind != :generated or read_only?(query)
 
-    with {:ok, ms} <- remaining(plan),
-         {:ok, _} <- guard.(control("BEGIN"), []) do
+    with {:ok, ms} <- remaining(plan) do
       result =
-        with :ok <- open_read(guard, read_only?, ms) do
-          read_result(execute.(plan.prefix <> text(query), params))
+        try do
+          with :ok <- open_read(guard, read_only?, ms) do
+            read_result(execute.(plan.prefix <> text(query), params))
+          end
+        rescue
+          exception ->
+            undo_read(guard, plan)
+            reraise exception, __STACKTRACE__
+        catch
+          kind, reason ->
+            undo_read(guard, plan)
+            :erlang.raise(kind, reason, __STACKTRACE__)
         end
 
+      case undo_read(guard, plan) do
+        :ok -> result
+        failure -> if match?({:ok, _}, result), do: failure, else: result
+      end
+    end
+  end
+
+  defp undo_read(guard, plan) do
+    if Map.get(plan, :status, fn -> :unknown end).() == :idle do
+      :ok
+    else
       case guard.(control("ROLLBACK"), []) do
         {:ok, _} ->
-          result
+          :ok
 
         {:error, _} = failure ->
           Map.get(plan, :close, fn -> :ok end).()
-          if match?({:ok, _}, result), do: failure, else: result
+          failure
       end
     end
   end
@@ -622,18 +652,26 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @encoding_column "CAST(pg_catalog.pg_client_encoding() AS pg_catalog.text) AS selecto_guard_encoding"
 
-  # The one statement after BEGIN: READ ONLY, the read's statement_timeout, and
-  # client_encoding by its canonical name (the setting keeps a spelling like
-  # UNICODE, which is UTF8). Postgrex sends parameters as UTF-8 bytes, which the
-  # server reads in the session's client_encoding: under LATIN1 the tenant café
-  # arrives as another tenant's name (R65).
+  @encoding_marker "selecto_guard_client_encoding_not_utf8"
+
+  # Postgrex returns only the first simple-query result, but propagates errors
+  # from every statement. The server must assert the canonical encoding (R65),
+  # rather than return an encoding row which the driver would discard.
   defp open_read(guard, read_only?, ms) do
     opening = %ReadOpening{read_only?: read_only?, timeout: ms}
 
     case guard.(opening, []) do
-      {:ok, %{rows: [[encoding | _]]}} -> utf8(encoding)
-      {:error, _} = error -> error
-      _unreadable -> {:error, read_refusal(session_unreadable())}
+      {:ok, _} ->
+        :ok
+
+      {:error, %Postgrex.Error{postgres: %{pg_code: "P0001", message: @encoding_marker}}} ->
+        utf8(:refused)
+
+      {:error, _} = error ->
+        error
+
+      _unreadable ->
+        {:error, read_refusal(session_unreadable())}
     end
   end
 
@@ -642,20 +680,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # than waiting for a Describe reply just to discover that $1 is text.
   defp read_opening_sql(%ReadOpening{read_only?: read_only?, timeout: ms})
        when is_boolean(read_only?) and (is_nil(ms) or (is_integer(ms) and ms > 0)) do
-    columns =
-      [@encoding_column] ++
-        if(read_only?,
-          do: [
-            "pg_catalog.set_config('transaction_read_only', 'on', true) AS selecto_guard_read_only"
-          ],
-          else: []
-        ) ++
-        if(ms,
-          do: [deadline_sql("'" <> Integer.to_string(ms) <> "'") <> " AS selecto_guard_deadline"],
-          else: []
-        )
+    begin = if read_only?, do: "BEGIN READ ONLY; ", else: "BEGIN; "
 
-    "SELECT " <> Enum.join(columns, ", ")
+    deadline =
+      if ms,
+        do:
+          "SELECT " <>
+            deadline_sql("'" <> Integer.to_string(ms) <> "'") <>
+            " AS selecto_guard_deadline; ",
+        else: ""
+
+    begin <>
+      deadline <>
+      "DO $selecto_guard$ BEGIN " <>
+      "IF pg_catalog.pg_client_encoding() OPERATOR(pg_catalog.<>) 'UTF8' THEN " <>
+      "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = '#{@encoding_marker}'; " <>
+      "END IF; END $selecto_guard$ LANGUAGE plpgsql"
   end
 
   # In the host's transaction: the encoding check and, with a deadline, the
