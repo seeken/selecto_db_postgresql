@@ -3814,8 +3814,35 @@ defmodule SelectoDBPostgreSQL.Adapter do
     Selecto.Telemetry.span_for(
       [:selecto_db_postgresql, :telemetry, :transaction],
       %{adapter: :postgresql},
-      fn -> do_postgres_transaction(connection, opts, fun) end
+      fn ->
+        if is_nil(Keyword.get(opts, :committed_effect_sink)),
+          do: do_postgres_transaction(connection, opts, fun),
+          else: driver_postgres_transaction(connection, opts, fun)
+      end
     )
+  end
+
+  # A sink receives a public transaction handle and can nest the driver's
+  # transaction API. Keep DBConnection's transaction-mode bookkeeping for that
+  # callback; a raw BEGIN handle would disconnect on a nested transaction.
+  defp driver_postgres_transaction(connection, opts, fun) do
+    Postgrex.transaction(
+      connection,
+      fn transaction_connection ->
+        Postgrex.query!(transaction_connection, @read_committed, [])
+
+        case fun.(transaction_connection) do
+          {:ok, results} -> results
+          {:error, error} -> Postgrex.rollback(transaction_connection, error)
+        end
+      end,
+      opts
+    )
+  rescue
+    exception ->
+      {:error, {:transaction_exception, exception.__struct__, Exception.message(exception)}}
+  catch
+    :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
   # Postgrex.transaction/3 hardcodes bare BEGIN. These controls stay on the

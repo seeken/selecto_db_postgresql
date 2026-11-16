@@ -298,7 +298,9 @@ UUID codecs, including domains over UUID, without a facts query or a schema
 cache. SET/RESET, rollback, DISCARD ALL and DDL are observed on the next
 command. The custom module/Ecto execution path retains its facts query and
 isolation setup because that API does not expose the checked-out Postgrex
-handle here. Generated write SQL names
+handle here. A configured committed-effect sink also retains Postgrex's
+transaction API and separate isolation SET, so the supplied public transaction
+handle supports nested driver transactions. Generated write SQL names
 its operators and functions plainly and its relation as the command names
 it. The statement returns its scope decision in RETURNING; no separate
 catalog or physical-identity recheck runs.

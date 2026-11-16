@@ -149,6 +149,37 @@ defmodule SelectoDBPostgreSQL.WriteRollbackIntegrationTest do
              )
   end
 
+  test "a committed-effect sink can use the driver's nested transaction API", %{
+    connection: connection
+  } do
+    sink = fn transaction_connection, _result, _context ->
+      assert {:ok, :effect} =
+               Postgrex.transaction(transaction_connection, fn nested ->
+                 Postgrex.query!(
+                   nested,
+                   "INSERT INTO selecto_committed_effects (item_id, state) VALUES (1, 'nested')",
+                   []
+                 )
+
+                 :effect
+               end)
+
+      :ok
+    end
+
+    assert {:ok, %{affected_rows: 1}} =
+             Adapter.execute_write_unsafe(connection, update_state_command!("archived"),
+               committed_effect_sink: sink
+             )
+
+    assert %{rows: [[1, "nested"]]} =
+             Postgrex.query!(
+               connection,
+               "SELECT item_id, state FROM selecto_committed_effects",
+               []
+             )
+  end
+
   test "capability discovery reuses an already checked-out transaction connection", %{
     connection: connection
   } do
