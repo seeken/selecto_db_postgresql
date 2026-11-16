@@ -11,10 +11,9 @@ defmodule SelectoDBPostgreSQL.ExplicitOperatorIntegrationTest do
 
   defp exec!(c, sql), do: {:ok, _} = Adapter.execute(c, sql, [], [])
 
-  # R48: Selecto's own guard SQL names its operators with exact-signature
-  # casts: an always-zero &(smallint, integer) in the reset path cannot hide
-  # a statement-level trigger from the bound-scope write check.
-  test "a reset-path operator cannot blind the statement-trigger check" do
+  # Host-installed statement triggers are outside the governed-write boundary.
+  # A reset-path operator no longer causes guard-only trigger discovery.
+  test "host statement triggers are outside the governed-write boundary" do
     schema = "selecto_r48_#{System.unique_integer([:positive])}"
     {:ok, admin} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
 
@@ -52,10 +51,9 @@ defmodule SelectoDBPostgreSQL.ExplicitOperatorIntegrationTest do
           metadata: %{post_image: %{predicate: scope, key: ["id"]}}
         })
 
-      assert {:error, %{details: %{code: :query_rule_not_evaluable}}} =
-               Adapter.execute_write_unsafe(c, command, [])
+      assert {:ok, %{affected_rows: 1}} = Adapter.execute_write_unsafe(c, command, [])
 
-      assert {:ok, %{rows: [["SECRET"]]}} =
+      assert {:ok, %{rows: [["PWNED"]]}} =
                Adapter.execute(c, "SELECT note FROM w48 WHERE id = 2", [], [])
     after
       GenServer.stop(c)

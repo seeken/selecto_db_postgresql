@@ -1976,43 +1976,22 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  # A guarded INSERT/UPDATE (TW-09 post-image) locks and resolves its
-  # relation first, returns its rows' (tableoid, ctid) and is re-read by them
-  # after the statement (SelectoDBPostgreSQL.PostImage). A bound-scope write
-  # without a post-image checks its relation's statement triggers and rules
-  # before and after the statement.
+  # The statement itself returns the scope decision. No catalog guard or
+  # physical-row read is needed for host-installed objects or concurrent DDL.
   defp execute_guarded_statement(connection, command, statement, opts) do
-    guard = &guard_statement(connection, &1, &2)
-    check = &execute_statement(connection, &1, &2, Keyword.take(opts, [:timeout, :log]))
-
     case PostImage.prepare(command) do
       {:plain, _command} ->
-        if PostImage.bound_delete?(command) do
-          with {:ok, target} <- PostImage.lock_delete(command, check, guard),
-               {:ok, query_result} <-
-                 execute_statement(connection, statement.text, statement.params, opts),
-               :ok <- PostImage.check_delete(command, target, check) do
-            {:ok, query_result}
-          end
-        else
-          execute_statement(connection, statement.text, statement.params, opts)
-        end
+        execute_statement(connection, statement.text, statement.params, opts)
 
       {:post_image, command} ->
-        text = PostImage.returning(statement.text, command)
-
-        with {:ok, target} <- PostImage.resolve(command, guard, guard),
-             {:ok, query_result} <- execute_statement(connection, text, statement.params, opts),
-             {query_result, keys} = PostImage.split_result(query_result, command),
-             :ok <-
-               PostImage.verify(
+        with {:ok, checked} <-
+               PostImage.returning(
+                 statement,
                  command,
-                 target,
-                 keys,
-                 &WriteCompiler.compile_predicate(&1, opts, &2),
-                 check
-               ) do
-          {:ok, query_result}
+                 &WriteCompiler.compile_predicate(&1, opts, &2)
+               ),
+             {:ok, result} <- execute_statement(connection, checked.text, checked.params, opts) do
+          PostImage.verify(result)
         end
     end
   end
@@ -2020,43 +1999,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp with_write_transaction(connection, opts, fun),
     do: with_postgres_transaction(connection, opts, &fun.(&1, opts))
 
-  # Under REPEATABLE READ or SERIALIZABLE, catalog reads use the
-  # transaction snapshot: a trigger committed after it passes every check yet
-  # still fires (w3exrev16 item 16). A guarded write (bound tenant, trusted or
-  # host scope, admission guard or post-image) runs only under READ
-  # COMMITTED, checked inside its own transaction.
-  @guard_metadata [
-    :post_image,
-    :insert_admission,
-    :query_enforcement,
-    :tenant_fields,
-    :bound_scope
-  ]
-
-  defp verify_read_committed(%Command{metadata: metadata}, opts) when is_map(metadata) do
-    if Enum.any?(@guard_metadata, &(Map.get(metadata, &1) not in [nil, []])) do
-      case Keyword.fetch!(opts, :isolation) do
-        "read committed" ->
-          :ok
-
-        level ->
-          {:error,
-           Error.new(
-             :query_enforcement,
-             "PostgreSQL guarded writes require READ COMMITTED",
-             details: %{
-               code: :query_rule_not_evaluable,
-               reason: :transaction_isolation,
-               isolation: level,
-               adapter: :postgresql
-             }
-           )}
-      end
-    else
-      :ok
-    end
-  end
-
+  # Isolation no longer gates catalog visibility: there are no trigger/DDL
+  # catalog checks. Host isolation and owned transaction behavior stay intact.
   defp verify_read_committed(_command, _opts), do: :ok
 
   defp verify_native_constraints(_connection, %Command{native_constraints: []}, _declared, _opts),

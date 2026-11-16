@@ -197,43 +197,15 @@ for application code.
 
 ### Post-image check and its operational limits
 
-A write bound to a tenant or trusted scope (`metadata.post_image`, set by
-`SelectoUpdato`) locks its table ROW EXCLUSIVE and resolves it to its oid
-before the statement. The statement returns the (tableoid, ctid) of every row
-it wrote, and those exact rows are re-read after every row trigger has run,
-inside the same transaction, from the schema-qualified table that oid named
-and only among that table's (and its partitions') oids. It is rolled back
-unless every written row is still inside the scope, so keys of any type work
-and a trigger that renumbers a row behind a decoy cannot pass; a row a later
-trigger updates again has a new row id and is refused. The check refuses
-(`query_rule_not_evaluable`) whatever it cannot see through:
-
-- Statement-level triggers and rewrite rules for the event on the table or
-  any of its partitions, views, tables with inheritance (non-partition)
-  children, and any enabled non-internal deferrable trigger in the database:
-  it fires at COMMIT, after the check.
-- A bound-scope DELETE (`metadata.bound_scope`, graph delete-missing
-  cleanups included) locks its table ROW EXCLUSIVE and is refused, before
-  and again after its statement, under an enabled statement-level DELETE
-  trigger or a DELETE rule on the table or anywhere in its partition or
-  inheritance tree, an enabled non-internal deferrable trigger, and on a
-  view. A graph descendant bound by its root or an ancestor (an insert,
-  update or delete on a table without a tenant field) follows the same rule
-  for its event.
-- **Every guarded write (bound tenant, trusted or host scope, admission
-  guard or post-image) requires READ COMMITTED**, checked inside the write's
-  transaction (`query_rule_not_evaluable`, `reason: :transaction_isolation`).
-  Under REPEATABLE READ or SERIALIZABLE the catalog checks read the
-  transaction snapshot, so a trigger committed after it would pass them and
-  still fire. Transactions the adapter opens itself (Postgrex or an Ecto
-  Repo) run `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` first, whatever
-  the connection's `default_transaction_isolation`; a host transaction must
-  be READ COMMITTED itself.
-
-**Row-level triggers that modify other rows are allowed, and their effects
-on those rows are the schema owner's responsibility.** The check proves the
-rows the statement itself wrote; a row-level trigger that updates or deletes
-*other* rows, another tenant's included, runs and is not checked.
+Governed writes check the declared policy and payload-bound authorization,
+keep tenant/scope predicates in WHERE, and check expected cardinality before
+COMMIT. PostgreSQL and SQLite evaluate the post-image predicate in the same
+statement's RETURNING, including storage coercion, defaults and BEFORE-trigger
+effects where supported. A false or unknown result rolls back the atomic unit.
+Host-installed triggers, rules, views, RLS policies and concurrent owner DDL
+are the schema owner's responsibility. Governed writes do not inspect catalogs
+or re-read rows solely to defend against those objects. Host transaction,
+non-relaxing deadline and exact-value contracts remain in force.
 
 ## Reads
 
@@ -322,9 +294,15 @@ write rolls back. Before each command one statement reads its facts:
 `client_encoding` (UTF8, or `reason: :client_encoding`), the transaction's
 isolation level, and the target's uuid columns. Generated write SQL names
 its operators and functions plainly and its relation as the command names
-it. A post-image re-read and the statement-trigger, rule and deferrable
-checks address the relation by the oid and schema-qualified name resolved
-under its lock before the DML (see the post-image check above).
+it. The statement returns its scope decision in RETURNING; no separate
+catalog or physical-identity recheck runs.
+
+The private same-statement scope receipt is exactly `selecto_post_image_key_0`.
+It is appended after the requested RETURNING fields and contains the written
+row's positive `tableoid` only when the required scope holds, otherwise NULL.
+The adapter checks every receipt and removes that last field by position before
+returning public rows. This stable private name also permits the Elixir-specific
+ASM001 observer to validate and normalize real driver receipts without a reread.
 
 ## What the host must provide
 
