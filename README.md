@@ -290,9 +290,15 @@ transaction opened with a raw text `BEGIN` is the host's too):
 
 A governed write runs in a transaction the adapter opens (READ COMMITTED),
 or under a savepoint of its own in the host's transaction, which a refused
-write rolls back. Before each command one statement reads its facts:
-`client_encoding` (UTF8, or `reason: :client_encoding`), the transaction's
-isolation level, and the target's uuid columns. Generated write SQL names
+write rolls back. On native Postgrex connections the opening is a single
+`BEGIN ISOLATION LEVEL READ COMMITTED`. Before binding each command,
+Postgrex's live ParameterStatus map must report UTF8 (otherwise
+`reason: :client_encoding`). The fresh unnamed parameter description supplies
+UUID codecs, including domains over UUID, without a facts query or a schema
+cache. SET/RESET, rollback, DISCARD ALL and DDL are observed on the next
+command. The custom module/Ecto execution path retains its facts query and
+isolation setup because that API does not expose the checked-out Postgrex
+handle here. Generated write SQL names
 its operators and functions plainly and its relation as the command names
 it. The statement returns its scope decision in RETURNING; no separate
 catalog or physical-identity recheck runs.

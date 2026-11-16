@@ -58,7 +58,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   @behaviour Selecto.DB.Adapter
   @behaviour Selecto.DB.WriteAdapter
 
-  alias SelectoDBPostgreSQL.PostImage
+  alias SelectoDBPostgreSQL.{PostImage, WriteParameter}
   alias SelectoDBPostgreSQL.{DeclaredSchema, HandBuilt}
 
   @read_committed "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
@@ -1900,9 +1900,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_write_command(connection, %Command{} = command, opts) do
     declared = command.relation
 
-    with {:ok, facts} <- write_facts(connection, command, opts),
-         opts = Keyword.merge(opts, uuid_columns: facts.uuid_columns, isolation: facts.isolation),
-         :ok <- verify_read_committed(command, opts),
+    with {:ok, opts} <- write_options(connection, command, opts),
          :ok <- verify_native_constraints(connection, command, declared, opts),
          {:ok, statement} <- WriteCompiler.compile(command, opts),
          {:ok, query_result} <- execute_guarded_statement(connection, command, statement, opts),
@@ -1918,6 +1916,43 @@ defmodule SelectoDBPostgreSQL.Adapter do
       {:error, %Error{} = error} -> {:error, error}
       {:error, reason} -> {:error, write_error(:execution_failed, reason, command)}
     end
+  end
+
+  # ParameterStatus is updated by Postgrex after SET, RESET, transaction
+  # rollback and reconnect. Read it on the actual checked-out connection,
+  # after BEGIN/savepoint has assigned a backend even behind a pooler.
+  defp write_options(%DBConnection{} = connection, _command, opts) do
+    case Postgrex.parameters(connection, Keyword.take(opts, [:timeout, :deadline])) do
+      %{"client_encoding" => encoding} when is_binary(encoding) ->
+        # ParameterStatus can preserve an accepted alias such as UNICODE,
+        # whereas pg_client_encoding() always returns its canonical name.
+        if String.downcase(String.replace(encoding, ~r/[^a-zA-Z0-9]/, "")) in ["utf8", "unicode"],
+          do: {:ok, Keyword.put(opts, :describe_write_parameters, true)},
+          else: invalid_write_encoding()
+
+      _other ->
+        invalid_write_encoding()
+    end
+  end
+
+  # Custom module/Ecto execution retains its catalog path: those APIs do not
+  # expose the transaction's checked-out Postgrex connection here.
+  defp write_options(connection, command, opts) do
+    with {:ok, facts} <- write_facts(connection, command, opts),
+         do: {:ok, Keyword.put(opts, :uuid_columns, facts.uuid_columns)}
+  end
+
+  defp invalid_write_encoding do
+    {:error,
+     Error.new(
+       :query_enforcement,
+       "PostgreSQL the session's client_encoding is not UTF8: parameters would be misread",
+       details: %{
+         code: :query_rule_not_evaluable,
+         reason: :client_encoding,
+         adapter: :postgresql
+       }
+     )}
   end
 
   # One statement before a command: client_encoding (UTF8, as for a read), the
@@ -1998,10 +2033,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp with_write_transaction(connection, opts, fun),
     do: with_postgres_transaction(connection, opts, &fun.(&1, opts))
-
-  # Isolation no longer gates catalog visibility: there are no trigger/DDL
-  # catalog checks. Host isolation and owned transaction behavior stay intact.
-  defp verify_read_committed(_command, _opts), do: :ok
 
   defp verify_native_constraints(_connection, %Command{native_constraints: []}, _declared, _opts),
     do: :ok
@@ -2758,7 +2789,12 @@ defmodule SelectoDBPostgreSQL.Adapter do
   end
 
   defp run_postgrex(connection, statement, params, opts) do
-    case Postgrex.query(connection, statement, params, opts) do
+    result =
+      if WriteParameter.marked?(params),
+        do: WriteParameter.query(connection, statement, params, opts),
+        else: Postgrex.query(connection, statement, params, opts)
+
+    case result do
       {:ok, result} -> {:ok, normalize_result(result)}
       {:error, reason} -> {:error, reason}
     end
@@ -3782,25 +3818,66 @@ defmodule SelectoDBPostgreSQL.Adapter do
     )
   end
 
+  # Postgrex.transaction/3 hardcodes bare BEGIN. These controls stay on the
+  # already checked-out connection, with the same ownership decision above.
+  # Combining isolation into BEGIN avoids a separate SET without trusting the
+  # host's default_transaction_isolation or changing host-owned transactions.
   defp do_postgres_transaction(connection, opts, fun) do
-    Postgrex.transaction(
-      connection,
-      fn transaction_connection ->
-        # A managed write transaction runs READ COMMITTED whatever the
-        # connection's default_transaction_isolation: the guarded-write
-        # catalog checks need a fresh snapshot per statement.
-        Postgrex.query!(transaction_connection, @read_committed, [])
+    with {:ok, _} <- write_control(connection, "BEGIN ISOLATION LEVEL READ COMMITTED", opts) do
+      try do
+        finish_owned_write(connection, opts, fun.(connection))
+      rescue
+        exception ->
+          rollback_owned_write(connection, opts, {:error, exception})
+      catch
+        :exit, reason ->
+          rollback_owned_write(connection, opts, {:error, {:connection_exit, reason}})
 
-        case fun.(transaction_connection) do
-          {:ok, results} -> results
-          {:error, error} -> Postgrex.rollback(transaction_connection, error)
-        end
-      end,
-      opts
-    )
+        kind, reason ->
+          rollback_owned_write(connection, opts, {:error, {kind, reason}})
+      end
+    end
+  end
+
+  defp finish_owned_write(connection, opts, {:ok, _} = result) do
+    if DBConnection.status(connection) == :transaction do
+      case write_control(connection, "COMMIT", opts) do
+        {:ok, %{command: :commit}} -> result
+        {:ok, _other} -> broken({:error, write_error(:transaction_failed, :not_committed)})
+        {:error, _} = error -> rollback_owned_write(connection, opts, error)
+      end
+    else
+      rollback_owned_write(connection, opts, {:error, :transaction_ended})
+    end
+  end
+
+  defp finish_owned_write(connection, opts, result),
+    do: rollback_owned_write(connection, opts, result)
+
+  defp rollback_owned_write(connection, opts, result, attempts \\ 20) do
+    case write_control(connection, "ROLLBACK", opts) do
+      {:ok, %{command: :rollback}} ->
+        result
+
+      {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} when attempts > 1 ->
+        rollback_owned_write(connection, opts, result, attempts - 1)
+
+      _failed ->
+        broken(result)
+    end
+  end
+
+  defp write_control(connection, sql, opts)
+       when sql in ["BEGIN ISOLATION LEVEL READ COMMITTED", "COMMIT", "ROLLBACK"] do
+    # Driver-level transaction controls, like Postgrex.transaction/3's own
+    # handle_begin/commit/rollback calls. Business statements still run through
+    # Postgrex.query/4 and retain their actual native receipts.
+    case DBConnection.execute(connection, %Postgrex.TextQuery{statement: sql}, [], unnamed(opts)) do
+      {:ok, _query, result} -> {:ok, result}
+      {:error, _} = error -> error
+    end
   rescue
-    exception ->
-      {:error, {:transaction_exception, exception.__struct__, Exception.message(exception)}}
+    exception -> {:error, {:transaction_exception, exception.__struct__}}
   catch
     :exit, reason -> {:error, {:connection_exit, reason}}
   end

@@ -101,7 +101,7 @@ defmodule SelectoDBPostgreSQL.ServerVersionRoundTripIntegrationTest do
       assert capabilities.merge_returning == major >= 17
     end
 
-    test "an executed write sends only its own statements", %{conn: conn} do
+    test "a textual write describes parameter codecs without a version query", %{conn: conn} do
       table = create_items!(conn)
       selecto = Selecto.configure(domain(table), conn, adapter: Adapter)
       command = insert!(table, 1)
@@ -110,7 +110,10 @@ defmodule SelectoDBPostgreSQL.ServerVersionRoundTripIntegrationTest do
 
       assert {:ok, %Selecto.Write.Result{affected_rows: 1}} = result
       refute Enum.any?(frames, &version_query?/1)
-      assert Enum.count(frames, &String.contains?(&1, "INSERT INTO")) == 1
+      # One prepare-only description, then Postgrex.query/4's fresh unnamed
+      # Parse/Bind/Execute. Only the latter executes the INSERT.
+      assert Enum.count(frames, &String.contains?(&1, "INSERT INTO")) == 2
+      assert %{rows: [[1]]} = Postgrex.query!(conn, "SELECT count(*) FROM #{table}", [])
     end
 
     test "a prepared write checks capabilities in its transaction without a round trip",

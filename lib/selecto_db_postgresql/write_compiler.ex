@@ -367,12 +367,32 @@ defmodule SelectoDBPostgreSQL.WriteCompiler do
   end
 
   defp compile_field_value(field, {:literal, value}, opts, offset) when is_binary(value) do
-    if uuid_column?(field, opts),
-      do: compile_uuid(field, value, opts, offset),
-      else: compile_text_value(field, value, opts, offset)
+    cond do
+      Keyword.get(opts, :describe_write_parameters, false) ->
+        with {:ok, compiled} <- compile_text_value(field, value, opts, offset) do
+          params = Enum.map(compiled.params, &mark_write_parameter(field, &1, opts))
+          {:ok, %{compiled | params: params}}
+        end
+
+      uuid_column?(field, opts) ->
+        compile_uuid(field, value, opts, offset)
+
+      true ->
+        compile_text_value(field, value, opts, offset)
+    end
   end
 
   defp compile_field_value(_field, value, opts, offset), do: compile_value(value, opts, offset)
+
+  defp mark_write_parameter(field, value, opts) when is_binary(value) do
+    %SelectoDBPostgreSQL.WriteParameter{
+      field: field,
+      value: value,
+      tenant?: to_string(field) in Keyword.get(opts, :tenant_fields, [])
+    }
+  end
+
+  defp mark_write_parameter(_field, value, _opts), do: value
 
   # The written relation's uuid columns, a domain over uuid included (the
   # adapter reads them before the command).
