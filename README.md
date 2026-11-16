@@ -293,9 +293,9 @@ or under a savepoint of its own in the host's transaction, which a refused
 write rolls back. On native Postgrex connections the opening is a single
 `BEGIN ISOLATION LEVEL READ COMMITTED`. Before binding each command,
 Postgrex's live ParameterStatus map must report UTF8 (otherwise
-`reason: :client_encoding`). The fresh unnamed parameter description supplies
-UUID codecs, including domains over UUID, without a facts query or a schema
-cache. SET/RESET, rollback, DISCARD ALL and DDL are observed on the next
+`reason: :client_encoding`). The fresh unnamed parameter description and Postgrex's loaded type metadata
+identify UUID values, including domains and custom host UUID codecs, without
+a facts query or an adapter schema cache. SET/RESET, rollback, DISCARD ALL and DDL are observed on the next
 command. The custom module/Ecto execution path retains its facts query and
 isolation setup because that API does not expose the checked-out Postgrex
 handle here. A configured committed-effect sink also retains Postgrex's

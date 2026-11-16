@@ -1,3 +1,5 @@
+Code.require_file("../support/custom_uuid.exs", __DIR__)
+
 defmodule SelectoDBPostgreSQL.WriteFactsIntegrationTest do
   use ExUnit.Case, async: false
 
@@ -61,6 +63,31 @@ defmodule SelectoDBPostgreSQL.WriteFactsIntegrationTest do
     Postgrex.query!(c, "CREATE TEMP TABLE selecto_write_facts (org text)", [])
     assert {:ok, _} = insert(c, "selecto_write_facts", "bad")
     assert %{rows: [[0]]} = Postgrex.query!(c, "SELECT count(*) FROM pg_prepared_statements", [])
+
+    opts =
+      ConnectionOptions.options()
+      |> Keyword.put(:pool_size, 1)
+      |> Keyword.put(:types, SelectoDBPostgreSQL.Verification.CustomUUIDTypes)
+
+    {:ok, custom} = Adapter.connect(opts)
+    Process.unlink(custom)
+
+    try do
+      Postgrex.query!(custom, "CREATE DOMAIN pg_temp.selecto_uuid_domain AS uuid", [])
+
+      Postgrex.query!(
+        custom,
+        "CREATE TEMP TABLE selecto_write_facts (org pg_temp.selecto_uuid_domain)",
+        []
+      )
+
+      assert {:error, %{details: %{reason: :invalid_uuid}}} =
+               insert(custom, "selecto_write_facts", String.upcase(uuid))
+
+      assert {:ok, _} = insert(custom, "selecto_write_facts", uuid)
+    after
+      GenServer.stop(custom)
+    end
   end
 
   test "ParameterStatus follows SET LOCAL rollback, reset and connection reuse", %{connection: c} do

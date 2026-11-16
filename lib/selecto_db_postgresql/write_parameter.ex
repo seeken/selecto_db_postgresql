@@ -19,15 +19,15 @@ defmodule SelectoDBPostgreSQL.WriteParameter do
     # replaced under a server-side name. This costs one additional round trip
     # for commands with textual literals, without a catalog SQL statement.
     with {:ok, query} <- Postgrex.prepare(connection, "", statement, opts),
-         {:ok, values} <- bind(params, query.param_oids, query.param_types) do
+         {:ok, values} <- bind(params, query.param_oids, query.types) do
       Postgrex.query(connection, statement, values, opts)
     end
   end
 
   defp bind(params, oids, types) do
-    Enum.zip([params, oids, types])
-    |> Enum.reduce_while({:ok, []}, fn {param, oid, type}, {:ok, values} ->
-      case value(param, oid, type) do
+    Enum.zip(params, oids)
+    |> Enum.reduce_while({:ok, []}, fn {param, oid}, {:ok, values} ->
+      case value(param, oid, types) do
         {:ok, value} -> {:cont, {:ok, [value | values]}}
         error -> {:halt, error}
       end
@@ -38,12 +38,34 @@ defmodule SelectoDBPostgreSQL.WriteParameter do
     end
   end
 
-  defp value(%__MODULE__{} = param, oid, type)
-       when oid == 2950 or type == Postgrex.Extensions.UUID,
-       do: uuid(param)
+  defp value(%__MODULE__{} = param, 2950, _types), do: uuid(param)
 
-  defp value(%__MODULE__{value: value}, _oid, _type), do: {:ok, value}
-  defp value(value, _oid, _type), do: {:ok, value}
+  # Postgrex 0.22's already-loaded TypeInfo is keyed by the OID supplied by
+  # this fresh description. A UUID domain has uuid_send even when the host
+  # replaces the UUID extension (or shares one extension across several types).
+  # Read the server's type identity, not an extension module-name heuristic.
+  # No adapter cache is created; missing metadata refuses before execution.
+  defp value(%__MODULE__{} = param, oid, {_module, table}) do
+    case :ets.lookup(table, oid) do
+      [{^oid, %Postgrex.TypeInfo{send: "uuid_send"}, _codec}] -> uuid(param)
+      [{^oid, %Postgrex.TypeInfo{}, _codec}] -> {:ok, param.value}
+      _missing -> missing_type_info()
+    end
+  end
+
+  defp value(%__MODULE__{}, _oid, _types), do: missing_type_info()
+  defp value(value, _oid, _types), do: {:ok, value}
+
+  defp missing_type_info do
+    {:error,
+     Error.new(:query_enforcement, "PostgreSQL cannot read the parameter's type identity",
+       details: %{
+         code: :query_rule_not_evaluable,
+         reason: :parameter_type_info,
+         adapter: :postgresql
+       }
+     )}
+  end
 
   defp uuid(%{value: value}) when byte_size(value) == 16, do: {:ok, value}
 
