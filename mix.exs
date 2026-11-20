@@ -1,7 +1,7 @@
 defmodule SelectoDBPostgreSQL.MixProject do
   use Mix.Project
 
-  @selecto_ref "0e98d8ec85e84c80705cd3526ea8cc46f8c9e96d"
+  @selecto_ref "a882e72f94b14c3485cb57de0a48ba4c605e4c0d"
   @version "0.5.0"
   @source_url "https://github.com/seeken/selecto_db_postgresql"
 
