@@ -22,17 +22,17 @@ defmodule SelectoDBPostgreSQL.ReadSettingsIntegrationTest do
     assert {:error, {:invalid_configuration, :read_only_reads}} = Adapter.connect(options())
   end
 
-  test "a statement_cache left in the configuration warns: it is ignored" do
-    Application.put_env(:selecto_db_postgresql, :statement_cache, 1024)
-    on_exit(fn -> Application.delete_env(:selecto_db_postgresql, :statement_cache) end)
+  test "a read_deadline that is neither :explicit nor :always refuses at connect" do
+    Application.put_env(:selecto_db_postgresql, :read_deadline, true)
+    on_exit(fn -> Application.delete_env(:selecto_db_postgresql, :read_deadline) end)
 
-    log =
-      ExUnit.CaptureLog.capture_log(fn ->
-        {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
-        GenServer.stop(c)
-      end)
+    assert {:error, {:invalid_configuration, :read_deadline}} = Adapter.connect(options())
 
-    assert log =~ ":statement_cache is ignored"
+    for valid <- [:explicit, :always] do
+      Application.put_env(:selecto_db_postgresql, :read_deadline, valid)
+      assert {:ok, c} = Adapter.connect(Keyword.put(options(), :pool_size, 1))
+      GenServer.stop(c)
+    end
   end
 
   test "a read's timeout stands: a failed undo does not replace it (R66)" do

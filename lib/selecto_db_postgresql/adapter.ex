@@ -11,16 +11,46 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   ## Reads
 
-  With no transaction open a Selecto read is a transaction of its own:
-  one simple query that begins it `READ ONLY` (unless it locks rows),
-  sets the read's `statement_timeout` and asserts `client_encoding` is UTF8,
-  the query, `ROLLBACK`. Inside the host's transaction (`DBConnection.status/1`,
-  so a raw `BEGIN` is the host's) it is the host's own statement, with its
-  `statement_timeout` set before it and put back after it; a read that fails
-  leaves that transaction for the host to end. Hand-built text must be a read
-  by its first word, and in the host's transaction refuses by its words when
-  it could write (`hand_built_in_host_transaction`). Relations a domain
-  declares a schema for are written with it (`SelectoDBPostgreSQL.DeclaredSchema`).
+  A read Selecto generated runs as one statement on an idle connection: no
+  transaction, no `READ ONLY`, one round trip once its statement is prepared.
+  Three kinds of read are a transaction of their own instead (one simple query
+  that begins it and sets what it needs, the query, `ROLLBACK`):
+
+  - a read with a deadline that was asked for (`timeout:` on `Selecto.execute/2`):
+    `READ ONLY` unless it locks rows, with the deadline as a `statement_timeout`
+    local to that transaction, so the session's value is unchanged afterwards;
+  - hand-built text, always `READ ONLY`: that is what refuses a hand-built
+    write (`read_only_read`, SQLSTATE 25006);
+  - a stream, for its cursor.
+
+  Inside the host's transaction (`DBConnection.status/1`, so a raw `BEGIN` is
+  the host's) a read is the host's own statement; a deadline that was asked for
+  is set before it and put back after it, and a read that fails leaves that
+  transaction for the host to end. Hand-built text must be a read by its first
+  word, and in the host's transaction refuses by its words when it could write
+  (`hand_built_in_host_transaction`). Relations a domain declares a schema for
+  are written with it (`SelectoDBPostgreSQL.DeclaredSchema`).
+
+  A generated read is not `READ ONLY`, so one that reaches a view or function
+  of the host's that writes commits that write. It was refused with 25006
+  before the user ruling of 2026-11-20 that narrowed R55.
+
+  Every read refuses a session whose `client_encoding` is not UTF8
+  (`reason: :client_encoding`). The value is the one the server reports to the
+  driver (ParameterStatus, `Postgrex.parameters/2`), so the check costs no
+  round trip; a connection that does not expose it is asked with one `SELECT`.
+
+  ### Deadlines
+
+  A server `statement_timeout` is sent only for a deadline that was asked for:
+  `timeout:` on the call. A read without one runs under the driver's own
+  timeout (Postgrex's 15 seconds, the repository's `:timeout`, or the deadline
+  of the checkout the host holds), and Selecto's 30 second default bounds the
+  call as before. To send a server deadline with every read, as releases
+  between 2026-11-05 and 2026-11-20 did, at the cost of a transaction around
+  each read (three round trips, not one):
+
+      config :selecto_db_postgresql, read_deadline: :always
 
   ## What the host must provide
 
@@ -31,15 +61,33 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   ## Prepared statements
 
-  Every statement runs unnamed, always: `pg_prepared_statements` stays empty.
-  Code a statement reaches can DEALLOCATE and PREPARE a named statement, in a
-  READ ONLY transaction and past a ROLLBACK, and the driver would bind the
-  replacement without parsing it. This works behind a transaction-mode pooler
-  too. Ecto repository connections keep the repository's own `:prepare`
-  setting for the repository's queries; the adapter's run unnamed there too.
-  """
+  By default the adapter prepares each statement once per connection under a
+  name, so later executions take one round trip (Bind/Execute), as Ecto's
+  default `prepare: :named` does. The default keeps 256 names per connection;
+  set another count, or turn it off:
 
-  require Logger
+      config :selecto_db_postgresql, statement_cache: 1024
+      config :selecto_db_postgresql, statement_cache: false   # or 0
+
+  Off, every statement is prepared unnamed, which costs two round trips
+  (Parse/Describe, then Bind/Execute). Named statements need a server session
+  per connection, so set `statement_cache: false` behind a transaction-mode
+  pooler (PgBouncer before 1.21, or without `max_prepared_statements`).
+
+  A name is a hash slot of the SQL, so each connection holds at most that many
+  prepared statements however many query shapes are built; two shapes sharing
+  a slot replace each other. A statement the server no longer has (SQLSTATE
+  26000, after `DISCARD ALL` or `DEALLOCATE`) or whose result type changed
+  under it (0A000, after DDL) is prepared again and run once more. Inside a
+  transaction that error has already aborted the transaction, so it is
+  returned as the server gave it, as with any named statement.
+
+  Transaction controls, a read's opening, write parameters that are described
+  per call, introspection and function verification stay unnamed. Ecto
+  repository connections keep the repository's own `:prepare` setting for the
+  repository's queries; the adapter's own statements run unnamed there.
+  R63 (every statement unnamed) was withdrawn by the user ruling of 2026-11-20.
+  """
 
   defmodule Control do
     @moduledoc false
@@ -279,6 +327,9 @@ defmodule SelectoDBPostgreSQL.Adapter do
       not read_only_setting_valid?() ->
         {:error, {:invalid_configuration, :read_only_reads}}
 
+      not read_deadline_setting_valid?() ->
+        {:error, {:invalid_configuration, :read_deadline}}
+
       Keyword.get(opts, :raw_jsonb, false) not in [true, false] ->
         {:error, {:invalid_connection_options, :raw_jsonb}}
 
@@ -288,7 +339,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
         {:error, {:invalid_connection_options, :raw_jsonb_types_conflict}}
 
       true ->
-        warn_statement_cache()
         {raw_jsonb?, opts} = Keyword.pop(opts, :raw_jsonb, false)
 
         opts =
@@ -302,15 +352,6 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   def connect(_other),
     do: {:error, {:invalid_connection_options, :expected_options_or_connection}}
-
-  # R63 removed the setting; a host that still sets it should know.
-  defp warn_statement_cache do
-    if match?({:ok, _}, Application.fetch_env(:selecto_db_postgresql, :statement_cache)) do
-      Logger.warning(
-        "selecto_db_postgresql: :statement_cache is ignored; every statement runs unnamed"
-      )
-    end
-  end
 
   @impl true
   def disconnect(connection) when is_pid(connection) do
@@ -334,13 +375,17 @@ defmodule SelectoDBPostgreSQL.Adapter do
   timeout that applies without it has elapsed: Postgrex's 15 second default,
   or the repository's configured `:timeout` for an Ecto repository.
 
-  A Selecto read's timeout is the server's `statement_timeout`, local to the
-  read, on any connection: nothing kills it, so a transaction the host holds
-  goes on. A host's own statement on a connection the calling process already
-  holds checked out (a `%DBConnection{}`, or an Ecto repository inside a
-  transaction or checkout) runs under its checkout's deadline, which ignores a
-  per-call timeout, so such a statement runs in a separate process that is shut
-  down when `timeout` elapses.
+  A Selecto read's timeout, when the caller asked for one, is the server's
+  `statement_timeout`, local to the read, on any connection: nothing kills it,
+  so a transaction the host holds goes on. Selecto's default (the options carry
+  `selecto_default_timeout: true`) is the driver's timeout only, unless
+  `config :selecto_db_postgresql, read_deadline: :always`.
+
+  A host's own statement on a connection the calling process already holds
+  checked out (a `%DBConnection{}`, or an Ecto repository inside a transaction
+  or checkout) runs under its checkout's deadline, which ignores a per-call
+  timeout, so such a statement runs in a separate process that is shut down
+  when `timeout` elapses.
 
   Without an integer `:timeout` the statement runs exactly as before.
   """
@@ -438,13 +483,17 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # runs on one checked-out connection. The server's transaction status decides
   # its shape (DBConnection.status/1, so a raw BEGIN is the host's too):
   #
-  # - idle: one simple query begins the transaction READ ONLY, sets the read's
-  #   statement_timeout and asserts client_encoding, then the query, ROLLBACK;
-  # - in the host's transaction: the query as the host's own statement, with its
-  #   statement_timeout set before it and the prior value put back after it.
+  # - idle, generated, no deadline asked for: the query alone, autocommit;
+  # - idle otherwise (hand-built or mixed text, or a deadline): one simple query
+  #   begins the transaction (READ ONLY unless it locks rows) and sets the
+  #   read's statement_timeout, then the query, ROLLBACK;
+  # - in the host's transaction: the query as the host's own statement, with a
+  #   deadline that was asked for set before it and put back after it.
+  #
+  # client_encoding is read from the driver's ParameterStatus (session_encoding/2).
   #
   # A connection the host holds is never cancelled by killing a process: that
-  # abandons an unread reply. The read's deadline is the server's
+  # abandons an unread reply. A deadline that was asked for is the server's
   # statement_timeout (read_deadline/1), so the reply is consumed and the
   # host's transaction survives.
   defp guarded_read(%DBConnection{} = connection, query, params, opts) do
@@ -542,12 +591,17 @@ defmodule SelectoDBPostgreSQL.Adapter do
   # does not answer at all reaches this, and then the connection goes.
   @client_grace 5_000
 
+  #
+  # A read with no server deadline (server_deadline?/1) has only this limit,
+  # so it gets no grace: the driver ends it, and the connection with it.
   defp client_cut(opts) do
+    grace = if server_deadline?(opts), do: @client_grace, else: 0
+
     opts
     |> Keyword.take([:timeout, :deadline, :queue_target, :queue_interval])
     |> Enum.map(fn
       {key, value} when key in [:timeout, :deadline] and is_integer(value) ->
-        {key, value + @client_grace}
+        {key, value + grace}
 
       other ->
         other
@@ -565,7 +619,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp connection_plan(plan, %DBConnection{} = connection) do
     Map.merge(plan, %{
       status: fn -> DBConnection.status(connection) end,
-      close: fn -> close_connection(connection) end
+      close: fn -> close_connection(connection) end,
+      parameters: fn -> Postgrex.parameters(connection) end
     })
   end
 
@@ -611,7 +666,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
     # whose words could write refuses before anything is sent.
     with :ok <- host_hand_built(query, plan),
          {:ok, ms} <- remaining(plan),
-         {:ok, prior} <- open_host_read(guard, ms) do
+         {:ok, prior} <- open_host_read(guard, ms, plan) do
       with {:ok, result} <- read_result(execute.(plan.prefix <> text(query), params)),
            :ok <- restore_deadline(guard, prior) do
         {:ok, result}
@@ -619,32 +674,41 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  # A read of its own: nothing it reaches can write (READ ONLY, unless it locks
-  # rows), and nothing it changes outlasts it (ROLLBACK). A read that cannot be
-  # ended closes the connection, as the last resort.
   defp run_guarded_read(execute, guard, false, query, params, plan) do
+    with {:ok, ms} <- remaining(plan),
+         :ok <- session_encoding(guard, plan) do
+      if is_nil(ms) and plan.kind == :generated,
+        do: read_result(execute.(plan.prefix <> text(query), params)),
+        else: framed_read(execute, guard, query, params, plan, ms)
+    end
+  end
+
+  # A read in a transaction of its own: a deadline is local to it
+  # (statement_timeout, gone at ROLLBACK), and hand-built or mixed text cannot
+  # write (READ ONLY). A generated read is READ ONLY here too, unless it locks
+  # rows or `read_only_reads: false`. A read that cannot be ended closes the
+  # connection, as the last resort.
+  defp framed_read(execute, guard, query, params, plan, ms) do
     read_only? = plan.kind != :generated or read_only?(query)
 
-    with {:ok, ms} <- remaining(plan) do
-      result =
-        try do
-          with :ok <- open_read(guard, read_only?, ms) do
-            read_result(execute.(plan.prefix <> text(query), params))
-          end
-        rescue
-          exception ->
-            undo_read(guard, plan)
-            reraise exception, __STACKTRACE__
-        catch
-          kind, reason ->
-            undo_read(guard, plan)
-            :erlang.raise(kind, reason, __STACKTRACE__)
+    result =
+      try do
+        with :ok <- open_read(guard, read_only?, ms) do
+          read_result(execute.(plan.prefix <> text(query), params))
         end
-
-      case undo_read(guard, plan) do
-        :ok -> result
-        failure -> if match?({:ok, _}, result), do: failure, else: result
+      rescue
+        exception ->
+          undo_read(guard, plan)
+          reraise exception, __STACKTRACE__
+      catch
+        kind, reason ->
+          undo_read(guard, plan)
+          :erlang.raise(kind, reason, __STACKTRACE__)
       end
+
+    case undo_read(guard, plan) do
+      :ok -> result
+      failure -> if match?({:ok, _}, result), do: failure, else: result
     end
   end
 
@@ -667,55 +731,83 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   @encoding_column "CAST(pg_catalog.pg_client_encoding() AS pg_catalog.text) AS selecto_guard_encoding"
 
-  @encoding_marker "selecto_guard_client_encoding_not_utf8"
+  # The session's client_encoding (R65), from the value the server reports to
+  # the driver: Postgrex keeps ParameterStatus current through SET, RESET,
+  # ROLLBACK and reconnect, so this costs no round trip. A connection that does
+  # not expose it (a custom module, an Ecto repository whose connection cannot
+  # be found) is asked.
+  defp session_encoding(guard, plan) do
+    case local_encoding(plan) do
+      {:ok, encoding} -> local_utf8(encoding)
+      :unknown -> server_encoding(guard)
+    end
+  end
 
-  # Postgrex returns only the first simple-query result, but propagates errors
-  # from every statement. The server must assert the canonical encoding (R65),
-  # rather than return an encoding row which the driver would discard.
+  defp local_encoding(%{parameters: parameters}) when is_function(parameters, 0) do
+    case parameters.() do
+      %{"client_encoding" => encoding} when is_binary(encoding) -> {:ok, encoding}
+      _other -> :unknown
+    end
+  rescue
+    _exception -> :unknown
+  catch
+    :exit, _reason -> :unknown
+  end
+
+  defp local_encoding(_plan), do: :unknown
+
+  # ParameterStatus can preserve an accepted alias such as UNICODE, whereas
+  # pg_client_encoding() always returns its canonical name.
+  defp local_utf8(encoding) do
+    if utf8_name?(encoding), do: :ok, else: utf8(:refused)
+  end
+
+  defp utf8_name?(encoding),
+    do: String.downcase(String.replace(encoding, ~r/[^a-zA-Z0-9]/, "")) in ["utf8", "unicode"]
+
+  defp server_encoding(guard) do
+    case guard.("SELECT " <> @encoding_column, []) do
+      {:ok, %{rows: [[encoding]]}} -> utf8(encoding)
+      {:error, _} = error -> error
+      _unreadable -> {:error, read_refusal(session_unreadable())}
+    end
+  end
+
   defp open_read(guard, read_only?, ms) do
     opening = %ReadOpening{read_only?: read_only?, timeout: ms}
 
     case guard.(opening, []) do
-      {:ok, _} ->
-        :ok
-
-      {:error, %Postgrex.Error{postgres: %{pg_code: "P0001", message: @encoding_marker}}} ->
-        utf8(:refused)
-
-      {:error, _} = error ->
-        error
-
-      _unreadable ->
-        {:error, read_refusal(session_unreadable())}
+      {:ok, _} -> :ok
+      {:error, _} = error -> error
     end
   end
 
-  # This fixed guard has no host SQL or parameter values. Sending its bounded
+  # This fixed opening has no host SQL or parameter values. Sending its bounded
   # integer deadline as a literal lets Postgrex use the simple protocol, rather
   # than waiting for a Describe reply just to discover that $1 is text.
   defp read_opening_sql(%ReadOpening{read_only?: read_only?, timeout: ms})
        when is_boolean(read_only?) and (is_nil(ms) or (is_integer(ms) and ms > 0)) do
-    begin = if read_only?, do: "BEGIN READ ONLY; ", else: "BEGIN; "
+    begin = if read_only?, do: "BEGIN READ ONLY", else: "BEGIN"
 
-    deadline =
-      if ms,
-        do:
-          "SELECT " <>
-            deadline_sql("'" <> Integer.to_string(ms) <> "'") <>
-            " AS selecto_guard_deadline; ",
-        else: ""
-
-    begin <>
-      deadline <>
-      "DO $selecto_guard$ BEGIN " <>
-      "IF pg_catalog.pg_client_encoding() OPERATOR(pg_catalog.<>) 'UTF8' THEN " <>
-      "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = '#{@encoding_marker}'; " <>
-      "END IF; END $selecto_guard$ LANGUAGE plpgsql"
+    if ms,
+      do:
+        begin <>
+          "; SELECT " <>
+          deadline_sql("'" <> Integer.to_string(ms) <> "'") <>
+          " AS selecto_guard_deadline",
+      else: begin
   end
 
-  # In the host's transaction: the encoding check and, with a deadline, the
-  # read's statement_timeout, set local to the transaction; the prior value
-  # comes back with restore_deadline/2.
+  # In the host's transaction, with a deadline: the encoding check and the
+  # read's statement_timeout, set local to the transaction, in one statement;
+  # the prior value comes back with restore_deadline/2. Without one nothing is
+  # sent when the driver knows the encoding.
+  defp open_host_read(guard, nil, plan) do
+    with :ok <- session_encoding(guard, plan), do: {:ok, nil}
+  end
+
+  defp open_host_read(guard, ms, _plan), do: open_host_read(guard, ms)
+
   defp open_host_read(guard, ms) do
     {columns, params} =
       if ms,
@@ -819,9 +911,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
     end
   end
 
-  # R55 awaits a decision: `config :selecto_db_postgresql, read_only_reads:
-  # false` turns READ ONLY off for generated reads in this one place. A read that
-  # locks rows cannot be READ ONLY.
+  # R55 as narrowed on 2026-11-20: a generated read is READ ONLY only inside
+  # the transaction its deadline needs (framed_read/6), and `config
+  # :selecto_db_postgresql, read_only_reads: false` turns that off too. A read
+  # that locks rows cannot be READ ONLY.
   defp read_only?(query), do: read_only_reads() and not HandBuilt.row_lock?(query)
 
   # Anything but false keeps reads read-only; connect/1 refuses a bad value.
@@ -855,8 +948,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
     }
   end
 
+  # The server deadline of a read (statement_timeout), sent only when one was
+  # asked for (user ruling 2026-11-20): the caller's `:timeout`, or every read
+  # under `config :selecto_db_postgresql, read_deadline: :always`. Selecto's
+  # own default arrives marked (`selecto_default_timeout: true`) and is then
+  # left to the driver's timeout (client_cut/1).
   defp read_deadline(opts) do
-    case Keyword.get(opts, :timeout) do
+    case server_deadline?(opts) and Keyword.get(opts, :timeout) do
       timeout when is_integer(timeout) and timeout >= 0 ->
         deadline = System.monotonic_time(:millisecond) + timeout
 
@@ -869,6 +967,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
         {nil, nil}
     end
   end
+
+  defp server_deadline?(opts),
+    do: Keyword.get(opts, :selecto_default_timeout) != true or read_deadline_setting() == :always
+
+  defp read_deadline_setting,
+    do: Application.get_env(:selecto_db_postgresql, :read_deadline, :explicit)
+
+  defp read_deadline_setting_valid?, do: read_deadline_setting() in [:explicit, :always]
 
   @doc """
   EXPLAIN of a Selecto read (`explain` the prefix, "EXPLAIN (...) "): the
@@ -1926,7 +2032,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       %{"client_encoding" => encoding} when is_binary(encoding) ->
         # ParameterStatus can preserve an accepted alias such as UNICODE,
         # whereas pg_client_encoding() always returns its canonical name.
-        if String.downcase(String.replace(encoding, ~r/[^a-zA-Z0-9]/, "")) in ["utf8", "unicode"],
+        if utf8_name?(encoding),
           do: {:ok, Keyword.put(opts, :describe_write_parameters, true)},
           else: invalid_write_encoding()
 
@@ -2785,14 +2891,14 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
   defp query_postgrex(connection, query, params, opts) do
     statement = query |> normalize_query()
-    run_postgrex(connection, statement, params, unnamed(opts))
+    run_postgrex(connection, statement, params, statement_cache_opts(statement, params, opts))
   end
 
   defp run_postgrex(connection, statement, params, opts) do
     result =
       if WriteParameter.marked?(params),
         do: WriteParameter.query(connection, statement, params, opts),
-        else: Postgrex.query(connection, statement, params, opts)
+        else: cached_query(connection, statement, params, opts)
 
     case result do
       {:ok, result} -> {:ok, normalize_result(result)}
@@ -2804,14 +2910,84 @@ defmodule SelectoDBPostgreSQL.Adapter do
     :exit, reason -> {:error, {:connection_exit, reason}}
   end
 
+  # A named statement the server no longer has (26000: DISCARD ALL, DEALLOCATE,
+  # a pooler that moved the session) or whose result type changed under it
+  # (0A000, after DDL) failed before it ran: Postgrex has dropped its copy, so
+  # running it again prepares it again. Postgrex retries 0A000 itself; 26000 it
+  # returns. A name the session already holds from elsewhere (42P05) cannot be
+  # prepared at all: that statement runs unnamed. Inside a transaction the
+  # error has aborted it and stands.
+  defp cached_query(connection, statement, params, opts) do
+    case Postgrex.query(connection, statement, params, opts) do
+      {:error, %Postgrex.Error{postgres: %{pg_code: code} = postgres}} = error ->
+        with true <- Keyword.has_key?(opts, :cache_statement),
+             retry when retry != :stands <- invalidated(code, postgres),
+             true <- retryable?(connection) do
+          retry_opts = if retry == :unnamed, do: unnamed(opts), else: opts
+          Postgrex.query(connection, statement, params, retry_opts)
+        else
+          _stands -> error
+        end
+
+      result ->
+        result
+    end
+  end
+
+  defp invalidated("26000", _postgres), do: :prepare
+  defp invalidated("0A000", %{message: "cached plan must not change result type"}), do: :prepare
+  defp invalidated("42P05", _postgres), do: :unnamed
+  defp invalidated(_code, _postgres), do: :stands
+
+  defp retryable?(%DBConnection{} = connection), do: DBConnection.status(connection) == :idle
+  defp retryable?(_pool), do: true
+
+  @default_statement_cache_slots 256
+
   @doc false
-  # R63: no statement of this adapter is ever named. PREPARE and DEALLOCATE
-  # work from any function a statement reaches, in a READ ONLY transaction,
-  # and survive ROLLBACK, and Postgrex binds a name without parsing it again,
-  # so a named guard, or a named business statement, can be swapped for
-  # another under the same name. An unnamed statement is parsed from the text
-  # sent with it. Only adapter-owned transaction controls and ReadOpening's
-  # fixed session guard take the simple protocol.
+  # Postgrex options for one statement under the `:statement_cache` setting.
+  #
+  # On (the default, 256 slots), the statement is prepared once per connection
+  # under a name and later executions send only Bind/Execute, one round trip,
+  # as Ecto's default `prepare: :named` does. Off (`false` or `0`), every
+  # statement is prepared unnamed: Parse/Describe, then Bind/Execute.
+  # The name is a hash slot of the SQL, so each connection holds at most
+  # `slots` prepared statements however many query shapes the application
+  # builds; two shapes sharing a slot replace each other (Postgrex compares the
+  # statement text). A statement with a `:comment` or `prepared: false`
+  # (introspection), and one whose parameters are described per call
+  # (WriteParameter), stays unnamed.
+  #
+  # Named statements need a session per connection: a transaction-mode
+  # connection pooler (PgBouncer before 1.21, or without
+  # max_prepared_statements) cannot use them, so turn it off there.
+  #
+  # R63 (never named) was withdrawn by the user ruling of 2026-11-20: its one
+  # threat, server code swapping a named statement, is out of scope.
+  def statement_cache_opts(statement, params, opts) do
+    slots = statement_cache_slots()
+
+    if slots == 0 or Keyword.has_key?(opts, :comment) or Keyword.get(opts, :prepared) == false or
+         WriteParameter.marked?(params) do
+      unnamed(opts)
+    else
+      name = "selecto_" <> Integer.to_string(:erlang.phash2(statement, slots))
+      Keyword.put(opts, :cache_statement, name)
+    end
+  end
+
+  defp statement_cache_slots do
+    case Application.get_env(:selecto_db_postgresql, :statement_cache, true) do
+      true -> @default_statement_cache_slots
+      slots when is_integer(slots) and slots > 0 -> slots
+      _off -> 0
+    end
+  end
+
+  @doc false
+  # A statement that is never named, whatever the setting: adapter-owned
+  # transaction controls and a read's opening take the simple protocol, and a
+  # described write parameter needs a fresh description.
   def unnamed(opts), do: Keyword.delete(opts, :cache_statement)
 
   # A transaction statement of the adapter's own, marked: only a statement
@@ -3412,7 +3588,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
       if cache_key do
         execute_with_prepared_cache(pool_pid, query, params, cache_key, query_opts)
       else
-        Postgrex.query(pool_pid, query, params, unnamed(query_opts))
+        cached_query(pool_pid, query, params, statement_cache_opts(query, params, query_opts))
       end
     rescue
       e ->
@@ -3429,7 +3605,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
   defp execute_with_prepared_cache(pool_pid, query, params, cache_key, query_opts) do
     case Selecto.ConnectionPool.prepared_statement_cached?(pool_pid, cache_key) do
       false ->
-        result = Postgrex.query(pool_pid, query, params, unnamed(query_opts))
+        result =
+          cached_query(pool_pid, query, params, statement_cache_opts(query, params, query_opts))
 
         if match?({:ok, _}, result) do
           Selecto.ConnectionPool.mark_prepared_statement(pool_pid, cache_key)
@@ -3438,7 +3615,7 @@ defmodule SelectoDBPostgreSQL.Adapter do
         result
 
       true ->
-        Postgrex.query(pool_pid, query, params, unnamed(query_opts))
+        cached_query(pool_pid, query, params, statement_cache_opts(query, params, query_opts))
     end
   end
 
@@ -3983,9 +4160,10 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
     producer =
       Keyword.get(opts, :stream_producer, fn send_chunk ->
-        # A Selecto read streams in a transaction of its own, opened as a read
-        # is (open_read/3): READ ONLY unless it locks rows, client_encoding
-        # checked. The transaction ends with the stream.
+        # A Selecto read streams in a transaction of its own, opened as a
+        # framed read is (open_read/3): READ ONLY unless it locks rows, and
+        # client_encoding checked on the connection the stream got. The
+        # transaction ends with the stream.
         read? = Keyword.get(opts, :selecto_read_stream) == true
 
         read_only? =
@@ -3993,8 +4171,13 @@ defmodule SelectoDBPostgreSQL.Adapter do
 
         own_stream_transaction(conn, stream_timeout, fn tx_conn ->
           if read? do
-            case open_read(&guard_statement(tx_conn, &1, &2), read_only?, nil) do
-              :ok -> :ok
+            guard = &guard_statement(tx_conn, &1, &2)
+            plan = %{parameters: fn -> Postgrex.parameters(tx_conn) end}
+
+            with :ok <- session_encoding(guard, plan),
+                 :ok <- open_read(guard, read_only?, nil) do
+              :ok
+            else
               {:error, reason} -> Postgrex.rollback(tx_conn, reason)
             end
           end

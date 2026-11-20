@@ -4,6 +4,37 @@ CHANGES
 V 0.5.0
 -------
 
+- **Read path: R63 withdrawn, R55 narrowed (user rulings of 2026-11-20).** A
+  generated read on an idle connection is one round trip; it was four
+  (opening, Parse/Describe, Bind/Execute, `ROLLBACK`).
+  - **Named statements are back, on by default** (`statement_cache`, 256
+    hash-slot names per connection; `false` or `0` turns it off, which a
+    transaction-mode pooler needs). R63's one threat, server code swapping a
+    named statement, is outside the threat model. A statement the server
+    dropped (26000) or whose result type changed (0A000) is prepared again
+    and run once more; inside a transaction the error stands. A slot name the
+    session already holds (42P05) runs unnamed. `:statement_cache` is no
+    longer ignored with a warning.
+  - **Behaviour change:** a generated read with no deadline asked for has no
+    transaction and is not `READ ONLY`. One that reaches a view or function
+    of the host's that writes now commits that write; it was refused with
+    25006 (`read_only_read`). Hand-built text, a generated statement carrying
+    a host fragment, a read with a deadline and a stream keep their
+    transaction, `READ ONLY` as before. A read inside the host's transaction
+    is the host's statement as before.
+  - **Behaviour change:** a server `statement_timeout` is sent only for a
+    deadline that was asked for (`timeout:`). Selecto's 30 second default,
+    which the core now marks (`selecto_default_timeout: true`), is left to
+    the driver's timeout, which drops the connection when it fires, where
+    the server cancelled the statement at 15 seconds and kept the
+    connection. `config :selecto_db_postgresql, read_deadline: :always`
+    restores a server deadline, and the transaction around it, on every
+    read. With a core that does not mark its default every read still gets
+    the server deadline.
+  - `client_encoding` is read from the driver's ParameterStatus
+    (`Postgrex.parameters/2`), as writes already did, instead of a PL/pgSQL
+    block in the opening. The refusal and its reason (`client_encoding`) are
+    unchanged, and now happen before anything is sent.
 - **Guard removal.** Generated SQL resolves as the host's own queries do,
   and a read is a read-only transaction of its own or the host's own
   statement (see README: Reads, Writes, What the host must provide).

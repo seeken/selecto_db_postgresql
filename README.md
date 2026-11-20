@@ -57,17 +57,42 @@ selecto =
   )
 ```
 
-## Prepared statements
+## Prepared statements (on by default)
 
-Every statement runs unnamed, always, so `pg_prepared_statements` stays empty
-on Selecto's connections. Code a statement reaches (a trigger, a planted
-function) can DEALLOCATE and PREPARE a named statement, in a READ ONLY
-transaction and past a ROLLBACK, and the driver binds the replacement without
-parsing it, so a named guard or business statement could be swapped. The
-`statement_cache` setting is gone. Adapter-owned transaction controls and the
-merged read opening use the simple protocol, one round trip each; business
-statements take two (Parse/Describe, Bind/Execute).
-This works behind a transaction-mode connection pooler.
+The adapter prepares each statement once per Postgrex connection under a
+name, so later executions take one round trip (Bind/Execute) instead of two
+(Parse/Describe, then Bind/Execute), as Ecto's default `prepare: :named`
+does. A name is a hash slot of the SQL (256 slots by default), so each
+connection holds at most that many prepared statements however many query
+shapes are built. Set another slot count, or turn it off so every statement
+is prepared unnamed:
+
+```elixir
+config :selecto_db_postgresql, statement_cache: 1024
+config :selecto_db_postgresql, statement_cache: false   # or 0
+```
+
+**Behind a transaction-mode connection pooler** (PgBouncer before 1.21, or
+1.21+ without `max_prepared_statements`) named statements do not work, since
+they need a server session per connection: set `statement_cache: false`.
+
+A statement the server no longer has (SQLSTATE 26000, after `DISCARD ALL` or
+`DEALLOCATE`) or whose result type changed under it (0A000 "cached plan must
+not change result type", after DDL) is prepared again and run once more.
+Inside a transaction that error has already aborted the transaction, so it is
+returned as the server gave it, as with any named statement (Ecto's
+included). A statement whose slot name the session already holds from
+elsewhere (42P05) runs unnamed.
+
+Transaction controls and a read's opening use the simple protocol, one round
+trip each. Governed-write parameters that are described per call,
+introspection and function verification stay unnamed. On an Ecto repository
+the repository's own `:prepare` setting governs the repository's queries, and
+the adapter's own statements run unnamed there.
+
+Between 2026-11-06 and 2026-11-20 every statement ran unnamed (R63, against
+server code swapping a named statement). That threat is outside the threat
+model, and the user ruling of 2026-11-20 withdrew R63.
 
 ### Optional raw jsonb results
 
@@ -213,28 +238,57 @@ A Selecto read runs on one checked-out connection, and the server's
 transaction status decides its shape (`DBConnection.status/1`, so a
 transaction opened with a raw text `BEGIN` is the host's too):
 
-- **No transaction open:** the read is a transaction of its own: one simple query
-  begins it `READ ONLY`, sets the read's `statement_timeout` and asserts that
-  `client_encoding` is UTF8 using PostgreSQL's standard `plpgsql` language.
-  The business query and `ROLLBACK` follow. Nothing
-  it reaches can write and nothing it changes outlasts it: a view using
-  `nextval` or an audit function refuses (`query_rule_not_evaluable`,
-  `reason: :read_only_read`). A generated read that locks rows (`FOR UPDATE`,
-  `FOR SHARE`) is not read-only; its locks end with it. A `ROLLBACK` that
-  fails closes the connection, so the holder's next statement says so.
-  `config :selecto_db_postgresql, read_only_reads: false` turns `READ ONLY`
-  off for generated reads.
+- **No transaction open, a generated read:** the statement alone, in
+  autocommit: no transaction, no `READ ONLY`, no `statement_timeout`, one
+  round trip once it is prepared. **It is not read-only:** a generated read
+  that reaches a view or function of the host's that writes (an audit
+  function, `nextval`) commits that write. Until the user ruling of
+  2026-11-20 narrowed R55 it was refused with SQLSTATE 25006; a host that
+  wants that refusal back gives its read role or read pool
+  `default_transaction_read_only = on`.
+- **No transaction open, a read with a deadline, or hand-built text:** the
+  read is a transaction of its own. One simple query begins it and sets what
+  it needs (`BEGIN READ ONLY`, and the deadline as a `statement_timeout`),
+  the query and `ROLLBACK` follow. Nothing it reaches can write and nothing
+  it changes outlasts it: a view using `nextval` or an audit function refuses
+  (`query_rule_not_evaluable`, `reason: :read_only_read`). For hand-built
+  text that is what makes "hand-built writes refuse" hold. A generated read
+  that locks rows (`FOR UPDATE`, `FOR SHARE`) is not read-only; its locks end
+  with it. A `ROLLBACK` that fails closes the connection, so the holder's
+  next statement says so. `config :selecto_db_postgresql, read_only_reads:
+  false` turns `READ ONLY` off for generated reads here too.
 - **Inside the host's transaction:** the read is the host's own statement.
-  One statement checks `client_encoding` and sets the read's
-  `statement_timeout` local to the transaction, the query runs as written,
-  and the prior `statement_timeout` is put back. Its locks, snapshot and any
-  write a view makes belong to that transaction. A read that fails (a
-  timeout, a missing relation) leaves the transaction aborted for the host
-  to roll back; Selecto never sends `COMMIT` or `ROLLBACK` for a transaction
-  it does not own, and kills no process on such a connection.
-- **Timeouts.** A read's `:timeout` is the server's `statement_timeout`; a
-  shorter `statement_timeout` of the host's stands. The connection's own
-  limit comes a few seconds later, for a server that does not answer at all.
+  With a deadline, one statement sets the read's `statement_timeout` local
+  to the transaction, the query runs as written, and the prior
+  `statement_timeout` is put back; without one the query is all that is
+  sent. Its locks, snapshot and any write a view makes belong to that
+  transaction. A read that fails (a timeout, a missing relation) leaves the
+  transaction aborted for the host to roll back; Selecto never sends `COMMIT`
+  or `ROLLBACK` for a transaction it does not own, and kills no process on
+  such a connection.
+- **Encoding.** Every read refuses a session whose `client_encoding` is not
+  UTF8 (`reason: :client_encoding`), before anything is sent. The value is
+  the one the server reports to the driver (ParameterStatus,
+  `Postgrex.parameters/2`, kept current through `SET`, `RESET`, `ROLLBACK`
+  and reconnect), so the check costs no round trip. A connection that does
+  not expose it is asked with one `SELECT`.
+- **Timeouts.** A server deadline is sent only when one is asked for. A
+  read's `timeout:` (on `Selecto.execute/2`) is the server's
+  `statement_timeout`, local to the read's own transaction, so the session's
+  value is unchanged afterwards; a shorter `statement_timeout` of the host's
+  stands, and the connection's own limit comes a few seconds later, for a
+  server that does not answer at all. A read **without** `timeout:` gets no
+  `statement_timeout`: it runs under the driver's own timeout (Postgrex's 15
+  seconds, the repository's `:timeout`, or the deadline of the checkout the
+  host holds), and when that fires the driver drops the connection rather
+  than cancelling the statement on a connection that stays. Selecto's 30
+  second default still bounds the call. To send every read's deadline to the
+  server, as releases between 2026-11-05 and 2026-11-20 did, at the cost of a
+  transaction around every read (three round trips instead of one):
+
+  ```elixir
+  config :selecto_db_postgresql, read_deadline: :always   # default :explicit
+  ```
 - **Statements are Selecto's or the host's.** A statement is Selecto's only
   when its executor stamped it (`selecto_generated`, or `selecto_raw_sql` for
   one carrying a host fragment: a custom column's `select:`, a
@@ -243,7 +297,8 @@ transaction opened with a raw text `BEGIN` is the host's too):
   hand-built text or a raw fragment from end-user input.** Hand-built text
   must be one statement beginning `SELECT`, `WITH`, `VALUES`, `TABLE`, `SHOW`
   or `EXPLAIN` (`reason: :hand_built_not_a_read`). With no transaction open
-  it runs as written, under `READ ONLY`. In the host's transaction nothing
+  it runs as written, under `READ ONLY`, and so does a generated statement
+  carrying a host fragment. In the host's transaction nothing
   would stop a write, so text whose words could write (`INSERT`, `UPDATE`,
   `DELETE`, `MERGE`, `TRUNCATE` or `INTO`, as a data-modifying `WITH` or
   `SELECT INTO` uses, and `EXPLAIN ANALYZE` of one) refuses before anything
