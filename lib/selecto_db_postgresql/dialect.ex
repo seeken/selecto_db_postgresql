@@ -9,7 +9,7 @@ defmodule SelectoDBPostgreSQL.Dialect do
   alias Selecto.Dialect.Bucket.Expression, as: BucketExpression
   alias Selecto.Dialect.Collection.Operation, as: CollectionOperation
   alias Selecto.Dialect.DateTime.Operation, as: DateTimeOperation
-  alias Selecto.Dialect.Hierarchy.{Adjacency, MaterializedPath}
+  alias Selecto.Dialect.Hierarchy.Adjacency
   alias Selecto.Dialect.TableFunction.Join, as: TableFunctionJoin
   alias Selecto.Dialect.Window.FrameBoundary
   alias Selecto.Dialect.View.{Definition, Index, Refresh}
@@ -881,37 +881,29 @@ defmodule SelectoDBPostgreSQL.Dialect do
 
   @impl true
   def render_hierarchy_adjacency(%Adjacency{} = hierarchy, _selecto) do
+    id = hierarchy.id_field
+    parent = hierarchy.parent_field
+    filter = Enum.flat_map(hierarchy.filter, &[" AND ", &1])
+    pairs = Enum.flat_map(hierarchy.pair_fields, &[" AND c.", &1, " = h.", &1])
+
     {:ok,
      [
        hierarchy.cte_name,
        " AS (",
-       "SELECT #{hierarchy.id_field}, #{hierarchy.name_field}, #{hierarchy.parent_field}, 0 as level, ",
-       "CAST(#{hierarchy.id_field} AS TEXT) as path, ARRAY[#{hierarchy.id_field}] as path_array ",
-       "FROM #{hierarchy.source_table} WHERE #{hierarchy.parent_field} IS NULL",
+       "SELECT c.*, 0 AS level, CAST(c.#{id} AS TEXT) AS path, ARRAY[c.#{id}] AS path_array ",
+       "FROM ",
+       hierarchy.source_table,
+       " c WHERE c.#{parent} IS NULL",
+       filter,
        " UNION ALL ",
-       "SELECT c.#{hierarchy.id_field}, c.#{hierarchy.name_field}, c.#{hierarchy.parent_field}, h.level + 1, ",
-       "h.path || '/' || CAST(c.#{hierarchy.id_field} AS TEXT), h.path_array || c.#{hierarchy.id_field} ",
-       "FROM #{hierarchy.source_table} c JOIN #{hierarchy.cte_name} h ON c.#{hierarchy.parent_field} = h.#{hierarchy.id_field} ",
-       "WHERE h.level < ",
+       "SELECT c.*, h.level + 1, h.path || '/' || CAST(c.#{id} AS TEXT), h.path_array || c.#{id} ",
+       "FROM ",
+       hierarchy.source_table,
+       " c JOIN #{hierarchy.cte_name} h ON c.#{parent} = h.#{id}",
+       pairs,
+       " WHERE h.level < ",
        {:param, hierarchy.depth_limit},
-       ")"
-     ]}
-  end
-
-  @impl true
-  def render_hierarchy_materialized_path(%MaterializedPath{} = hierarchy, _selecto) do
-    separator = escape_literal(hierarchy.path_separator)
-
-    {:ok,
-     [
-       hierarchy.query_name,
-       " AS (",
-       "SELECT *, ",
-       "(length(#{hierarchy.path_field}) - length(replace(#{hierarchy.path_field}, '#{separator}', ''))) as depth, ",
-       "string_to_array(#{hierarchy.path_field}, '#{separator}') as path_array ",
-       "FROM #{hierarchy.source_table} ",
-       "WHERE #{hierarchy.path_field} LIKE ",
-       {:param, hierarchy.path_pattern},
+       filter,
        ")"
      ]}
   end

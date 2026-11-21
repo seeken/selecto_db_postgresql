@@ -4,7 +4,7 @@ defmodule SelectoDBPostgreSQL.DialectTest do
   alias Selecto.Dialect.Collection.Operation, as: CollectionOperation
   alias Selecto.Dialect.Bucket.Expression, as: BucketExpression
   alias Selecto.Dialect.DateTime.Operation, as: DateTimeOperation
-  alias Selecto.Dialect.Hierarchy.{Adjacency, MaterializedPath}
+  alias Selecto.Dialect.Hierarchy.Adjacency
   alias Selecto.Dialect.Json.Operation, as: JsonOperation
   alias Selecto.Dialect.Predicate.Comparison
   alias Selecto.Dialect.Text.Normalization, as: TextNormalization
@@ -131,40 +131,26 @@ defmodule SelectoDBPostgreSQL.DialectTest do
     assert rendered == ["ARRAY[", fragment.value, "]"]
   end
 
-  test "PostgreSQL hierarchy path SQL is adapter-owned" do
+  test "PostgreSQL adjacency-list hierarchy SQL is adapter-owned" do
     adjacency = %Adjacency{
       cte_name: "category_hierarchy",
-      source_table: "categories",
-      id_field: "id",
-      name_field: "name",
-      parent_field: "parent_id",
-      depth_limit: 5
-    }
-
-    materialized = %MaterializedPath{
-      query_name: "category_path",
-      source_table: "categories",
-      path_field: "path",
-      path_separator: "/",
-      path_pattern: "root/%"
+      source_table: ~s("categories"),
+      id_field: ~s("id"),
+      parent_field: ~s("parent_id"),
+      depth_limit: 5,
+      filter: [[~s(c."active" = ), {:param, true}]],
+      pair_fields: [~s("tenant_id")]
     }
 
     assert {:ok, adjacency_sql} = Dialect.render_hierarchy_adjacency(adjacency, %{})
 
-    assert {finalized_adjacency, [5]} =
+    assert {finalized, [true, 5, true]} =
              Selecto.SQL.Params.finalize(adjacency_sql, adapter: SelectoDBPostgreSQL.Adapter)
 
-    assert finalized_adjacency =~ "ARRAY[id] as path_array"
-
-    assert {:ok, materialized_sql} =
-             Dialect.render_hierarchy_materialized_path(materialized, %{})
-
-    assert {finalized_materialized, ["root/%"]} =
-             Selecto.SQL.Params.finalize(materialized_sql,
-               adapter: SelectoDBPostgreSQL.Adapter
-             )
-
-    assert finalized_materialized =~ "string_to_array(path, '/') as path_array"
+    assert finalized =~ ~s|SELECT c.*, 0 AS level, CAST(c."id" AS TEXT) AS path|
+    assert finalized =~ ~s(WHERE c."parent_id" IS NULL AND c."active" = $1)
+    assert finalized =~ ~s(ON c."parent_id" = h."id" AND c."tenant_id" = h."tenant_id")
+    assert finalized =~ ~s(WHERE h.level < $2 AND c."active" = $3)
   end
 
   test "portable JSON aggregate nodes accept core-prepared expressions" do
