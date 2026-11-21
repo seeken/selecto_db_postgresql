@@ -2270,6 +2270,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
       :rollup,
       :cube,
       :grouping_sets,
+      :right_join,
+      :full_join,
       :returning,
       :text_search,
       :window_functions,
