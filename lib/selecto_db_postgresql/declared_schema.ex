@@ -24,6 +24,21 @@ defmodule SelectoDBPostgreSQL.DeclaredSchema do
   and not in another, refuses (`relation_ambiguous`).
   """
   def relations(selecto) do
+    if declares_schema?(selecto), do: declared_relations(selecto), else: {:ok, %{}}
+  end
+
+  # A statement none of whose queries declares a schema, for its root or for
+  # any table of its domain, names every relation as compiled: there is
+  # nothing to look for in its text.
+  defp declares_schema?(selecto) do
+    selecto
+    |> Selecto.Executor.read_queries()
+    |> Enum.any?(fn query ->
+      root_schema(query) != nil or map_size(Selecto.Domain.Relations.schemas(query)) > 0
+    end)
+  end
+
+  defp declared_relations(selecto) do
     with {:ok, requests} <- requests(selecto) do
       requests
       |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
@@ -49,9 +64,8 @@ defmodule SelectoDBPostgreSQL.DeclaredSchema do
   end
 
   defp query_requests(%{query: query, roots: roots} = scope) do
-    domain = Map.get(query, :domain) || %{}
     root = Enum.find_value(roots, &root_schema/1)
-    declared = collect_declared(domain, %{})
+    declared = Selecto.Domain.Relations.schemas(query)
 
     case Enum.find(declared, &match?({_table, :conflict}, &1)) do
       {table, :conflict} ->
@@ -76,28 +90,6 @@ defmodule SelectoDBPostgreSQL.DeclaredSchema do
   defp schema_name(schema) when is_binary(schema) and schema != "", do: schema
   defp schema_name(schema) when is_atom(schema) and not is_nil(schema), do: Atom.to_string(schema)
   defp schema_name(_schema), do: nil
-
-  defp collect_declared(map, acc) when is_map(map) and not is_struct(map) do
-    table = Map.get(map, :source_table) || Map.get(map, "source_table")
-    schema = map |> Map.get(:source_schema, Map.get(map, "source_schema")) |> schema_name()
-
-    acc =
-      if table && schema do
-        Map.update(acc, to_string(table), schema, fn
-          ^schema -> schema
-          _other -> :conflict
-        end)
-      else
-        acc
-      end
-
-    Enum.reduce(Map.values(map), acc, &collect_declared/2)
-  end
-
-  defp collect_declared(list, acc) when is_list(list),
-    do: Enum.reduce(list, acc, &collect_declared/2)
-
-  defp collect_declared(_value, acc), do: acc
 
   defp two_schemas(tables),
     do:

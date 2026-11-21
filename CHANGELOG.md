@@ -4,6 +4,12 @@ CHANGES
 V 0.5.0
 -------
 
+- A read no longer walks its domain for declared schemas: they come from
+  the index `Selecto.configure/3` builds (`Selecto.Domain.Relations.schemas/1`,
+  which needs the core that has it), and a statement none of whose queries
+  declares a schema is not scanned for the relations it names. The names a
+  statement is qualified with and the `relation_ambiguous` refusal are
+  unchanged.
 - **Read path: R63 withdrawn, R55 narrowed (user rulings of 2026-11-20).** A
   generated read on an idle connection is one round trip; it was four
   (opening, Parse/Describe, Bind/Execute, `ROLLBACK`).
