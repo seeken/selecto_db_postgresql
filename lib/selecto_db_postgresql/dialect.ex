@@ -140,6 +140,23 @@ defmodule SelectoDBPostgreSQL.Dialect do
     end
   end
 
+  # Whole calendar days from start to end: the difference of their dates.
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :days_between,
+          expression: [start, finish],
+          type: "integer",
+          path: []
+        } = fragment,
+        _selecto
+      )
+      when map_size(fragment) == 5 do
+    if computed_expression?(start) and computed_expression?(finish),
+      do: {:ok, ["(CAST(", finish, " AS DATE) - CAST(", start, " AS DATE))"]},
+      else: invalid_computed_value(:days_between)
+  end
+
   def render_computed_value(_fragment, _selecto), do: invalid_computed_value(:unknown)
 
   @doc false
@@ -344,6 +361,23 @@ defmodule SelectoDBPostgreSQL.Dialect do
     range_case_sql(["DATE_PART('year', ", expression, ")"], bucket.ranges)
   end
 
+  # Calendar months ago: 0 is this month, 1 last month.
+  defp bucket_sql(%BucketExpression{kind: :month_ranges} = bucket) do
+    expression = bucket_datetime_expression(bucket)
+
+    range_case_sql(
+      [
+        "((DATE_PART('year', CURRENT_DATE) * 12 + DATE_PART('month', CURRENT_DATE)) - ",
+        "(DATE_PART('year', ",
+        expression,
+        ") * 12 + DATE_PART('month', ",
+        expression,
+        ")))"
+      ],
+      bucket.ranges
+    )
+  end
+
   defp bucket_sql(%BucketExpression{kind: :text_prefix} = bucket) do
     normalized =
       text_normalization_sql(%TextNormalization{
@@ -541,7 +575,13 @@ defmodule SelectoDBPostgreSQL.Dialect do
        do: :ok
 
   defp validate_bucket(%BucketExpression{kind: kind, ranges: ranges})
-       when kind in [:numeric_ranges, :date_relative_ranges, :elapsed_days_ranges, :year_ranges] and
+       when kind in [
+              :numeric_ranges,
+              :date_relative_ranges,
+              :elapsed_days_ranges,
+              :year_ranges,
+              :month_ranges
+            ] and
               is_list(ranges) and ranges != [],
        do: :ok
 

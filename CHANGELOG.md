@@ -4,6 +4,8 @@ CHANGES
 V 0.5.0
 -------
 
+- `days_between` computed values (the difference of the two dates) and
+  `:month_ranges` buckets (calendar months ago, 0 the current month).
 - A read no longer walks its domain for declared schemas: they come from
   the index `Selecto.configure/3` builds (`Selecto.Domain.Relations.schemas/1`,
   which needs the core that has it), and a statement none of whose queries
