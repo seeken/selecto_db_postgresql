@@ -2268,6 +2268,8 @@ defmodule SelectoDBPostgreSQL.Adapter do
       :array_any_comparison,
       :native_null_ordering,
       :rollup,
+      :cube,
+      :grouping_sets,
       :returning,
       :text_search,
       :window_functions,
