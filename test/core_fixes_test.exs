@@ -2,6 +2,21 @@ defmodule SelectoDBPostgreSQL.CoreFixesTest do
   use ExUnit.Case, async: false
   alias SelectoDBPostgreSQL.Adapter
 
+  defmodule ClockSpy do
+    for {function, arity} <- SelectoDBPostgreSQL.Adapter.__info__(:functions),
+        {function, arity} != {:execute, 4} do
+      args = Macro.generate_arguments(arity, __MODULE__)
+
+      def unquote(function)(unquote_splicing(args)),
+        do: apply(SelectoDBPostgreSQL.Adapter, unquote(function), [unquote_splicing(args)])
+    end
+
+    def execute(conn, sql, params, opts) do
+      send(self(), {:clock_build_sql, sql})
+      SelectoDBPostgreSQL.Adapter.execute(conn, sql, params, opts)
+    end
+  end
+
   setup do
     {:ok, conn} =
       Postgrex.start_link(
@@ -204,6 +219,37 @@ defmodule SelectoDBPostgreSQL.CoreFixesTest do
 
       assert sql != ""
       assert Enum.all?(params, &String.starts_with?(&1, String.slice(clock, 0, 10)))
+    end
+  end
+
+  test "one compiled shortcut follows execution-time session dates without build I/O", %{
+    conn: conn
+  } do
+    sql!(conn, "CREATE TEMP TABLE fix_events(id INTEGER, at DATE)")
+    zones = ["Pacific/Pago_Pago", "Pacific/Kiritimati"]
+
+    dates =
+      Enum.map(zones, fn zone ->
+        sql!(conn, "SET TIME ZONE '" <> zone <> "'")
+        %{rows: [[date]]} = sql!(conn, "SELECT CURRENT_DATE")
+        date
+      end)
+
+    assert Enum.uniq(dates) == dates
+    Postgrex.query!(conn, "INSERT INTO fix_events VALUES(1,$1),(2,$2)", dates)
+
+    q =
+      base(conn, domain(:date))
+      |> Selecto.select(["id"])
+      |> Selecto.filter([Selecto.Expr.date_shortcut("at", "today")])
+
+    q = %{q | adapter: ClockSpy}
+    {sql, _, params} = Selecto.gen_sql(q, [])
+    refute_receive {:clock_build_sql, _}
+
+    for {zone, id} <- Enum.with_index(zones, 1) do
+      sql!(conn, "SET TIME ZONE '" <> zone <> "'")
+      assert {:ok, %{rows: [[^id]]}} = Adapter.execute(conn, sql, params, [])
     end
   end
 end
