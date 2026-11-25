@@ -99,7 +99,8 @@ defmodule SelectoDBPostgreSQL.Dialect do
   def render_computed_value(
         %{__struct__: Selecto.Dialect.ComputedValue, operation: :month_day, expression: value},
         _query
-      ), do: {:ok, ["(EXTRACT(MONTH FROM ", value, ") * 100 + EXTRACT(DAY FROM ", value, "))"]}
+      ),
+      do: {:ok, ["(EXTRACT(MONTH FROM ", value, ") * 100 + EXTRACT(DAY FROM ", value, "))"]}
 
   def render_computed_value(
         %{
@@ -167,11 +168,11 @@ defmodule SelectoDBPostgreSQL.Dialect do
 
     {:ok,
      [
-       "(EXTRACT(EPOCH FROM (CAST(",
+       "((EXTRACT(EPOCH FROM ",
        finish,
-       " AS TIMESTAMP) - CAST(",
+       ") - EXTRACT(EPOCH FROM ",
        start,
-       " AS TIMESTAMP))) / ",
+       ")) / ",
        divisor,
        ")"
      ]}
