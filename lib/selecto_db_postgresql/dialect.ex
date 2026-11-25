@@ -97,6 +97,75 @@ defmodule SelectoDBPostgreSQL.Dialect do
   end
 
   def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :local_clock,
+          expression: value,
+          path: [zone]
+        },
+        _query
+      ),
+      do: {:ok, ["(", value, " AT TIME ZONE ", zone, ")"]}
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :date_anchor,
+          expression: today,
+          path: [kind, months, days]
+        },
+        _query
+      )
+      when kind in [:today, :week, :month, :quarter, :year] and is_integer(months) and
+             is_integer(days) do
+    value =
+      if kind == :today,
+        do: today,
+        else: ["CAST(DATE_TRUNC('", Atom.to_string(kind), "', ", today, ") AS DATE)"]
+
+    value =
+      if months == 0,
+        do: value,
+        else: ["CAST(", value, " + INTERVAL '", Integer.to_string(months), " months' AS DATE)"]
+
+    value =
+      if days == 0,
+        do: value,
+        else: ["CAST(", value, " + INTERVAL '", Integer.to_string(days), " days' AS DATE)"]
+
+    {:ok, value}
+  end
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :calendar_bound,
+          expression: value,
+          type: type,
+          path: zones
+        },
+        _query
+      ) do
+    instant =
+      case zones do
+        [] -> ["CAST(", value, " AS TIMESTAMPTZ)"]
+        [zone] -> ["(CAST(", value, " AS TIMESTAMP) AT TIME ZONE ", zone, ")"]
+      end
+
+    sql =
+      case type do
+        "date" -> ["CAST(", value, " AS DATE)"]
+        "datetime" -> ["CAST(", value, " AS TIMESTAMP)"]
+        "naive_utc" -> ["(", instant, " AT TIME ZONE 'UTC')"]
+        "epoch_seconds" -> ["CAST(EXTRACT(EPOCH FROM ", instant, ") AS BIGINT)"]
+        "epoch_ms" -> ["CAST(EXTRACT(EPOCH FROM ", instant, ") * 1000 AS BIGINT)"]
+        "instant" -> instant
+      end
+
+    {:ok, sql}
+  end
+
+  def render_computed_value(
         %{__struct__: Selecto.Dialect.ComputedValue, operation: :month_day, expression: value},
         _query
       ),
