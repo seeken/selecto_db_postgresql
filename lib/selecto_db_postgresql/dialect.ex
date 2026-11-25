@@ -97,6 +97,102 @@ defmodule SelectoDBPostgreSQL.Dialect do
   end
 
   def render_computed_value(
+        %{__struct__: Selecto.Dialect.ComputedValue, operation: :month_day, expression: value},
+        _query
+      ), do: {:ok, ["(EXTRACT(MONTH FROM ", value, ") * 100 + EXTRACT(DAY FROM ", value, "))"]}
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :months_between,
+          expression: [start, finish]
+        },
+        _query
+      ),
+      do:
+        {:ok,
+         [
+           "((EXTRACT(YEAR FROM CAST(",
+           finish,
+           " AS DATE)) * 12 + EXTRACT(MONTH FROM CAST(",
+           finish,
+           " AS DATE))) - (EXTRACT(YEAR FROM CAST(",
+           start,
+           " AS DATE)) * 12 + EXTRACT(MONTH FROM CAST(",
+           start,
+           " AS DATE))))"
+         ]}
+
+  def render_computed_value(
+        %{__struct__: Selecto.Dialect.ComputedValue, operation: :read_clock, expression: value},
+        _query
+      ),
+      do: {:ok, ["CAST(CAST(", value, " AS TEXT) AS TIMESTAMPTZ) AT TIME ZONE 'UTC'"]}
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :period_bound,
+          expression: value,
+          type: type
+        },
+        _query
+      ),
+      do:
+        {:ok,
+         [
+           "CAST(CAST(",
+           value,
+           " AS TEXT) AS ",
+           case type do
+             "date" -> "DATE"
+             "instant" -> "TIMESTAMPTZ"
+             _ -> "TIMESTAMP"
+           end,
+           ")"
+         ]}
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: operation,
+          expression: [start, finish],
+          type: "decimal",
+          path: []
+        },
+        _selecto
+      )
+      when operation in [:hours_between, :fractional_days_between] do
+    divisor = if operation == :hours_between, do: "3600.0", else: "86400.0"
+
+    {:ok,
+     [
+       "(EXTRACT(EPOCH FROM (CAST(",
+       finish,
+       " AS TIMESTAMP) - CAST(",
+       start,
+       " AS TIMESTAMP))) / ",
+       divisor,
+       ")"
+     ]}
+  end
+
+  def render_computed_value(
+        %{
+          __struct__: Selecto.Dialect.ComputedValue,
+          operation: :epoch_datetime,
+          expression: value,
+          type: unit,
+          path: []
+        },
+        _selecto
+      )
+      when unit in ["seconds", "milliseconds"] do
+    scale = if unit == "milliseconds", do: "1000.0", else: "1.0"
+    {:ok, ["(TO_TIMESTAMP(", value, " / ", scale, ") AT TIME ZONE 'UTC')"]}
+  end
+
+  def render_computed_value(
         %{
           __struct__: Selecto.Dialect.ComputedValue,
           operation: :cast,
