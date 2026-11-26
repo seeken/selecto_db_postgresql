@@ -1,6 +1,9 @@
 defmodule SelectoDBPostgreSQL.CoreFixesTest do
   use ExUnit.Case, async: false
   alias SelectoDBPostgreSQL.Adapter
+  alias SelectoDBPostgreSQL.Verification.ConnectionOptions
+
+  @moduletag :postgres
 
   defmodule ClockSpy do
     for {function, arity} <- SelectoDBPostgreSQL.Adapter.__info__(:functions),
@@ -19,13 +22,9 @@ defmodule SelectoDBPostgreSQL.CoreFixesTest do
 
   setup do
     {:ok, conn} =
-      Postgrex.start_link(
-        hostname: "127.0.0.1",
-        port: 55481,
-        username: "chris",
-        database: "selecto_perf",
-        pool_size: 1
-      )
+      ConnectionOptions.options()
+      |> Keyword.put(:pool_size, 1)
+      |> Postgrex.start_link()
 
     Process.unlink(conn)
     on_exit(fn -> if Process.alive?(conn), do: GenServer.stop(conn) end)
